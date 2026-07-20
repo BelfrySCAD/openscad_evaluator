@@ -38,11 +38,9 @@ For DXF import support:
 pip install openscad-evaluator[dxf]
 ```
 
-For 3MF export support:
-
-```bash
-pip install openscad-evaluator[3mf]
-```
+STL/OBJ/OFF/3MF export needs nothing extra -- all four writers are pure Python (`export.py`; 3MF
+is just a ZIP of XML, built with the standard library's `zipfile`/`xml.etree.ElementTree`, not the
+platform-limited `lib3mf`).
 
 ### From Source
 
@@ -74,7 +72,7 @@ and exports the result -- STL, OBJ, OFF, or 3MF, inferred from `-o`'s extension:
 
 ```bash
 openscad-evaluator model.scad -o model.stl
-openscad-evaluator model.scad -o model.3mf          # needs the [3mf] extra
+openscad-evaluator model.scad -o model.3mf
 openscad-evaluator model.scad -o model.mesh --format obj   # explicit format overrides the extension
 ```
 

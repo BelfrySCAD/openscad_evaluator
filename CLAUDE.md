@@ -43,7 +43,10 @@ reuses its previous result instead of recomputing it.
 - `src/openscad_evaluator/resources/fonts/` — bundled Liberation Sans fallback font (used when
   `fc-match` isn't available or a `font=` spec can't be resolved)
 - `src/openscad_evaluator/export.py` — headless STL/OBJ/OFF/3MF export from a `ColoredBody` list;
-  no GUI dependency, ported from BelfrySCAD's own exporter so both stay in sync
+  no GUI dependency, no `lib3mf` dependency either (3MF is written by hand as a ZIP of XML via
+  stdlib `zipfile`/`xml.etree.ElementTree`, mirroring `evaluator.py`'s own `_load_3mf` reader,
+  since `lib3mf` has limited platform support — not available on aarch64/ARM64). STL/OBJ ported
+  from BelfrySCAD's own exporter so the two stay in sync.
 - `src/openscad_evaluator/cli.py` / `_debug_repl.py` — the `openscad-evaluator` console script
   (`[project.scripts]`) and its `--debug` gdb-style REPL, built entirely on the public
   `debug_hook`/`error_break_fn`/`return_hook` contract (nothing evaluator-internal)
@@ -78,3 +81,6 @@ the Manifold provenance / AST-to-geometry-ID mapping API used by BelfrySCAD's WY
 - `tests/test_cli.py` — the `openscad-evaluator` CLI end to end: all four export formats, error
   exit codes, and the `--debug` REPL (breakpoints, step/next/finish, print, set, quit) driven by
   monkeypatching `input()` with canned responses
+- `tests/test_export.py` — `export.py` at the unit level: format dispatch, empty-geometry errors,
+  and the pure-Python 3MF writer's structure/colors/round-trip through `_load_3mf` (and a hard
+  assertion that it never imports `lib3mf`)

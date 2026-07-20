@@ -58,26 +58,10 @@ class TestExportFormats:
         assert out.read_text().startswith("OFF\n")
 
     def test_3mf_export(self, tmp_path):
-        pytest.importorskip("lib3mf")
         src = _write(tmp_path, "cube.scad", CUBE_SCRIPT)
         out = tmp_path / "cube.3mf"
         assert cli.main([str(src), "-o", str(out)]) == 0
         assert out.stat().st_size > 0
-
-    def test_missing_lib3mf_gives_clear_error(self, tmp_path, monkeypatch, capsys):
-        real_import = builtins.__import__
-
-        def blocked_import(name, *args, **kwargs):
-            if name == "lib3mf":
-                raise ImportError("simulated missing lib3mf")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.delitem(sys.modules, "lib3mf", raising=False)
-        monkeypatch.setattr(builtins, "__import__", blocked_import)
-        src = _write(tmp_path, "cube.scad", CUBE_SCRIPT)
-        out = tmp_path / "cube.3mf"
-        assert cli.main([str(src), "-o", str(out)]) == 1
-        assert "lib3mf" in capsys.readouterr().err
 
     def test_unrecognized_extension_errors(self, tmp_path, capsys):
         src = _write(tmp_path, "cube.scad", CUBE_SCRIPT)

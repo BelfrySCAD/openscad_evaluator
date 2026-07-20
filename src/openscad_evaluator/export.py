@@ -95,79 +95,94 @@ def write_off(path: str, bodies: list[ColoredBody]) -> None:
             f.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
 
 
+_3MF_CORE_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+_3MF_MATERIAL_NS = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+_3MF_XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+
+_3MF_CONTENT_TYPES = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    b'<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+    b'</Types>'
+)
+_3MF_RELS = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    b'<Relationship Target="/3D/3dmodel.model" Id="rel0" '
+    b'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+    b'</Relationships>'
+)
+
+
+def _3mf_hex_color(rgba) -> str:
+    r, g, b, a = (max(0, min(255, round(c * 255))) for c in rgba)
+    return f"#{r:02X}{g:02X}{b:02X}{a:02X}"
+
+
 def write_3mf(path: str, bodies: list[ColoredBody]) -> None:
-    """Write a 3MF file, one mesh object + color group per body. Needs the
-    optional `lib3mf` package (`pip install openscad-evaluator[3mf]`)."""
-    try:
-        import lib3mf
-    except ImportError as e:
-        raise ImportError(
-            "3MF export needs the optional 'lib3mf' package: pip install openscad-evaluator[3mf]"
-        ) from e
+    """Write a 3MF file, one mesh object + base color per body.
 
-    fa3 = type(lib3mf.Position().Coordinates)
-    ui3 = type(lib3mf.Triangle().Indices)
+    Pure Python -- a 3MF file is just a ZIP package holding an XML mesh
+    description (plus a couple of small fixed manifest files), so this needs
+    only the standard library (`zipfile` + `xml.etree.ElementTree`), unlike
+    `lib3mf`, which isn't available on every platform (e.g. aarch64/ARM64).
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
 
-    def _identity_transform():
-        t = lib3mf.Transform()
-        col = type(t.Fields[0])
-        t.Fields[0] = col(1, 0, 0)
-        t.Fields[1] = col(0, 1, 0)
-        t.Fields[2] = col(0, 0, 1)
-        t.Fields[3] = col(0, 0, 0)
-        return t
+    ET.register_namespace("", _3MF_CORE_NS)
+    ET.register_namespace("m", _3MF_MATERIAL_NS)
 
-    wrapper = lib3mf.Wrapper()
-    model = wrapper.CreateModel()
-    wrote_any = False
+    model_el = ET.Element(f"{{{_3MF_CORE_NS}}}model", {"unit": "millimeter", _3MF_XML_LANG: "en-US"})
+    resources_el = ET.SubElement(model_el, f"{{{_3MF_CORE_NS}}}resources")
+    build_el = ET.SubElement(model_el, f"{{{_3MF_CORE_NS}}}build")
+
+    next_id = 1
+    object_ids = []
 
     for colored_body in bodies:
         if colored_body.body is None or colored_body.body.is_empty():
             continue
         mesh = colored_body.body.to_mesh()
-        verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float32)
-        tris = np.asarray(mesh.tri_verts, dtype=np.int32)
+        verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float64)
+        tris = np.asarray(mesh.tri_verts, dtype=np.int64)
         if len(tris) == 0:
             continue
-        wrote_any = True
 
-        mesh_obj = model.AddMeshObject()
-        positions = []
-        for v in verts:
-            p = lib3mf.Position()
-            p.Coordinates = fa3(float(v[0]), float(v[1]), float(v[2]))
-            positions.append(p)
-        triangles = []
-        for t in tris:
-            tri = lib3mf.Triangle()
-            tri.Indices = ui3(int(t[0]), int(t[1]), int(t[2]))
-            triangles.append(tri)
-        mesh_obj.SetGeometry(positions, triangles)
-
+        color_group_id, next_id = next_id, next_id + 1
+        colorgroup_el = ET.SubElement(resources_el, f"{{{_3MF_MATERIAL_NS}}}colorgroup", {"id": str(color_group_id)})
         rgba = colored_body.color or (0.8, 0.8, 0.8, 1.0)
-        cg = model.AddColorGroup()
-        c = lib3mf.Color()
-        c.Red = max(0, min(255, int(rgba[0] * 255)))
-        c.Green = max(0, min(255, int(rgba[1] * 255)))
-        c.Blue = max(0, min(255, int(rgba[2] * 255)))
-        c.Alpha = max(0, min(255, int(rgba[3] * 255)))
-        color_id = cg.AddColor(c)
-        cg_uid = cg.GetUniqueResourceID()
+        ET.SubElement(colorgroup_el, f"{{{_3MF_MATERIAL_NS}}}color", {"color": _3mf_hex_color(rgba)})
 
-        props = []
-        for _ in range(len(tris)):
-            tp = lib3mf.TriangleProperties()
-            tp.ResourceID = cg_uid
-            tp.PropertyIDs = ui3(color_id, color_id, color_id)
-            props.append(tp)
-        mesh_obj.SetAllTriangleProperties(props)
-        model.AddBuildItem(mesh_obj, _identity_transform())
+        object_id, next_id = next_id, next_id + 1
+        object_el = ET.SubElement(resources_el, f"{{{_3MF_CORE_NS}}}object", {
+            "id": str(object_id), "type": "model", "pid": str(color_group_id), "pindex": "0",
+        })
+        mesh_el = ET.SubElement(object_el, f"{{{_3MF_CORE_NS}}}mesh")
+        vertices_el = ET.SubElement(mesh_el, f"{{{_3MF_CORE_NS}}}vertices")
+        for v in verts:
+            ET.SubElement(vertices_el, f"{{{_3MF_CORE_NS}}}vertex",
+                          {"x": f"{v[0]:.6g}", "y": f"{v[1]:.6g}", "z": f"{v[2]:.6g}"})
+        triangles_el = ET.SubElement(mesh_el, f"{{{_3MF_CORE_NS}}}triangles")
+        for t in tris:
+            ET.SubElement(triangles_el, f"{{{_3MF_CORE_NS}}}triangle",
+                          {"v1": str(int(t[0])), "v2": str(int(t[1])), "v3": str(int(t[2]))})
 
-    if not wrote_any:
+        object_ids.append(object_id)
+
+    if not object_ids:
         raise ValueError("No geometry to export")
 
-    writer = model.QueryWriter("3mf")
-    writer.WriteToFile(str(path))
+    for object_id in object_ids:
+        ET.SubElement(build_el, f"{{{_3MF_CORE_NS}}}item", {"objectid": str(object_id)})
+
+    model_xml = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(model_el, encoding="utf-8")
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", _3MF_CONTENT_TYPES)
+        z.writestr("_rels/.rels", _3MF_RELS)
+        z.writestr("3D/3dmodel.model", model_xml)
 
 
 _WRITERS = {"stl": write_stl, "obj": write_obj, "off": write_off, "3mf": write_3mf}

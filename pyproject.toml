@@ -48,9 +48,6 @@ dependencies = [
 dxf = [
     "ezdxf>=1.0",
 ]
-3mf = [
-    "lib3mf; platform_machine != 'aarch64' and platform_machine != 'ARM64'",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=7.1.0",
