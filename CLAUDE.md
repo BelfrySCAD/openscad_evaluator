@@ -48,13 +48,15 @@ reuses its previous result instead of recomputing it.
 - **Callback injection, not GUI coupling**: `Evaluator.__init__` takes `echo_fn`/`debug_hook`/
   `error_break_fn`/`return_hook`, all optional plain callables. No `QObject`, no signals — a
   caller (like BelfrySCAD's debugger) wires these to its own event system; the evaluator itself
-  has zero GUI-toolkit dependencies.
+  has zero GUI-toolkit dependencies. See `examples/minimal_debugger.py` for a minimal, runnable
+  `debug_hook` integration (tracing, breakpoints, variable overrides via `mods`).
 - **`EvalContext`**: `__slots__`-based, threaded through recursive evaluation, carries lexical
   scope + `$`-variable dynamic scope + `let` bindings + color/children state. `child_ctx()`/
   `call_ctx()`/`let_child_ctx()` derive new contexts for different scoping situations.
 - **Content-hash geometry cache**: `ManifoldCache` (opt-in, `None` by default) keys on each
   `CSGNode`'s resolved content, letting `generate_tree()` skip recomputing unchanged Manifold work
-  across renders/debugger pauses.
+  across renders/debugger pauses. See `examples/manifold_cache_reuse.py` for a minimal, runnable
+  demonstration of the speedup on an unchanged subtree.
 - **Profiling**: opt-in (`Evaluator(profile=True)`), self-time + cumulative-time per call site
   (not per declaration), zero overhead when off.
 
@@ -66,3 +68,5 @@ the Manifold provenance / AST-to-geometry-ID mapping API used by BelfrySCAD's WY
 
 - `tests/test_evaluator.py` — the whole test suite: built-ins, scoping, CSG tree, profiling,
   `ManifoldCache`, error handling, real-script regression cases
+- `tests/test_examples.py` — runs every script under `examples/` as `__main__`, so their own
+  `assert`s double as regression coverage against the examples drifting out of sync with the API

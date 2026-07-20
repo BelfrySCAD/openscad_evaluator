@@ -61,6 +61,26 @@ for body in bodies:
     print(body.body.num_tri(), "triangles")
 ```
 
+## Examples
+
+Runnable, self-checking scripts under [`examples/`](examples/) go beyond the Quick Start above to
+cover the two optional integration points most callers ask about:
+
+- [`examples/minimal_debugger.py`](examples/minimal_debugger.py) — hooking a debugger into
+  `Evaluator(debug_hook=...)`: tracing every statement, stopping evaluation at a breakpoint, and
+  overriding a variable's value mid-run via the hook's `mods` return value.
+- [`examples/manifold_cache_reuse.py`](examples/manifold_cache_reuse.py) — sharing one
+  `ManifoldCache` across repeated `evaluate()` calls so an unchanged subtree (e.g. everything but
+  the part of the script a user just edited) skips re-running Manifold work on the next render.
+
+```bash
+python examples/minimal_debugger.py
+python examples/manifold_cache_reuse.py
+```
+
+Both are also run under `pytest` (`tests/test_examples.py`) so they fail CI if they drift out of
+sync with the real API.
+
 ## Development
 
 ```bash
