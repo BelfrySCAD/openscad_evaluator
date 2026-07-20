@@ -1,0 +1,69 @@
+[build-system]
+requires = ["uv_build>=0.8.22,<=0.9.20"]
+build-backend = "uv_build"
+
+[project]
+name = "openscad_evaluator"
+version = "1.0.0"
+description = "An AST evaluator for the OpenSCAD language, producing Manifold CSG geometry from a parsed AST."
+readme = "README.md"
+authors = [
+  { name="Revar Desmera", email="revarbat@gmail.com" },
+]
+maintainers = [
+  { name="Revar Desmera", email="revarbat@gmail.com" },
+]
+license = "MIT"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Artistic Software",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["openscad", "openscad evaluator", "csg", "manifold"]
+dependencies = [
+    "manifold3d>=3.0",
+    "numpy>=1.24",
+    "fonttools>=4.0",
+    "shapely>=2.0",
+    "shapely-polyskel>=0.1.2",
+    "Pillow>=10.0",
+    "openscad_lalr_parser>=1.1.0",
+]
+
+[project.optional-dependencies]
+dxf = [
+    "ezdxf>=1.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=7.1.0",
+    "genbadge[coverage]>=1.1.0",
+    "ezdxf>=1.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/BelfrySCAD/openscad_evaluator"
+"Repository" = "https://github.com/BelfrySCAD/openscad_evaluator"
+"Bug Tracker" = "https://github.com/BelfrySCAD/openscad_evaluator/issues"
+"Releases" = "https://github.com/BelfrySCAD/openscad_evaluator/releases"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v"
