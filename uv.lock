@@ -351,6 +351,16 @@ wheels = [
 ]
 
 [[package]]
+name = "lib3mf"
+version = "2.5.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/87/47504d69f0f36841670d12ce3fe1668025bad74d83ed361ead378f626fed/lib3mf-2.5.0-py3-none-macosx_10_9_universal2.whl", hash = "sha256:f7dc57ea22214fa92dac728ba66e58c4b24b775d467888262a820338d7d84145", size = 2216305, upload-time = "2026-02-23T21:17:35.935Z" },
+    { url = "https://files.pythonhosted.org/packages/88/83/8b987ba95ac0ed9cc7e9c407a579bf43eff6349b1792b4a66c992ce4f76b/lib3mf-2.5.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:b4c00033c47cfeac93b7daa069fb46e8dea4391d5522b79cd6e9f6af75e33013", size = 1575000, upload-time = "2026-02-23T21:17:37.803Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/b3/7a844247dfa1f0b24de6fa0425afb808dd1feeef2d05d6335170433c1071/lib3mf-2.5.0-py3-none-win_amd64.whl", hash = "sha256:e378470855d634708c6ae7f2f2c6fcd89e4996350de86020849e7b2d51ffe6ac", size = 857560, upload-time = "2026-02-23T21:17:39.431Z" },
+]
+
+[[package]]
 name = "manifold3d"
 version = "3.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -530,7 +540,7 @@ wheels = [
 
 [[package]]
 name = "openscad-evaluator"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fonttools" },
@@ -544,6 +554,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+3mf = [
+    { name = "lib3mf", marker = "platform_machine != 'ARM64' and platform_machine != 'aarch64'" },
+]
 dev = [
     { name = "ezdxf" },
     { name = "genbadge", extra = ["coverage"] },
@@ -560,6 +573,7 @@ requires-dist = [
     { name = "ezdxf", marker = "extra == 'dxf'", specifier = ">=1.0" },
     { name = "fonttools", specifier = ">=4.0" },
     { name = "genbadge", extras = ["coverage"], marker = "extra == 'dev'", specifier = ">=1.1.0" },
+    { name = "lib3mf", marker = "platform_machine != 'ARM64' and platform_machine != 'aarch64' and extra == '3mf'" },
     { name = "manifold3d", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "openscad-lalr-parser", specifier = ">=1.1.0" },
@@ -569,7 +583,7 @@ requires-dist = [
     { name = "shapely", specifier = ">=2.0" },
     { name = "shapely-polyskel", specifier = ">=0.1.2" },
 ]
-provides-extras = ["dxf", "dev"]
+provides-extras = ["dxf", "3mf", "dev"]
 
 [[package]]
 name = "openscad-lalr-parser"

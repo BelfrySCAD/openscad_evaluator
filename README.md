@@ -38,6 +38,12 @@ For DXF import support:
 pip install openscad-evaluator[dxf]
 ```
 
+For 3MF export support:
+
+```bash
+pip install openscad-evaluator[3mf]
+```
+
 ### From Source
 
 ```bash
@@ -60,6 +66,46 @@ bodies, id_to_node = ev.evaluate(nodes, root_scope)
 for body in bodies:
     print(body.body.num_tri(), "triangles")
 ```
+
+## Command Line
+
+Installing the package also installs an `openscad-evaluator` script that evaluates a `.scad` file
+and exports the result -- STL, OBJ, OFF, or 3MF, inferred from `-o`'s extension:
+
+```bash
+openscad-evaluator model.scad -o model.stl
+openscad-evaluator model.scad -o model.3mf          # needs the [3mf] extra
+openscad-evaluator model.scad -o model.mesh --format obj   # explicit format overrides the extension
+```
+
+`echo()`/warning output goes to stdout; a parse or evaluation error goes to stderr and exits
+non-zero.
+
+`--debug` drops into a small, gdb-style interactive debugger instead of running straight through:
+set breakpoints and `run`, then `step`/`next`/`finish`/`continue`, `print <name>`, `backtrace`, and
+`set <name>=<value>` to override a variable before resuming.
+
+```
+$ openscad-evaluator model.scad -o model.stl --debug
+Reading symbols from model.scad...
+(scad-dbg) break 12
+Breakpoint set at model.scad:12
+(scad-dbg) run
+
+Breakpoint hit at model.scad:12
+     10  module bracket(w) {
+     11      h = w * 2;
+->   12      cube([w, h, 3]);
+     13  }
+(scad-dbg) print h
+$1 = 20
+(scad-dbg) continue
+Exported to model.stl
+```
+
+See `src/openscad_evaluator/_debug_repl.py` for the full command list (`help` at either prompt also
+prints it), and `examples/minimal_debugger.py` for the underlying `debug_hook` protocol if you're
+integrating your own debugger rather than using this one.
 
 ## Examples
 

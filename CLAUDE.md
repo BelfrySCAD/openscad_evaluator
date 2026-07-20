@@ -42,6 +42,11 @@ reuses its previous result instead of recomputing it.
   it if it ever needs updating)
 - `src/openscad_evaluator/resources/fonts/` — bundled Liberation Sans fallback font (used when
   `fc-match` isn't available or a `font=` spec can't be resolved)
+- `src/openscad_evaluator/export.py` — headless STL/OBJ/OFF/3MF export from a `ColoredBody` list;
+  no GUI dependency, ported from BelfrySCAD's own exporter so both stay in sync
+- `src/openscad_evaluator/cli.py` / `_debug_repl.py` — the `openscad-evaluator` console script
+  (`[project.scripts]`) and its `--debug` gdb-style REPL, built entirely on the public
+  `debug_hook`/`error_break_fn`/`return_hook` contract (nothing evaluator-internal)
 
 ### Design Patterns
 
@@ -70,3 +75,6 @@ the Manifold provenance / AST-to-geometry-ID mapping API used by BelfrySCAD's WY
   `ManifoldCache`, error handling, real-script regression cases
 - `tests/test_examples.py` — runs every script under `examples/` as `__main__`, so their own
   `assert`s double as regression coverage against the examples drifting out of sync with the API
+- `tests/test_cli.py` — the `openscad-evaluator` CLI end to end: all four export formats, error
+  exit codes, and the `--debug` REPL (breakpoints, step/next/finish, print, set, quit) driven by
+  monkeypatching `input()` with canned responses
