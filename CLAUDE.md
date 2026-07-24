@@ -49,7 +49,16 @@ reuses its previous result instead of recomputing it.
   from BelfrySCAD's own exporter so the two stay in sync.
 - `src/openscad_evaluator/cli.py` / `_debug_repl.py` — the `openscad-evaluator` console script
   (`[project.scripts]`) and its `--debug` gdb-style REPL, built entirely on the public
-  `debug_hook`/`error_break_fn`/`return_hook` contract (nothing evaluator-internal)
+  `debug_hook`/`error_break_fn`/`return_hook` contract (nothing evaluator-internal). `DebugRepl`
+  caches source lines per-origin (`_source_lines_by_origin`, lazily populated via `_lines_for()`),
+  not just the main script's own file — a breakpoint/step can land inside a `use <file>`-injected
+  function/module's own body, which lives in a different file than `source_path`; `list` (both the
+  automatic display on a pause and the explicit command) must read *that* file's lines. Was a real
+  bug until fixed (`_list_source` used to always read the main script's lines regardless of where
+  the debugger was actually paused) — see `tests/test_cli.py`'s
+  `test_list_shows_source_from_use_injected_file_when_paused_there`; the C++ port
+  (`openscad_cpp_evaluator`) had the identical bug in its own `DebugRepl`, fixed the same way there
+  too.
 
 ### Design Patterns
 

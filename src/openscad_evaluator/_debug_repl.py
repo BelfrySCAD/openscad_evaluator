@@ -86,10 +86,12 @@ class DebugRepl:
 
     def __init__(self, source_path: str):
         self._source_path = os.path.realpath(source_path)
-        try:
-            self._source_lines = Path(source_path).read_text(encoding="utf-8").splitlines()
-        except OSError:
-            self._source_lines = []
+        # Lazily populated per-origin (not just the main script) -- a
+        # breakpoint/step can land inside a `use <file>`-injected function
+        # or module, which lives in a different file than source_path;
+        # `list`/pause-time source display must read *that* file's lines,
+        # not always the main script's. See _lines_for().
+        self._source_lines_by_origin: dict[str, list[str]] = {self._source_path: self._read_lines(source_path)}
         self._breakpoints: dict[str, set[int]] = {}
         self._break_on_first = True
         self._step_cmd: str | None = None   # "into" / "over" / "out"
@@ -106,6 +108,20 @@ class DebugRepl:
 
     def _resolve(self, origin: str | None) -> str:
         return os.path.realpath(origin) if origin else self._source_path
+
+    @staticmethod
+    def _read_lines(path: str) -> list[str]:
+        try:
+            return Path(path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+    def _lines_for(self, origin: str) -> list[str]:
+        lines = self._source_lines_by_origin.get(origin)
+        if lines is None:
+            lines = self._read_lines(origin)
+            self._source_lines_by_origin[origin] = lines
+        return lines
 
     def _parse_location(self, arg: str):
         arg = arg.strip()
@@ -146,21 +162,22 @@ class DebugRepl:
         for origin, line in rows:
             print(f"breakpoint at {os.path.basename(origin)}:{line}")
 
-    def _list_source(self, arg: str, current_line: int | None = None):
+    def _list_source(self, arg: str, current_line: int | None = None, origin: str | None = None):
+        lines = self._lines_for(origin or self._source_path)
         target = current_line if current_line is not None else 1
         if arg.strip():
             try:
                 target = int(arg.strip())
             except ValueError:
                 pass
-        if not self._source_lines:
+        if not lines:
             print("No source available.")
             return
         lo = max(1, target - 5)
-        hi = min(len(self._source_lines), target + 4)
+        hi = min(len(lines), target + 4)
         for n in range(lo, hi + 1):
             marker = "->" if n == current_line else "  "
-            print(f"{marker}{n:4d}\t{self._source_lines[n - 1]}")
+            print(f"{marker}{n:4d}\t{lines[n - 1]}")
 
     def _set_var(self, arg: str):
         if "=" not in arg:
@@ -270,7 +287,7 @@ class DebugRepl:
 
         (_narrow_locals, all_frames), call_stack = get_frames()
         print(f"\nBreakpoint hit at {os.path.basename(resolved)}:{line}")
-        self._list_source("", current_line=line)
+        self._list_source("", current_line=line, origin=resolved)
         visible_vars = self._visible_vars(all_frames[0]) if all_frames else {}
         return self._interact(line, depth, resolved, visible_vars, call_stack)
 
@@ -279,7 +296,7 @@ class DebugRepl:
             return
         resolved = self._resolve(origin)
         print(f"\n{msg}")
-        self._list_source("", current_line=line)
+        self._list_source("", current_line=line, origin=resolved)
         visible_vars = self._visible_vars(all_frame_locals[0]) if all_frame_locals else {}
         print("(evaluation will abort once you resume; inspect state, then continue/quit)")
         self._interact(line, len(call_stack), resolved, visible_vars, call_stack)
@@ -319,7 +336,7 @@ class DebugRepl:
             elif cmd in ("backtrace", "bt", "where"):
                 self._print_backtrace(call_stack, origin, line)
             elif cmd in ("list", "l"):
-                self._list_source(arg, current_line=line)
+                self._list_source(arg, current_line=line, origin=origin)
             elif cmd in ("break", "b"):
                 self._add_breakpoint(arg)
             elif cmd in ("delete", "d"):
