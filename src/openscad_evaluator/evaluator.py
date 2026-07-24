@@ -29,6 +29,7 @@ from openscad_lalr_parser.nodes import (
     PositionalArgument, NamedArgument,
     AdditionOp, SubtractionOp, MultiplicationOp, DivisionOp, ModuloOp, ExponentOp,
     UnaryMinusOp,
+    BitwiseAndOp, BitwiseOrOp, BitwiseNotOp, BitwiseShiftLeftOp, BitwiseShiftRightOp,
     LogicalAndOp, LogicalOrOp, LogicalNotOp,
     EqualityOp, InequalityOp, GreaterThanOp, GreaterThanOrEqualOp, LessThanOp, LessThanOrEqualOp,
     TernaryOp,
@@ -4850,6 +4851,81 @@ class Evaluator:
         except TypeError:
             return None
 
+    # Bitwise/shift operators, added by real OpenSCAD in PR #4833 (merged
+    # 2025-03-14, "Bitwise operators. Fixes #3345."). No real integer type:
+    # operands truncate-to-int64 (real OpenSCAD's own Value::toInt64(),
+    # Value.cc: `trunc(toDouble())` cast to int64_t), operate in int64
+    # two's-complement arithmetic, then cast back to a plain OpenSCAD
+    # number (float here) -- matching real OpenSCAD's own "operates on
+    # ordinary OpenSCAD numbers, no new integer type" design.
+    @staticmethod
+    def _to_bitwise_int64(v) -> int:
+        """Truncate-to-int64 two's-complement conversion for bitwise ops.
+        Python ints are arbitrary precision and already implement
+        two's-complement semantics for negative numbers natively (`~x` is
+        already `-x-1`, `-1 & 5` already gives `5`), so the mask below only
+        matters for values that would overflow a real bounded int64 -- e.g.
+        re-wrapping a left-shift's result the way int64_t's own bounded
+        arithmetic would (`1 << 32 << 32 == 0`)."""
+        n = int(math.trunc(v)) & 0xFFFFFFFFFFFFFFFF
+        return n - 0x10000000000000000 if n >= 0x8000000000000000 else n
+
+    def _expr_bitor(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            return float(self._to_bitwise_int64(a) | self._to_bitwise_int64(b))
+        self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} | {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_bitand(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            return float(self._to_bitwise_int64(a) & self._to_bitwise_int64(b))
+        self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} & {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_bitnot(self, node, ctx):
+        v = self._eval_expr(node.expr, ctx)
+        if type(v) is int or type(v) is float:
+            return float(~self._to_bitwise_int64(v))
+        self._echo_fn(f"WARNING: undefined operation (~{_osc_type_name(v)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_shl(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if not ((ta is int or ta is float) and (tb is int or tb is float)):
+            self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} << {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+            return None
+        rhs = math.trunc(b)
+        if rhs < 0:
+            self._echo_fn(f"WARNING: negative shift{self._loc(getattr(node, 'position', None))}")
+            return None
+        if rhs >= 64:
+            self._echo_fn(f"WARNING: shift too large{self._loc(getattr(node, 'position', None))}")
+            return None
+        return float(self._to_bitwise_int64(self._to_bitwise_int64(a) << rhs))
+
+    def _expr_shr(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if not ((ta is int or ta is float) and (tb is int or tb is float)):
+            self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} >> {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+            return None
+        rhs = math.trunc(b)
+        if rhs < 0:
+            self._echo_fn(f"WARNING: negative shift{self._loc(getattr(node, 'position', None))}")
+            return None
+        if rhs >= 64:
+            self._echo_fn(f"WARNING: shift too large{self._loc(getattr(node, 'position', None))}")
+            return None
+        # Python's native >> on an int already sign-extends (arithmetic
+        # shift), matching int64_t's own C++20-guaranteed arithmetic right
+        # shift for a negative left-hand side.
+        return float(self._to_bitwise_int64(a) >> rhs)
+
     def _expr_and(self, node, ctx):
         return bool(self._eval_expr(node.left, ctx)) and bool(self._eval_expr(node.right, ctx))
 
@@ -5713,6 +5789,11 @@ _EXPR_DISPATCH: dict[type, callable] = {
     ModuloOp: Evaluator._expr_mod,
     ExponentOp: Evaluator._expr_exp,
     UnaryMinusOp: Evaluator._expr_unary_minus,
+    BitwiseOrOp: Evaluator._expr_bitor,
+    BitwiseAndOp: Evaluator._expr_bitand,
+    BitwiseNotOp: Evaluator._expr_bitnot,
+    BitwiseShiftLeftOp: Evaluator._expr_shl,
+    BitwiseShiftRightOp: Evaluator._expr_shr,
     LogicalAndOp: Evaluator._expr_and,
     LogicalOrOp: Evaluator._expr_or,
     LogicalNotOp: Evaluator._expr_not,

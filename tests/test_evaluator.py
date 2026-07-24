@@ -197,6 +197,66 @@ class TestExpressions:
 
 
 # ---------------------------------------------------------------------------
+# Bitwise/shift operators (real OpenSCAD PR #4833, merged 2025-03-14)
+# ---------------------------------------------------------------------------
+
+class TestBitwiseOps:
+    def test_basic_operations(self):
+        _, lines = run(
+            'echo(12 & 5, 12 | 5, 2 << 3, 16 >> 2, ~0, ~-1, ~5);'
+        )
+        assert lines == ["ECHO: 4, 13, 16, 4, -1, 0, -6"]
+
+    def test_precedence_shift_over_and(self):
+        # Shift binds tighter than binary-and/or -- real OpenSCAD's grammar
+        # deliberately differs from C to avoid `x & 1 == 0` parsing as
+        # `x & (1 == 0)`.
+        _, lines = run("echo((3 << 1 & 14) == ((3 << 1) & 14));")
+        assert lines == ["ECHO: true"]
+
+    def test_precedence_and_over_or(self):
+        _, lines = run("echo((1 & 2 | 3) == ((1 & 2) | 3));")
+        assert lines == ["ECHO: true"]
+
+    def test_precedence_or_over_comparison(self):
+        _, lines = run("echo((1 | 2 > 3) == ((1 | 2) > 3));")
+        assert lines == ["ECHO: true"]
+
+    def test_negative_numbers(self):
+        _, lines = run("echo((-1 | 0) == -1, (-1 | 0) == ~0);")
+        assert lines == ["ECHO: true, true"]
+
+    def test_fractions_truncate(self):
+        _, lines = run("echo(1.4 | 0, 1.6 | 0, -1.4 & 3, -1.6 & 3);")
+        assert lines == ["ECHO: 1, 1, 3, 3"]
+
+    def test_shift_overflow_wraps_like_64bit_twos_complement(self):
+        _, lines = run("echo(1 << 32 << 32, 1 >> 1);")
+        assert lines == ["ECHO: 0, 0"]
+
+    def test_out_of_range_shift_is_undef_and_warns(self):
+        _, lines = run(
+            "echo(is_undef(1 << 64), is_undef(1 << -1), is_undef(1 >> 64), is_undef(1 >> -1));"
+        )
+        assert lines == [
+            "WARNING: shift too large in file <string>, line 1",
+            "WARNING: negative shift in file <string>, line 1",
+            "WARNING: shift too large in file <string>, line 1",
+            "WARNING: negative shift in file <string>, line 1",
+            "ECHO: true, true, true, true",
+        ]
+
+    def test_non_numeric_operand_is_undef_and_warns(self):
+        _, lines = run('echo(is_undef(1 | "hello"), is_undef(1 & true), is_undef(~"hello"));')
+        assert lines == [
+            'WARNING: undefined operation (number | string) in file <string>, line 1',
+            'WARNING: undefined operation (number & bool) in file <string>, line 1',
+            'WARNING: undefined operation (~string) in file <string>, line 1',
+            "ECHO: true, true, true",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Variables and scoping
 # ---------------------------------------------------------------------------
 
