@@ -149,3 +149,22 @@ class TestDebugRepl:
         _feed_input(monkeypatch, ["run", "continue"])
         assert cli.main([str(src), "-o", str(out), "--debug"]) == 1
         assert "boom" in capsys.readouterr().err
+
+    def test_list_shows_source_from_use_injected_file_when_paused_there(self, tmp_path, monkeypatch, capsys):
+        # A breakpoint hit inside a `use <file>`-injected module's own body
+        # lives in a *different* file than the main script -- `list` (both
+        # the automatic display on the breakpoint hit and an explicit `list`
+        # command) must show that file's lines, not the main script's.
+        lib = _write(tmp_path, "lib.scad", "module lib_cube(s) {\n    cube(s);\n}\n")
+        src = _write(tmp_path, "main.scad", f'use <{lib}>\nlib_cube(5);\n')
+        out = tmp_path / "main.stl"
+        # "run" pauses at main.scad:1 first (break-on-first); "continue"
+        # resumes to the lib.scad:2 breakpoint (whose hit auto-lists);
+        # "list" then re-lists explicitly, from the same paused location.
+        _feed_input(monkeypatch, [f"break {lib}:2", "run", "continue", "list", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        # "cube(s);" only exists in lib.scad -- before the fix, _list_source
+        # always read main.scad's own lines regardless of which file the
+        # debugger was actually paused in, so this string could never appear
+        # (main.scad's own line 2 is "lib_cube(5);", not "cube(s);").
+        assert "cube(s);" in capsys.readouterr().out

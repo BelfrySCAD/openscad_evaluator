@@ -29,6 +29,7 @@ from openscad_lalr_parser.nodes import (
     PositionalArgument, NamedArgument,
     AdditionOp, SubtractionOp, MultiplicationOp, DivisionOp, ModuloOp, ExponentOp,
     UnaryMinusOp,
+    BitwiseAndOp, BitwiseOrOp, BitwiseNotOp, BitwiseShiftLeftOp, BitwiseShiftRightOp,
     LogicalAndOp, LogicalOrOp, LogicalNotOp,
     EqualityOp, InequalityOp, GreaterThanOp, GreaterThanOrEqualOp, LessThanOp, LessThanOrEqualOp,
     TernaryOp,
@@ -2880,7 +2881,7 @@ class Evaluator:
             else:
                 child_ctx.let[k] = v
         # Apply defaults for missing params
-        self._apply_defaults(params, child_ctx)
+        self._apply_defaults(params, args, child_ctx)
 
         name = call.name.name
         call_pos = getattr(call, 'position', None)
@@ -4850,6 +4851,81 @@ class Evaluator:
         except TypeError:
             return None
 
+    # Bitwise/shift operators, added by real OpenSCAD in PR #4833 (merged
+    # 2025-03-14, "Bitwise operators. Fixes #3345."). No real integer type:
+    # operands truncate-to-int64 (real OpenSCAD's own Value::toInt64(),
+    # Value.cc: `trunc(toDouble())` cast to int64_t), operate in int64
+    # two's-complement arithmetic, then cast back to a plain OpenSCAD
+    # number (float here) -- matching real OpenSCAD's own "operates on
+    # ordinary OpenSCAD numbers, no new integer type" design.
+    @staticmethod
+    def _to_bitwise_int64(v) -> int:
+        """Truncate-to-int64 two's-complement conversion for bitwise ops.
+        Python ints are arbitrary precision and already implement
+        two's-complement semantics for negative numbers natively (`~x` is
+        already `-x-1`, `-1 & 5` already gives `5`), so the mask below only
+        matters for values that would overflow a real bounded int64 -- e.g.
+        re-wrapping a left-shift's result the way int64_t's own bounded
+        arithmetic would (`1 << 32 << 32 == 0`)."""
+        n = int(math.trunc(v)) & 0xFFFFFFFFFFFFFFFF
+        return n - 0x10000000000000000 if n >= 0x8000000000000000 else n
+
+    def _expr_bitor(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            return float(self._to_bitwise_int64(a) | self._to_bitwise_int64(b))
+        self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} | {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_bitand(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            return float(self._to_bitwise_int64(a) & self._to_bitwise_int64(b))
+        self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} & {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_bitnot(self, node, ctx):
+        v = self._eval_expr(node.expr, ctx)
+        if type(v) is int or type(v) is float:
+            return float(~self._to_bitwise_int64(v))
+        self._echo_fn(f"WARNING: undefined operation (~{_osc_type_name(v)}){self._loc(getattr(node, 'position', None))}")
+        return None
+
+    def _expr_shl(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if not ((ta is int or ta is float) and (tb is int or tb is float)):
+            self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} << {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+            return None
+        rhs = math.trunc(b)
+        if rhs < 0:
+            self._echo_fn(f"WARNING: negative shift{self._loc(getattr(node, 'position', None))}")
+            return None
+        if rhs >= 64:
+            self._echo_fn(f"WARNING: shift too large{self._loc(getattr(node, 'position', None))}")
+            return None
+        return float(self._to_bitwise_int64(self._to_bitwise_int64(a) << rhs))
+
+    def _expr_shr(self, node, ctx):
+        a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        ta, tb = type(a), type(b)
+        if not ((ta is int or ta is float) and (tb is int or tb is float)):
+            self._echo_fn(f"WARNING: undefined operation ({_osc_type_name(a)} >> {_osc_type_name(b)}){self._loc(getattr(node, 'position', None))}")
+            return None
+        rhs = math.trunc(b)
+        if rhs < 0:
+            self._echo_fn(f"WARNING: negative shift{self._loc(getattr(node, 'position', None))}")
+            return None
+        if rhs >= 64:
+            self._echo_fn(f"WARNING: shift too large{self._loc(getattr(node, 'position', None))}")
+            return None
+        # Python's native >> on an int already sign-extends (arithmetic
+        # shift), matching int64_t's own C++20-guaranteed arithmetic right
+        # shift for a negative left-hand side.
+        return float(self._to_bitwise_int64(a) >> rhs)
+
     def _expr_and(self, node, ctx):
         return bool(self._eval_expr(node.left, ctx)) and bool(self._eval_expr(node.right, ctx))
 
@@ -5591,43 +5667,73 @@ class Evaluator:
             }),
         })
 
-    def _apply_defaults(self, params, child_ctx: EvalContext):
-        """Fill in any param not already bound in child_ctx.let from its
-        default expression. Matches real OpenSCAD (verified directly against
-        /Applications/OpenSCAD.app): a default expression is evaluated
-        purely lexically against the function/module's own declaration
-        scope (child_ctx.scope) -- it sees neither the caller's local
-        variables nor this same call's other (sibling) parameters, though
-        $-vars remain dynamically scoped as usual (child_ctx.dyn is already
-        the correctly-threaded dynamic environment, so it's reused as-is).
-        A default that reads a variable the caller shadows via let()
-        resolves to the function's own enclosing scope, not the caller's
-        shadow; a default referencing an earlier sibling parameter is an
-        unknown variable (warning + undef), not a forward reference."""
+    def _apply_defaults(self, params, bound, child_ctx: EvalContext):
+        """Fill in any param not already present in `bound` (_bind_args' own
+        return value -- the authoritative "did the caller actually supply
+        this name" record) from its default expression. Matches real
+        OpenSCAD (verified directly against /Applications/OpenSCAD.app): a
+        default expression is evaluated purely lexically against the
+        function/module's own declaration scope (child_ctx.scope) -- it
+        sees neither the caller's local variables nor this same call's
+        other (sibling) parameters, though $-vars remain dynamically scoped
+        as usual (child_ctx.dyn is already the correctly-threaded dynamic
+        environment, so it's reused as-is). A default that reads a variable
+        the caller shadows via let() resolves to the function's own
+        enclosing scope, not the caller's shadow; a default referencing an
+        earlier sibling parameter is an unknown variable (warning + undef),
+        not a forward reference.
+
+        A $-prefixed parameter's result (bound or defaulted) goes into
+        child_ctx.dyn, everything else into child_ctx.let -- matching the
+        bound-argument loop at each call site exactly. `bound`, not
+        child_ctx.let/dyn, must be the "already bound" source of truth:
+        child_ctx.dyn is always pre-seeded with $fn/$fa/$fs/$t/
+        $parent_modules regardless of what the caller actually passed, so
+        checking dyn's mere presence could never distinguish "the caller
+        explicitly passed $fn" from "$fn merely exists because of that
+        ambient seed" -- and checking only child_ctx.let (the original
+        shape of this function) missed a $-prefixed name bound into dyn
+        just as badly in the other direction: it always looked unbound,
+        clobbering the real value with a fresh undef written into .let,
+        which then shadowed the correct .dyn value the moment the body
+        referenced that name as a plain identifier (_eval_identifier checks
+        .let before .dyn)."""
         let_dict = child_ctx.let
+        dyn_dict = child_ctx.dyn
         default_ctx = None
         _eval = self._eval_expr
         for param in params:
             pname = param.name.name
-            if pname not in let_dict:
+            if pname not in bound:
+                is_dyn = pname[0] == '$'
                 default = param.default
                 if default is None:
-                    let_dict[pname] = None
+                    if is_dyn:
+                        dyn_dict[pname] = None
+                    else:
+                        let_dict[pname] = None
                 else:
                     if default_ctx is None:
                         default_ctx = child_ctx.child_ctx(let={}, share_dyn=True)
-                    let_dict[pname] = _eval(default, default_ctx)
+                    value = _eval(default, default_ctx)
+                    if is_dyn:
+                        dyn_dict[pname] = value
+                    else:
+                        let_dict[pname] = value
 
     def _has_dollar_param(self, decl_id: int, params) -> bool:
         """Whether any of `params`' declared names starts with '$' --
         memoized by declaration identity, since this is a purely static
-        property of the declaration, never of any particular call. Lets
-        _eval_user_function/_eval_function_literal skip the any(bound)
-        share_dyn check entirely for the overwhelming common case (no
-        $-param declared at all -- BOSL2 barely uses them): bound's keys
-        are always a subset of params' names, so a declaration with no
-        $-param can never produce a $ key in bound regardless of the call,
-        and share_dyn can just be True unconditionally."""
+        property of the declaration, never of any particular call. IS
+        _eval_user_function/_eval_function_literal's own share_dyn value
+        directly (not just a fast-path skip): every declared $-param
+        writes to child_ctx.dyn exactly once per call, either via the
+        bound-argument loop (if the caller supplied it) or via
+        _apply_defaults (if not) -- so a declaration with no $-param at all
+        is the ONLY case where dyn is guaranteed untouched regardless of
+        the call's actual arguments, and share_dyn can be True
+        unconditionally; any $-param at all means False unconditionally,
+        no per-call bound-keys check needed."""
         cached = self._decl_dollar_param.get(decl_id)
         if cached is None:
             cached = any(p.name.name[0] == '$' for p in params)
@@ -5638,22 +5744,23 @@ class Evaluator:
         params = decl.parameters or []
         bound = self._bind_args(params, arguments, ctx)
         fn_scope = decl.scope or ctx.scope
-        # No $-prefixed argument was actually bound (the common case --
-        # _apply_defaults below only ever writes into .let, never .dyn, so
-        # bound's own keys are the complete set of things that could touch
-        # child_ctx.dyn) -- safe to skip copying dyn/dyn_explicit and share
-        # ctx's own dict/set by reference instead. A real, measured
+        # No $-prefixed parameter is declared at all -- the common case,
+        # and the ONLY case where child_ctx.dyn is guaranteed untouched by
+        # either the bound-argument loop below or _apply_defaults (every
+        # declared $-param writes to dyn exactly once, via whichever of the
+        # two actually applies) -- safe to skip copying dyn/dyn_explicit and
+        # share ctx's own dict/set by reference instead. A real, measured
         # optimization: on a BOSL2-heavy script (Anklet.scad, ~1.1M user
         # function calls), context-creation machinery was ~9.6% of total
         # evaluate() time, and this is its single biggest piece.
-        share_dyn = True if not self._has_dollar_param(id(decl), params) else not any(k[0] == '$' for k in bound)
+        share_dyn = not self._has_dollar_param(id(decl), params)
         child_ctx = self._call_ctx_for(decl, ctx, scope=fn_scope, share_dyn=share_dyn)
         for k, v in bound.items():
             if k[0] == '$':
                 child_ctx.dyn[k] = v
             else:
                 child_ctx.let[k] = v
-        self._apply_defaults(params, child_ctx)
+        self._apply_defaults(params, bound, child_ctx)
         pos = call_node.position if call_node is not None else None
         prof = self._profile_enter("function", name, pos, decl.position) if self._profiling else None
         self._call_stack.append(("function", name, pos, decl.position))
@@ -5676,14 +5783,14 @@ class Evaluator:
         bound = self._bind_args(params, arguments, ctx)
         fn_scope = func_node.scope or ctx.scope
         # See _eval_user_function's matching comment -- same optimization.
-        share_dyn = True if not self._has_dollar_param(id(func_node), params) else not any(k[0] == '$' for k in bound)
+        share_dyn = not self._has_dollar_param(id(func_node), params)
         child_ctx = self._call_ctx_for(func_node, ctx, scope=fn_scope, share_dyn=share_dyn)
         for k, v in bound.items():
             if k[0] == '$':
                 child_ctx.dyn[k] = v
             else:
                 child_ctx.let[k] = v
-        self._apply_defaults(params, child_ctx)
+        self._apply_defaults(params, bound, child_ctx)
         pos = call_node.position if call_node is not None else None
         fn_name = name or "<function>"
         prof = self._profile_enter("function", fn_name, pos, func_node.position) if self._profiling else None
@@ -5713,6 +5820,11 @@ _EXPR_DISPATCH: dict[type, callable] = {
     ModuloOp: Evaluator._expr_mod,
     ExponentOp: Evaluator._expr_exp,
     UnaryMinusOp: Evaluator._expr_unary_minus,
+    BitwiseOrOp: Evaluator._expr_bitor,
+    BitwiseAndOp: Evaluator._expr_bitand,
+    BitwiseNotOp: Evaluator._expr_bitnot,
+    BitwiseShiftLeftOp: Evaluator._expr_shl,
+    BitwiseShiftRightOp: Evaluator._expr_shr,
     LogicalAndOp: Evaluator._expr_and,
     LogicalOrOp: Evaluator._expr_or,
     LogicalNotOp: Evaluator._expr_not,

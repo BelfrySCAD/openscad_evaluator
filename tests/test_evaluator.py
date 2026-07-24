@@ -197,6 +197,66 @@ class TestExpressions:
 
 
 # ---------------------------------------------------------------------------
+# Bitwise/shift operators (real OpenSCAD PR #4833, merged 2025-03-14)
+# ---------------------------------------------------------------------------
+
+class TestBitwiseOps:
+    def test_basic_operations(self):
+        _, lines = run(
+            'echo(12 & 5, 12 | 5, 2 << 3, 16 >> 2, ~0, ~-1, ~5);'
+        )
+        assert lines == ["ECHO: 4, 13, 16, 4, -1, 0, -6"]
+
+    def test_precedence_shift_over_and(self):
+        # Shift binds tighter than binary-and/or -- real OpenSCAD's grammar
+        # deliberately differs from C to avoid `x & 1 == 0` parsing as
+        # `x & (1 == 0)`.
+        _, lines = run("echo((3 << 1 & 14) == ((3 << 1) & 14));")
+        assert lines == ["ECHO: true"]
+
+    def test_precedence_and_over_or(self):
+        _, lines = run("echo((1 & 2 | 3) == ((1 & 2) | 3));")
+        assert lines == ["ECHO: true"]
+
+    def test_precedence_or_over_comparison(self):
+        _, lines = run("echo((1 | 2 > 3) == ((1 | 2) > 3));")
+        assert lines == ["ECHO: true"]
+
+    def test_negative_numbers(self):
+        _, lines = run("echo((-1 | 0) == -1, (-1 | 0) == ~0);")
+        assert lines == ["ECHO: true, true"]
+
+    def test_fractions_truncate(self):
+        _, lines = run("echo(1.4 | 0, 1.6 | 0, -1.4 & 3, -1.6 & 3);")
+        assert lines == ["ECHO: 1, 1, 3, 3"]
+
+    def test_shift_overflow_wraps_like_64bit_twos_complement(self):
+        _, lines = run("echo(1 << 32 << 32, 1 >> 1);")
+        assert lines == ["ECHO: 0, 0"]
+
+    def test_out_of_range_shift_is_undef_and_warns(self):
+        _, lines = run(
+            "echo(is_undef(1 << 64), is_undef(1 << -1), is_undef(1 >> 64), is_undef(1 >> -1));"
+        )
+        assert lines == [
+            "WARNING: shift too large in file <string>, line 1",
+            "WARNING: negative shift in file <string>, line 1",
+            "WARNING: shift too large in file <string>, line 1",
+            "WARNING: negative shift in file <string>, line 1",
+            "ECHO: true, true, true, true",
+        ]
+
+    def test_non_numeric_operand_is_undef_and_warns(self):
+        _, lines = run('echo(is_undef(1 | "hello"), is_undef(1 & true), is_undef(~"hello"));')
+        assert lines == [
+            'WARNING: undefined operation (number | string) in file <string>, line 1',
+            'WARNING: undefined operation (number & bool) in file <string>, line 1',
+            'WARNING: undefined operation (~string) in file <string>, line 1',
+            "ECHO: true, true, true",
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Variables and scoping
 # ---------------------------------------------------------------------------
 
@@ -1336,6 +1396,73 @@ class TestDefaultParamScoping:
     def test_explicit_arg_bypasses_default(self):
         _, lines = run("function f(x, y=k) = x + y; k=100; echo(f(1, 5));")
         assert lines == ["ECHO: 6"]
+
+
+# ---------------------------------------------------------------------------
+# $-prefixed function/module parameters: regression coverage for a bug where
+# _apply_defaults checked ONLY child_ctx.let for "already bound", regardless
+# of a param's $-prefix -- so a $-prefixed param bound into child_ctx.dyn (by
+# the bound-argument loop just above _apply_defaults' own call) still looked
+# "unbound" to it, and its own no-default branch clobbered the real value
+# with a fresh None/undef written into child_ctx.let. Since _eval_identifier
+# checks .let before .dyn, that stray None then shadowed the correct .dyn
+# value for any bare `$fn`-style reference in the body -- even though
+# geometry builtins reading ctx.dyn directly (sphere's own $fn lookup, the
+# pre-existing test_module_with_dollar_arg above) never noticed, since they
+# never go through _eval_identifier at all. The same bug affected a
+# $-prefixed parameter's OWN declared default value too (never reached dyn
+# either). Fixed by making _apply_defaults check `bound` (the caller's
+# actual argument dict) instead of child_ctx.let/dyn, and route a
+# $-prefixed name's result into child_ctx.dyn instead of .let.
+# ---------------------------------------------------------------------------
+
+class TestDollarPrefixedParameterBinding:
+    def test_function_dollar_param_bound_by_caller_visible_as_identifier(self):
+        _, lines = run("function f($fn) = $fn; echo(f($fn=16));")
+        assert lines == ["ECHO: 16"]
+
+    def test_function_dollar_param_default_visible_as_identifier(self):
+        _, lines = run("function f($fn=16) = $fn; echo(f());")
+        assert lines == ["ECHO: 16"]
+
+    def test_function_literal_dollar_param_bound_by_caller_visible_as_identifier(self):
+        _, lines = run("g = function($fn) $fn; echo(g($fn=16));")
+        assert lines == ["ECHO: 16"]
+
+    def test_module_dollar_param_bound_by_caller_visible_as_identifier(self):
+        src = 'module m($fn) { echo($fn); } m($fn=16);'
+        _, lines = run(src)
+        assert lines == ["ECHO: 16"]
+
+    def test_module_dollar_param_default_visible_as_identifier(self):
+        src = 'module m($fn=16) { echo($fn); } m();'
+        _, lines = run(src)
+        assert lines == ["ECHO: 16"]
+
+    def test_share_dyn_fast_path_does_not_leak_default_into_caller(self):
+        # The share_dyn optimization (_eval_user_function/
+        # _eval_function_literal) must be False whenever the declaration
+        # has ANY $-prefixed parameter, even one the caller didn't supply
+        # this call -- otherwise child_ctx.dyn is the SAME dict object as
+        # the caller's own ctx.dyn, and _apply_defaults' new dyn-writing
+        # branch would corrupt the caller's $fn instead of only this call's
+        # private copy. Calling f() a second time with a caller-side $fn
+        # already set confirms the caller's own $fn survives unpolluted.
+        src = """
+        function f($fn=99) = $fn;
+        result = let($fn=5) f();
+        echo(result);
+        echo($fn);
+        """
+        _, lines = run(src)
+        # result: f() gets no $fn argument, so its own default (99) applies
+        # -- $fn=5 from the enclosing let() is irrelevant here since f()
+        # declares its own $fn parameter, shadowing the dynamically-scoped
+        # one entirely for its own body. The trailing echo($fn) confirms
+        # the caller's own $fn (root-seeded default 0, untouched by the
+        # let() -- which only scopes to evaluating f() itself) survived
+        # unpolluted by f()'s private dyn write.
+        assert lines == ["ECHO: 99", "ECHO: 0"]
 
 
 # ---------------------------------------------------------------------------
