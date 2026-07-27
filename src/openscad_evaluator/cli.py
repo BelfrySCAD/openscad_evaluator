@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         evaluator = Evaluator(
             debug_hook=repl.debug_hook, error_break_fn=repl.error_break, return_hook=repl.return_hook,
         )
+        repl._evaluator = evaluator  # lets "child" read Evaluator._last_children_positions
     else:
         evaluator = Evaluator()
 

@@ -68,6 +68,9 @@ Commands (while paused):
   step, s                 Step into the next statement/call
   next, n                 Step over the next statement (don't descend into calls)
   finish, fin             Run until the current call returns
+  child, sc               Step to child: run until children()/children(N) forwards
+                          control to one of this call's own { ... } children
+                          (or it returns, if it never calls children() at all)
   print <name>, p         Print a variable's value
   backtrace, bt, where    Show the call stack (innermost first)
   list [line], l          Show source around a line (default: current line)
@@ -94,13 +97,23 @@ class DebugRepl:
         self._source_lines_by_origin: dict[str, list[str]] = {self._source_path: self._read_lines(source_path)}
         self._breakpoints: dict[str, set[int]] = {}
         self._break_on_first = True
-        self._step_cmd: str | None = None   # "into" / "over" / "out"
+        self._step_cmd: str | None = None   # "into" / "over" / "out" / "to_child"
         self._step_line = 0
         self._step_depth = 0
         self._step_origin = ""
+        self._step_to_child_targets: set[tuple[str | None, int]] = set()
         self._pending_mods: dict = {}
         self._print_count = 0
         self._quit = False
+        # Set by the caller (cli.py) once the Evaluator exists -- "child"
+        # reads Evaluator._last_children_positions (see that field's own
+        # doc comment), computed fresh on every _check_debug call, to know
+        # which of the currently-paused call's own { ... } children a
+        # children()/children(N) forward might land on. Left unwired
+        # (None), "child" behaves like "finish" (the depth-drop fallback
+        # below still applies), matching what happens if the paused call
+        # never invokes children() at all.
+        self._evaluator = None
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -272,6 +285,16 @@ class DebugRepl:
             step_hit = (line != self._step_line or resolved != self._step_origin) and not expr_level
         elif step == "out":
             step_hit = depth < self._step_depth and not expr_level
+        elif step == "to_child":
+            # Pause the first time control reaches one of the paused call's
+            # own children (wherever children()/children(N) forwards to
+            # them) -- or, if the call never invokes children() at all,
+            # fall back to the same "call returned" safety net step-out
+            # uses, so this can never hang. Mirrors BelfrySCAD's
+            # DebugSession._make_hook exactly.
+            step_hit = not expr_level and (
+                (resolved, line) in self._step_to_child_targets or depth < self._step_depth
+            )
 
         should_pause = (
             forced
@@ -331,6 +354,8 @@ class DebugRepl:
                 return self._resume("over", line, depth, origin)
             elif cmd in ("finish", "fin"):
                 return self._resume("out", line, depth, origin)
+            elif cmd in ("child", "sc"):
+                return self._resume("to_child", line, depth, origin)
             elif cmd in ("print", "p"):
                 self._print_var(arg, visible_vars)
             elif cmd in ("backtrace", "bt", "where"):
@@ -354,5 +379,14 @@ class DebugRepl:
     def _resume(self, step_cmd: str | None, line: int = 0, depth: int = 0, origin: str = ""):
         if step_cmd is not None:
             self._step_cmd, self._step_line, self._step_depth, self._step_origin = step_cmd, line, depth, origin
+        if step_cmd == "to_child":
+            targets = getattr(self._evaluator, "_last_children_positions", None) if self._evaluator else None
+            # Normalize each target's origin through the same _resolve()
+            # used on the hook's own `resolved` before comparing -- these
+            # positions are captured raw (whatever the AST's own position
+            # carries), which can disagree with the realpath'd form (e.g.
+            # macOS's /var -> /private/var) even for the objectively same
+            # file.
+            self._step_to_child_targets = {(self._resolve(o), ln) for o, ln in (targets or [])}
         mods, self._pending_mods = self._pending_mods, {}
         return "continue", mods
