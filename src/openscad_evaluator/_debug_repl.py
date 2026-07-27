@@ -15,6 +15,7 @@ statements -- ported rather than re-derived to avoid reintroducing those bugs.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -27,6 +28,23 @@ try:
     import readline  # noqa: F401
 except ImportError:
     pass
+
+
+@dataclass
+class DeclInfo:
+    """One user-defined function/module declaration -- backs both
+    "info functions"/"info modules" (display) and "list <name>" (lookup by
+    name, jumping to wherever it's actually declared, which may be a
+    different file than wherever the debugger happens to be paused right
+    now -- e.g. a `use <file>`-injected declaration). Constructed by the
+    caller (cli.py, which has direct AST access) and handed to
+    set_declared_names(); `origin` need not be pre-resolved --
+    set_declared_names() canonicalizes it the same way every other origin
+    this class stores/compares already is."""
+    name: str
+    params: str  # "a, b=2" ("" if no parameters)
+    origin: str
+    line: int
 
 
 def _fmt(v) -> str:
@@ -71,7 +89,8 @@ Commands (before "run"):
   info breakpoints       List breakpoints
   info modules           List user-defined modules
   info functions         List user-defined functions
-  list [line], l         Show source around a line (default: start of file)
+  list [line|name], l    Show source around a line, or a function/module
+                          ("foo" if unambiguous, else "function:foo"/"module:foo")
   quit, q, exit          Exit without running
   help, h                Show this text
 (Enter on a blank line repeats the last restart/list)"""
@@ -93,7 +112,8 @@ Commands (while paused):
   info variables          List currently visible variables
   info modules            List user-defined modules
   info functions          List user-defined functions
-  list [line], l          Show source around a line (default: current line)
+  list [line|name], l     Show source around a line, or a function/module
+                          ("foo" if unambiguous, else "function:foo"/"module:foo")
   break [file:]line, b    Set a breakpoint
   delete [file:]line, d   Delete a breakpoint (no args: delete all)
   set <name>=<value>      Override a variable's value on resume
@@ -145,11 +165,11 @@ class DebugRepl:
         # never invokes children() at all.
         self._evaluator = None
         # Fed by set_declared_names() (cli.py, which has direct AST
-        # access) for "info functions"/"info modules" -- already-
-        # formatted, already-sorted display lines, so this class stays
-        # fully decoupled from parser/AST types.
-        self._declared_function_lines: list[str] = []
-        self._declared_module_lines: list[str] = []
+        # access) for "info functions"/"info modules" (display) and
+        # "list <name>" (lookup), so this class stays fully decoupled
+        # from parser/AST types beyond the one DeclInfo dataclass.
+        self._declared_functions: list[DeclInfo] = []
+        self._declared_modules: list[DeclInfo] = []
         # What the paused session's own "stop"/"restart"/"quit" command
         # decided, once it raises the shared DEBUGGING_STOPPED_MESSAGE
         # EvalError -- read by cli.py (via take_post_run_action()) after
@@ -230,13 +250,44 @@ class DebugRepl:
             print(f"breakpoint at {os.path.basename(origin)}:{line}")
 
     def _list_source(self, arg: str, current_line: int | None = None, origin: str | None = None):
-        lines = self._lines_for(origin or self._source_path)
+        """`arg` also accepts a name instead of a line number -- "fib"
+        (looked up unqualified, erroring if ambiguous between the
+        function/module namespaces) or "function:fib"/"module:fib"
+        (explicit), jumping to that declaration's own file:line
+        regardless of the current pause location. See DeclInfo's own
+        doc comment for why this needs _declared_functions/_declared_modules,
+        not just a line number."""
+        list_origin = origin or self._source_path
         target = current_line if current_line is not None else 1
-        if arg.strip():
+        t = arg.strip()
+
+        if t:
             try:
-                target = int(arg.strip())
+                target = int(t)
             except ValueError:
-                pass
+                # "function:name" / "module:name" qualifies which namespace
+                # to search -- reuses this REPL's existing "prefix:rest"
+                # colon convention (break/delete's own [file:]line parsing).
+                # Unqualified: search both, erroring if the name exists in
+                # both (a function and a module CAN share a name in OpenSCAD).
+                qualifier, sep, name = t.partition(":")
+                if not sep:
+                    qualifier, name = "", t
+                fn = self._find_decl(self._declared_functions, name) if qualifier in ("", "function") else None
+                mod = self._find_decl(self._declared_modules, name) if qualifier in ("", "module") else None
+                if fn and mod:
+                    print(f'Both a function and a module are named "{name}" -- '
+                          f'use "list function:{name}" or "list module:{name}".')
+                    return
+                decl = fn or mod
+                if not decl:
+                    print(f'No symbol "{name}" in current context.')
+                    return
+                list_origin = decl.origin
+                target = decl.line
+                current_line = None  # jumping to a declaration, not the paused line -- no "->" marker
+
+        lines = self._lines_for(list_origin)
         if not lines:
             print("No source available.")
             return
@@ -291,30 +342,41 @@ class DebugRepl:
         for name in sorted(visible_vars):
             print(f"{name} = {_fmt(visible_vars[name])}")
 
-    def _print_declared_functions(self):
-        if not self._declared_function_lines:
-            print("No user-defined functions.")
+    @staticmethod
+    def _print_decls(decls: list[DeclInfo], kind_label: str):
+        if not decls:
+            print(f"No user-defined {kind_label}.")
             return
-        print("User-defined functions:")
-        for line in self._declared_function_lines:
-            print(f"  {line}")
+        print(f"User-defined {kind_label}:")
+        for d in decls:
+            print(f"  {d.name}({d.params}) at {os.path.basename(d.origin)}:{d.line}")
+
+    def _print_declared_functions(self):
+        self._print_decls(self._declared_functions, "functions")
 
     def _print_declared_modules(self):
-        if not self._declared_module_lines:
-            print("No user-defined modules.")
-            return
-        print("User-defined modules:")
-        for line in self._declared_module_lines:
-            print(f"  {line}")
+        self._print_decls(self._declared_modules, "modules")
 
-    def set_declared_names(self, function_lines: list[str], module_lines: list[str]):
-        """Feeds "info functions"/"info modules" their (already-formatted,
-        already-sorted) display lines -- computed once by the caller
-        (cli.py) from the fully use-resolved top-level node list. Call
-        before run_prompt(); an empty list just means "no user-defined
-        functions/modules" (a real, reportable state, not an error)."""
-        self._declared_function_lines = function_lines
-        self._declared_module_lines = module_lines
+    @staticmethod
+    def _find_decl(decls: list[DeclInfo], name: str) -> DeclInfo | None:
+        for d in decls:
+            if d.name == name:
+                return d
+        return None
+
+    def set_declared_names(self, functions: list[DeclInfo], modules: list[DeclInfo]):
+        """Feeds "info functions"/"info modules" (display) and
+        "list <name>" (lookup) their declaration data -- computed once by
+        the caller (cli.py, which has direct AST access) from the fully
+        use-resolved top-level node list. Call before run_prompt(); an
+        empty list just means "no user-defined functions/modules" (a
+        real, reportable state, not an error)."""
+        for d in functions:
+            d.origin = self._resolve(d.origin)
+        for d in modules:
+            d.origin = self._resolve(d.origin)
+        self._declared_functions = functions
+        self._declared_modules = modules
 
     def prepare_for_run(self):
         """Resets everything that must start fresh for a (re)run: the

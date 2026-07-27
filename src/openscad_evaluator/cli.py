@@ -26,30 +26,33 @@ import sys
 
 from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile
 
-from openscad_evaluator._debug_repl import DebugRepl
+from openscad_evaluator._debug_repl import DebugRepl, DeclInfo
 from openscad_evaluator.evaluator import (
     DEBUGGING_STOPPED_MESSAGE, EvalError, Evaluator, resolve_use_scopes, to_renderable_bodies,
 )
 from openscad_evaluator.export import export_bodies, format_for_path
 
 
-def _collect_declared_lines(nodes: list, cls: type, main_path: str) -> list[str]:
-    """"info functions"/"info modules": one "name(params) at file:line" per
+def _collect_declarations(nodes: list, cls: type, main_path: str) -> list[DeclInfo]:
+    """"info functions"/"info modules"/"list <name>": one DeclInfo per
     top-level FunctionDeclaration/ModuleDeclaration node in the fully
     use-resolved node list, so a `use <file>`-injected declaration shows up
-    too, matching what's actually callable -- sorted for deterministic
-    output (the input list's own order isn't alphabetical). Ported
-    identically to the C++ port's own collectDeclaredLines in
+    too, matching what's actually callable -- sorted by name for
+    deterministic "info" output (DebugRepl.set_declared_names() itself
+    resolves each origin, so the raw node.position.origin here is enough).
+    Ported identically to the C++ port's own collectDeclarations in
     cli_lib.cpp."""
-    lines = []
-    for n in nodes:
-        if not isinstance(n, cls):
-            continue
-        params = ", ".join(str(p) for p in n.parameters)
-        origin = n.position.origin or main_path
-        lines.append(f"{n.name.name}({params}) at {os.path.basename(origin)}:{n.position.line}")
-    lines.sort()
-    return lines
+    decls = [
+        DeclInfo(
+            name=n.name.name,
+            params=", ".join(str(p) for p in n.parameters),
+            origin=n.position.origin or main_path,
+            line=n.position.line,
+        )
+        for n in nodes if isinstance(n, cls)
+    ]
+    decls.sort(key=lambda d: d.name)
+    return decls
 
 
 def _select_and_sort_call_sites(profile, sort: str, min_self: float, min_calls: int) -> list:
@@ -190,8 +193,8 @@ def main(argv: list[str] | None = None) -> int:
         # Python's own default SIGINT behavior otherwise.
         signal.signal(signal.SIGINT, lambda signum, frame: repl.request_pause())
         repl.set_declared_names(
-            _collect_declared_lines(nodes, FunctionDeclaration, args.input),
-            _collect_declared_lines(nodes, ModuleDeclaration, args.input),
+            _collect_declarations(nodes, FunctionDeclaration, args.input),
+            _collect_declarations(nodes, ModuleDeclaration, args.input),
         )
 
     # Runs at least once; loops again only when a paused --debug session
