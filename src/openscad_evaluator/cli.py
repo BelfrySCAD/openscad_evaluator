@@ -24,11 +24,32 @@ import os
 import signal
 import sys
 
-from openscad_lalr_parser import getASTfromFile
+from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile
 
 from openscad_evaluator._debug_repl import DebugRepl
-from openscad_evaluator.evaluator import EvalError, Evaluator, resolve_use_scopes, to_renderable_bodies
+from openscad_evaluator.evaluator import (
+    DEBUGGING_STOPPED_MESSAGE, EvalError, Evaluator, resolve_use_scopes, to_renderable_bodies,
+)
 from openscad_evaluator.export import export_bodies, format_for_path
+
+
+def _collect_declared_lines(nodes: list, cls: type, main_path: str) -> list[str]:
+    """"info functions"/"info modules": one "name(params) at file:line" per
+    top-level FunctionDeclaration/ModuleDeclaration node in the fully
+    use-resolved node list, so a `use <file>`-injected declaration shows up
+    too, matching what's actually callable -- sorted for deterministic
+    output (the input list's own order isn't alphabetical). Ported
+    identically to the C++ port's own collectDeclaredLines in
+    cli_lib.cpp."""
+    lines = []
+    for n in nodes:
+        if not isinstance(n, cls):
+            continue
+        params = ", ".join(str(p) for p in n.parameters)
+        origin = n.position.origin or main_path
+        lines.append(f"{n.name.name}({params}) at {os.path.basename(origin)}:{n.position.line}")
+    lines.sort()
+    return lines
 
 
 def _select_and_sort_call_sites(profile, sort: str, min_self: float, min_calls: int) -> list:
@@ -160,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: AST too deeply nested (recursion limit exceeded while resolving 'use')", file=sys.stderr)
         return 1
 
+    repl = None
     if args.debug:
         repl = DebugRepl(args.input)
         # Ctrl+C during a running evaluate() pauses like a breakpoint
@@ -167,46 +189,79 @@ def main(argv: list[str] | None = None) -> int:
         # raising an unhandled KeyboardInterrupt mid-AST-walk, which is
         # Python's own default SIGINT behavior otherwise.
         signal.signal(signal.SIGINT, lambda signum, frame: repl.request_pause())
-        if not repl.run_prompt():
-            return 0
-        evaluator = Evaluator(
-            debug_hook=repl.debug_hook, error_break_fn=repl.error_break, return_hook=repl.return_hook,
-            profile=bool(args.profile),
+        repl.set_declared_names(
+            _collect_declared_lines(nodes, FunctionDeclaration, args.input),
+            _collect_declared_lines(nodes, ModuleDeclaration, args.input),
         )
-        repl._evaluator = evaluator  # lets "child" read Evaluator._last_children_positions
-    else:
-        evaluator = Evaluator(profile=bool(args.profile))
 
-    try:
-        bodies, _id_to_node = evaluator.evaluate(nodes, root_scope)
-    except RecursionError:
-        print("error: AST too deeply nested (recursion limit exceeded during evaluation)", file=sys.stderr)
-        return 1
-    except EvalError as e:
-        print(str(e), file=sys.stderr)
-        return 1
+    # Runs at least once; loops again only when a paused --debug session
+    # issues "stop" (back to the pre-run prompt) or "restart" (skip the
+    # prompt, go straight back into a fresh run) -- both unwind out of
+    # evaluate() via the same shared DEBUGGING_STOPPED_MESSAGE EvalError
+    # "quit" already used, disambiguated below via
+    # DebugRepl.take_post_run_action(). Without --debug this loop always
+    # runs exactly once (need_prompt/repl-related branches are all no-ops
+    # when not args.debug), so this is the same single-pass behavior as
+    # before, not a new code path.
+    need_prompt = True
+    while True:
+        if args.debug:
+            if need_prompt and not repl.run_prompt():
+                return 0  # user quit before ever running
+            repl.prepare_for_run()
+        need_prompt = True
 
-    if args.profile:
+        if args.debug:
+            evaluator = Evaluator(
+                debug_hook=repl.debug_hook, error_break_fn=repl.error_break, return_hook=repl.return_hook,
+                profile=bool(args.profile),
+            )
+            repl._evaluator = evaluator  # lets "child" read Evaluator._last_children_positions
+        else:
+            evaluator = Evaluator(profile=bool(args.profile))
+
         try:
-            with open(args.profile, "w", encoding="utf-8") as f:
-                f.write(_format_profile_report(
-                    args.input, evaluator.profile_result,
-                    fmt=args.profile_format, sort=args.profile_sort,
-                    min_self=args.profile_min_self, min_calls=args.profile_min_calls,
-                ))
-        except OSError as e:
+            bodies, _id_to_node = evaluator.evaluate(nodes, root_scope)
+        except RecursionError:
+            print("error: AST too deeply nested (recursion limit exceeded during evaluation)", file=sys.stderr)
+            return 1
+        except EvalError as e:
+            if args.debug and str(e) == DEBUGGING_STOPPED_MESSAGE:
+                action = repl.take_post_run_action()
+                if action == "stopped":
+                    print("Evaluation stopped.")
+                    continue  # need_prompt stays True -> back to the pre-run prompt
+                if action == "restart":
+                    need_prompt = False  # skip the prompt, run again immediately
+                    continue
+                # action in ("quit", None): fall through to the generic
+                # error path below -- str(e) is already
+                # DEBUGGING_STOPPED_MESSAGE, matching this exact behavior
+                # from before restart/stop existed.
+            print(str(e), file=sys.stderr)
+            return 1
+
+        if args.profile:
+            try:
+                with open(args.profile, "w", encoding="utf-8") as f:
+                    f.write(_format_profile_report(
+                        args.input, evaluator.profile_result,
+                        fmt=args.profile_format, sort=args.profile_sort,
+                        min_self=args.profile_min_self, min_calls=args.profile_min_calls,
+                    ))
+            except OSError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+
+        bodies = to_renderable_bodies(bodies)
+        try:
+            export_bodies(args.output, bodies, fmt=fmt)
+        except (ValueError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
 
-    bodies = to_renderable_bodies(bodies)
-    try:
-        export_bodies(args.output, bodies, fmt=fmt)
-    except (ValueError, ImportError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-
-    print(f"Exported to {args.output}")
-    return 0
+        print(f"Exported to {args.output}")
+        return 0
 
 
 if __name__ == "__main__":

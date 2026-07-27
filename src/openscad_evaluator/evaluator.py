@@ -51,6 +51,17 @@ class EvalError(Exception):
     pass
 
 
+# The exact message _check_debug() raises EvalError with when a debug
+# hook's returned cmd == "stop" is honored -- exported (not a leading-
+# underscore internal name) so cli.py can tell "the debugger itself asked
+# to abort" (its own "stop"/"restart"/"quit" commands) apart from a
+# genuine script error (assert()/etc, possibly also inspected via an
+# error_break() pause that happens to have "stop" typed into it) without
+# the two copies of this string ever risking drifting apart. Mirrors the
+# C++ port's own debug_hooks.hpp::kDebuggingStoppedMessage.
+DEBUGGING_STOPPED_MESSAGE = "Debugging stopped."
+
+
 def _is_flat_numeric(v):
     if not v:
         return False
@@ -2323,7 +2334,7 @@ class Evaluator:
         for k, v in mods.items():
             ctx.let[k] = v
         if cmd == "stop":
-            raise EvalError("Debugging stopped.")
+            raise EvalError(DEBUGGING_STOPPED_MESSAGE)
 
     @staticmethod
     def _loc(pos) -> str:

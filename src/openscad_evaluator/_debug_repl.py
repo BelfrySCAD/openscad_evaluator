@@ -65,13 +65,16 @@ def _parse_value(s: str):
 
 _PRE_RUN_HELP = """\
 Commands (before "run"):
-  run, r                 Start evaluating the script
+  run, r, restart        Start evaluating the script
   break [file:]line, b   Set a breakpoint
   delete [file:]line, d  Delete a breakpoint (no args: delete all)
   info breakpoints       List breakpoints
+  info modules           List user-defined modules
+  info functions         List user-defined functions
   list [line], l         Show source around a line (default: start of file)
-  quit, q                Exit without running
-  help, h                Show this text"""
+  quit, q, exit          Exit without running
+  help, h                Show this text
+(Enter on a blank line repeats the last restart/list)"""
 
 _PAUSED_HELP = """\
 Commands (while paused):
@@ -82,14 +85,22 @@ Commands (while paused):
   child, sc               Step to child: run until children()/children(N) forwards
                           control to one of this call's own { ... } children
                           (or it returns, if it never calls children() at all)
+  stop                    Abort the current evaluation, return to the pre-run prompt
+  restart, r              Abort the current evaluation and run again from the start
   print <name>, p         Print a variable's value
   backtrace, bt, where    Show the call stack (innermost first)
+  info breakpoints        List breakpoints
+  info variables          List currently visible variables
+  info modules            List user-defined modules
+  info functions          List user-defined functions
   list [line], l          Show source around a line (default: current line)
   break [file:]line, b    Set a breakpoint
   delete [file:]line, d   Delete a breakpoint (no args: delete all)
   set <name>=<value>      Override a variable's value on resume
-  quit, q                 Abort evaluation
-  help, h                 Show this text"""
+  quit, q, exit           Abort evaluation
+  help, h                 Show this text
+(Enter on a blank line repeats the last step/next/child/restart/
+ continue/finish/list)"""
 
 
 class DebugRepl:
@@ -133,6 +144,30 @@ class DebugRepl:
         # below still applies), matching what happens if the paused call
         # never invokes children() at all.
         self._evaluator = None
+        # Fed by set_declared_names() (cli.py, which has direct AST
+        # access) for "info functions"/"info modules" -- already-
+        # formatted, already-sorted display lines, so this class stays
+        # fully decoupled from parser/AST types.
+        self._declared_function_lines: list[str] = []
+        self._declared_module_lines: list[str] = []
+        # What the paused session's own "stop"/"restart"/"quit" command
+        # decided, once it raises the shared DEBUGGING_STOPPED_MESSAGE
+        # EvalError -- read by cli.py (via take_post_run_action()) after
+        # catching that specific exception, to decide whether to return to
+        # the pre-run prompt ("stopped"), immediately re-run ("restart"),
+        # or actually exit the CLI ("quit"). None is the initial/reset
+        # state -- also what a genuine (non-debugger-triggered) EvalError
+        # leaves it at.
+        self._post_run_action: str | None = None
+        # Hitting Enter on a blank line re-issues this exact command+arg,
+        # mirroring gdb's own "repeat last command" convention -- only
+        # step/next/child/restart/continue/finish/list ever set this
+        # (None means "nothing to repeat yet", so a blank line before any
+        # of those is a no-op like it always was). Shared across
+        # run_prompt() and _interact() rather than reset between them,
+        # matching gdb's own single persistent "last command" register.
+        self._last_repeatable_cmd: str | None = None
+        self._last_repeatable_arg = ""
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -249,6 +284,60 @@ class DebugRepl:
     def _visible_vars(frame: dict) -> dict:
         return {**frame.get("outer_scope", {}), **frame.get("local_scope", {})}
 
+    def _print_variables(self, visible_vars: dict):
+        if not visible_vars:
+            print("No variables in current context.")
+            return
+        for name in sorted(visible_vars):
+            print(f"{name} = {_fmt(visible_vars[name])}")
+
+    def _print_declared_functions(self):
+        if not self._declared_function_lines:
+            print("No user-defined functions.")
+            return
+        print("User-defined functions:")
+        for line in self._declared_function_lines:
+            print(f"  {line}")
+
+    def _print_declared_modules(self):
+        if not self._declared_module_lines:
+            print("No user-defined modules.")
+            return
+        print("User-defined modules:")
+        for line in self._declared_module_lines:
+            print(f"  {line}")
+
+    def set_declared_names(self, function_lines: list[str], module_lines: list[str]):
+        """Feeds "info functions"/"info modules" their (already-formatted,
+        already-sorted) display lines -- computed once by the caller
+        (cli.py) from the fully use-resolved top-level node list. Call
+        before run_prompt(); an empty list just means "no user-defined
+        functions/modules" (a real, reportable state, not an error)."""
+        self._declared_function_lines = function_lines
+        self._declared_module_lines = module_lines
+
+    def prepare_for_run(self):
+        """Resets everything that must start fresh for a (re)run: the
+        break-on-first-statement flag, any in-flight step command, and
+        pending `set` overrides -- called once per run, including the
+        very first one, so "restart" is indistinguishable from a genuine
+        fresh "run" except that breakpoints/history/print-counter carry
+        over (matching gdb's own `run`-after-`kill` behavior). Does NOT
+        touch _breakpoints or _print_count."""
+        self._quit = False
+        self._post_run_action = None
+        self._break_on_first = True
+        self._step_cmd = None
+        self._step_to_child_targets = set()
+        self._pending_mods = {}
+
+    def take_post_run_action(self) -> str | None:
+        """Reads and resets the outcome of the paused session's own
+        "stop"/"restart"/"quit" command (None if evaluation completed
+        normally, or hasn't been asked to abort at all)."""
+        action, self._post_run_action = self._post_run_action, None
+        return action
+
     def request_pause(self):
         """Requests a pause at the next debug_hook() call, exactly like
         hitting a breakpoint. Called by a real SIGINT handler (see cli.py)
@@ -276,18 +365,41 @@ class DebugRepl:
             cmd, _, arg = raw.strip().partition(" ")
             arg = arg.strip()
             if not cmd:
-                continue
-            if cmd in ("run", "r"):
+                # Hitting Enter on a blank line repeats the last "restart"/
+                # "list" (the only two of the repeatable commands valid at
+                # this prompt) -- mirrors gdb's own repeat-last-command
+                # convention. No prior repeatable command yet: unchanged
+                # no-op behavior.
+                if self._last_repeatable_cmd is None:
+                    continue
+                cmd, arg = self._last_repeatable_cmd, self._last_repeatable_arg
+            # "restart" is also accepted here (not just "run"/"r") so a
+            # user who just typed "stop" can reflexively type "restart"
+            # again -- with nothing currently running, the two commands
+            # mean the same thing at this prompt.
+            if cmd in ("run", "r", "restart"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "restart", ""
                 return True
             elif cmd in ("break", "b"):
                 self._add_breakpoint(arg)
             elif cmd in ("delete", "d"):
                 self._delete_breakpoint(arg)
-            elif cmd == "info" and arg.startswith("break"):
-                self._print_breakpoints()
+            elif cmd == "info":
+                sub = arg.strip()
+                if sub.startswith("break"):
+                    self._print_breakpoints()
+                elif sub == "modules":
+                    self._print_declared_modules()
+                elif sub == "functions":
+                    self._print_declared_functions()
+                elif sub == "variables":
+                    print('No variables to show before "run".')
+                else:
+                    print(f'Undefined info command: "{sub}". Try "help".')
             elif cmd in ("list", "l"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "list", arg
                 self._list_source(arg)
-            elif cmd in ("quit", "q"):
+            elif cmd in ("quit", "q", "exit"):
                 return False
             elif cmd in ("help", "h"):
                 print(_PRE_RUN_HELP)
@@ -381,27 +493,61 @@ class DebugRepl:
             except EOFError:
                 print()
                 self._quit = True
+                self._post_run_action = "quit"
                 return "stop", {}
             cmd, _, arg = raw.strip().partition(" ")
             arg = arg.strip()
             if not cmd:
-                continue
+                # Hitting Enter on a blank line repeats the last step/next/
+                # child/restart/continue/finish/list -- mirrors gdb's own
+                # repeat-last-command convention. No prior repeatable
+                # command yet: unchanged no-op behavior.
+                if self._last_repeatable_cmd is None:
+                    continue
+                cmd, arg = self._last_repeatable_cmd, self._last_repeatable_arg
 
             if cmd in ("continue", "c"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "continue", ""
                 return self._resume(None)
             elif cmd in ("step", "s"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "step", ""
                 return self._resume("into", line, depth, origin)
             elif cmd in ("next", "n"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "next", ""
                 return self._resume("over", line, depth, origin)
             elif cmd in ("finish", "fin"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "finish", ""
                 return self._resume("out", line, depth, origin)
             elif cmd in ("child", "sc"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "child", ""
                 return self._resume("to_child", line, depth, origin)
+            elif cmd == "stop":
+                self._quit = True
+                self._post_run_action = "stopped"
+                return "stop", {}
+            elif cmd in ("restart", "r"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "restart", ""
+                self._quit = True
+                self._post_run_action = "restart"
+                return "stop", {}
             elif cmd in ("print", "p"):
                 self._print_var(arg, visible_vars)
             elif cmd in ("backtrace", "bt", "where"):
                 self._print_backtrace(call_stack, origin, line)
+            elif cmd == "info":
+                sub = arg.strip()
+                if sub.startswith("break"):
+                    self._print_breakpoints()
+                elif sub == "variables":
+                    self._print_variables(visible_vars)
+                elif sub == "modules":
+                    self._print_declared_modules()
+                elif sub == "functions":
+                    self._print_declared_functions()
+                else:
+                    print(f'Undefined info command: "{sub}". Try "help".')
             elif cmd in ("list", "l"):
+                self._last_repeatable_cmd, self._last_repeatable_arg = "list", arg
                 self._list_source(arg, current_line=line, origin=origin)
             elif cmd in ("break", "b"):
                 self._add_breakpoint(arg)
@@ -409,8 +555,9 @@ class DebugRepl:
                 self._delete_breakpoint(arg)
             elif cmd == "set":
                 self._set_var(arg)
-            elif cmd in ("quit", "q"):
+            elif cmd in ("quit", "q", "exit"):
                 self._quit = True
+                self._post_run_action = "quit"
                 return "stop", {}
             elif cmd in ("help", "h"):
                 print(_PAUSED_HELP)
