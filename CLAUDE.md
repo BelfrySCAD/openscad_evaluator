@@ -60,6 +60,20 @@ reuses its previous result instead of recomputing it.
   (`openscad_cpp_evaluator`) had the identical bug in its own `DebugRepl`, fixed the same way there
   too.
 
+  Two later additions, both ported from (or discovered missing relative to) BelfrySCAD's own GUI
+  debugger (`DebugSession`, the upstream source `_debug_repl.py`'s own module docstring already
+  cites for its into/over/out semantics): **`child`** (step-to-child) pauses the first time
+  `children()`/`children(N)` forwards control to one of the paused call's own `{ ... }` children,
+  reading `Evaluator._last_children_positions` (already existed, docstring-labeled for exactly
+  this, just never wired to a REPL command); **Ctrl+C** during a running `evaluate()` now pauses
+  like a breakpoint instead of raising an unhandled `KeyboardInterrupt` (Python's own default
+  SIGINT behavior otherwise) — `cli.py` installs a `signal.signal(SIGINT, ...)` handler that calls
+  `DebugRepl.request_pause()`, a plain flag read-and-cleared in `debug_hook()` alongside
+  breakpoints/steps, mirroring `DebugSession._pause_requested`/`pause()` exactly (a GUI button
+  there, a signal here). Both required the exact same fix on the C++ port's side too — see that
+  port's own `CLAUDE.md` for the fuller writeup, including a real bug caught in `child`'s own
+  target-position matching (raw vs. realpath'd origins disagreeing across a symlink).
+
 ### Design Patterns
 
 - **Callback injection, not GUI coupling**: `Evaluator.__init__` takes `echo_fn`/`debug_hook`/
@@ -88,8 +102,9 @@ the Manifold provenance / AST-to-geometry-ID mapping API used by BelfrySCAD's WY
 - `tests/test_examples.py` — runs every script under `examples/` as `__main__`, so their own
   `assert`s double as regression coverage against the examples drifting out of sync with the API
 - `tests/test_cli.py` — the `openscad-evaluator` CLI end to end: all four export formats, error
-  exit codes, and the `--debug` REPL (breakpoints, step/next/finish, print, set, quit) driven by
-  monkeypatching `input()` with canned responses
+  exit codes, and the `--debug` REPL (breakpoints, step/next/finish/child, print, set, quit,
+  Ctrl+C-during-a-running-eval via `request_pause()`) driven by monkeypatching `input()` with
+  canned responses
 - `tests/test_export.py` — `export.py` at the unit level: format dispatch, empty-geometry errors,
   and the pure-Python 3MF writer's structure/colors/round-trip through `_load_3mf` (and a hard
   assertion that it never imports `lib3mf`)

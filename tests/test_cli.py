@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from openscad_evaluator import cli
+from openscad_evaluator._debug_repl import DebugRepl
 
 CUBE_SCRIPT = "cube([10, 10, 10]);\n"
 
@@ -191,6 +192,27 @@ class TestDebugRepl:
         _feed_input(monkeypatch, ["break 3", "run", "child", "continue"])
         assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
         assert out.stat().st_size > 0
+
+    def test_request_pause_causes_next_debug_hook_call_to_pause_like_a_breakpoint(self, tmp_path, monkeypatch, capsys):
+        # request_pause() sets the exact same flag a real SIGINT handler
+        # would (see its own docstring -- this in-process test harness,
+        # monkeypatched input() with no subprocess, can't deliver a real
+        # OS signal). Constructs a DebugRepl directly (not through
+        # cli.main()) and drives debug_hook() by hand so this is isolated
+        # from _break_on_first/_breakpoints/step_hit -- a different origin
+        # than the constructed source path means break-on-first can't be
+        # what's causing the pause, so this specifically proves
+        # request_pause()'s own contribution to the should_pause check.
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        _feed_input(monkeypatch, ["continue"])
+        repl = DebugRepl(str(src))
+        repl.request_pause()
+        cmd, mods = repl.debug_hook(
+            5, 0, forced=False, origin="/some/other/file.scad",
+            get_frames=lambda: (({}, [{}]), []),
+        )
+        assert cmd == "continue"
+        assert "Interrupted at" in capsys.readouterr().out
 
     def test_list_shows_source_from_use_injected_file_when_paused_there(self, tmp_path, monkeypatch, capsys):
         # A breakpoint hit inside a `use <file>`-injected module's own body
