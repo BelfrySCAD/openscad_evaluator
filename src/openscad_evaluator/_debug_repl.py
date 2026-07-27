@@ -105,6 +105,14 @@ class DebugRepl:
         self._pending_mods: dict = {}
         self._print_count = 0
         self._quit = False
+        # Set via request_pause() -- either by a real SIGINT handler
+        # (cli.py installs one around the evaluate() call) or, in tests,
+        # directly (no subprocess means no real OS signal can be
+        # delivered). Read-and-cleared in debug_hook(), folded into the
+        # exact same should_pause check breakpoints/steps use -- mirrors
+        # BelfrySCAD's own DebugSession._pause_requested/pause() exactly,
+        # just signal-triggered here instead of a GUI button click.
+        self._pause_requested = False
         # Set by the caller (cli.py) once the Evaluator exists -- "child"
         # reads Evaluator._last_children_positions (see that field's own
         # doc comment), computed fresh on every _check_debug call, to know
@@ -230,6 +238,16 @@ class DebugRepl:
     def _visible_vars(frame: dict) -> dict:
         return {**frame.get("outer_scope", {}), **frame.get("local_scope", {})}
 
+    def request_pause(self):
+        """Requests a pause at the next debug_hook() call, exactly like
+        hitting a breakpoint. Called by a real SIGINT handler (see cli.py)
+        so Ctrl+C during a running evaluate() drops into the paused
+        prompt; also callable directly (bypassing signal.signal entirely)
+        so tests -- which drive this in-process via monkeypatched
+        input(), no subprocess, no real OS signal deliverable -- can
+        simulate "the user just pressed Ctrl+C"."""
+        self._pause_requested = True
+
     # ------------------------------------------------------------------
     # Pre-run prompt
     # ------------------------------------------------------------------
@@ -296,8 +314,17 @@ class DebugRepl:
                 (resolved, line) in self._step_to_child_targets or depth < self._step_depth
             )
 
+        # Read-and-clear, same as BelfrySCAD's own DebugSession.pause()/
+        # pause_now -- a stray SIGINT that arrives while already blocked
+        # in input() at a prompt (not mid-evaluate()) just gets consumed
+        # here on the next statement check once the user resumes, causing
+        # an immediate re-pause; a harmless quirk, not a hang or crash.
+        pause_requested = self._pause_requested
+        self._pause_requested = False
+
         should_pause = (
             forced
+            or pause_requested
             or (self._break_on_first and not expr_level and resolved == self._source_path)
             or (line in self._breakpoints.get(resolved, set()) and not expr_level)
             or step_hit
@@ -309,7 +336,10 @@ class DebugRepl:
         self._step_cmd = None
 
         (_narrow_locals, all_frames), call_stack = get_frames()
-        print(f"\nBreakpoint hit at {os.path.basename(resolved)}:{line}")
+        if pause_requested:
+            print(f"\nInterrupted at {os.path.basename(resolved)}:{line}")
+        else:
+            print(f"\nBreakpoint hit at {os.path.basename(resolved)}:{line}")
         self._list_source("", current_line=line, origin=resolved)
         visible_vars = self._visible_vars(all_frames[0]) if all_frames else {}
         return self._interact(line, depth, resolved, visible_vars, call_stack)

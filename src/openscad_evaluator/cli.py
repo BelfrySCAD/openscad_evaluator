@@ -10,6 +10,7 @@ and during evaluation -- see `DebugRepl` in `_debug_repl.py`.
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from openscad_lalr_parser import getASTfromFile
@@ -55,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.debug:
         repl = DebugRepl(args.input)
+        # Ctrl+C during a running evaluate() pauses like a breakpoint
+        # (see DebugRepl.request_pause()'s own doc comment) instead of
+        # raising an unhandled KeyboardInterrupt mid-AST-walk, which is
+        # Python's own default SIGINT behavior otherwise.
+        signal.signal(signal.SIGINT, lambda signum, frame: repl.request_pause())
         if not repl.run_prompt():
             return 0
         evaluator = Evaluator(
