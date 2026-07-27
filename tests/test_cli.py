@@ -88,6 +88,32 @@ class TestExportFormats:
         assert out.stat().st_size > 0
 
 
+class TestProfile:
+    def test_writes_report_with_call_site_and_summary(self, tmp_path):
+        # A recursive user function gives real call sites to report on --
+        # fib(0)/fib(1) never recurse further, so the tree stays small.
+        src = _write(
+            tmp_path, "profile.scad",
+            "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\ncube([fib(4)+1, 1, 1]);\n",
+        )
+        out = tmp_path / "profile_out.stl"
+        report = tmp_path / "profile_out.txt"
+        assert cli.main([str(src), "-o", str(out), "--profile", str(report)]) == 0
+        assert out.stat().st_size > 0
+        text = report.read_text()
+        assert "Profile report for" in text
+        assert "Total time:" in text
+        assert "fib" in text
+
+    def test_unwritable_profile_path_returns_1(self, tmp_path, capsys):
+        src = _write(tmp_path, "profile2.scad", CUBE_SCRIPT)
+        out = tmp_path / "profile2_out.stl"
+        # A path inside a nonexistent directory can never be opened for writing.
+        bad_path = tmp_path / "no_such_dir_xyz" / "p.txt"
+        assert cli.main([str(src), "-o", str(out), "--profile", str(bad_path)]) == 1
+        assert "error:" in capsys.readouterr().err
+
+
 class TestErrorHandling:
     def test_syntax_error_returns_1(self, tmp_path):
         src = _write(tmp_path, "bad.scad", "cube([10,10,10]\n")
