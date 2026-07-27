@@ -102,6 +102,29 @@ reuses its previous result instead of recomputing it.
   run -- real wall-clock measurement). An unwritable output path returns exit code 1 with an
   `error: ...` message, matching every other file-write failure this CLI already handles.
 
+  **Sort/filter/CSV options, added right after**: the original `--profile` always sorted by self
+  time and always emitted plain text -- no way to sort by cumulative time or call count, no way to
+  cut a large (Anklet.scad's own real-world script produces 800+ call-site rows) report down to
+  just the rows that matter, and no machine-readable output. `--profile-sort {self,cumulative,
+  calls,name}` (default `self`) and `--profile-min-self SECONDS`/`--profile-min-calls N` (both
+  default `0`, reproducing the original unfiltered behavior) feed a new
+  `_select_and_sort_call_sites()` (filter, then sort by the chosen key, every non-`name` order
+  keeping the original tie-break rule); `_format_profile_report()` now dispatches to
+  `_render_profile_report_text()` (the original layout, unchanged) or the new
+  `_render_profile_report_csv()` (`--profile-format {text,csv}`, default `text`) -- CSV's summary
+  lives in `#`-prefixed comment lines ahead of the real header/data rows (skippable via
+  `pandas.read_csv(..., comment="#")` or `grep -v '^#'`), built with stdlib `csv.writer` (RFC-4180
+  quoting for free, no hand-rolled escaping needed). `--profile-sort`/`--profile-format` are
+  `argparse` `choices=` arguments -- invalid values exit 2 via `argparse`'s own mechanism, the same
+  precedent `--format`'s own `choices=` already set, not a new inconsistency. Ported identically
+  (same option names/defaults/CSV columns/comment convention) to the C++ port's own
+  `selectAndSortCallSites()`/`renderProfileReportText()`/`renderProfileReportCsv()` in
+  `cli_lib.cpp` -- its hand-rolled arg parser has no `choices=` equivalent, so invalid values there
+  are checked explicitly and exit 1, not 2 (a harmless cross-CLI exit-code asymmetry that falls out
+  of each side's own pre-existing parser). Manually cross-checked against Anklet.scad (see this
+  repo's own perf-tracking memory): `--profile-format csv --profile-sort cumulative
+  --profile-min-calls 100` cuts an 873-line unfiltered report down to 107 lines.
+
 ### Design Patterns
 
 - **Callback injection, not GUI coupling**: `Evaluator.__init__` takes `echo_fn`/`debug_hook`/

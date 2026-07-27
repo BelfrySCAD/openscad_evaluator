@@ -113,6 +113,76 @@ class TestProfile:
         assert cli.main([str(src), "-o", str(out), "--profile", str(bad_path)]) == 1
         assert "error:" in capsys.readouterr().err
 
+    def test_sort_calls_orders_higher_call_count_first(self, tmp_path):
+        # fib(6): the recursive call site is "fib(n-1)"/"fib(n-2)" on line 1
+        # (many calls); the toplevel call site is "fib(6)" on line 2 (one
+        # call). --profile-sort calls must put the former's row first
+        # regardless of self time. Keyed on the unique "file:line" location
+        # column rather than exact column spacing, an implementation detail
+        # this test shouldn't depend on.
+        src = _write(
+            tmp_path, "profile3.scad",
+            "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\ncube([fib(6)+1, 1, 1]);\n",
+        )
+        out = tmp_path / "profile3_out.stl"
+        report = tmp_path / "profile3_out.txt"
+        assert cli.main([str(src), "-o", str(out), "--profile", str(report), "--profile-sort", "calls"]) == 0
+        text = report.read_text()
+        recursive_row = text.find("profile3.scad:1")
+        toplevel_row = text.find("profile3.scad:2")
+        assert recursive_row != -1
+        assert toplevel_row != -1
+        assert recursive_row < toplevel_row
+
+    def test_min_calls_filters_out_low_volume_call_sites(self, tmp_path):
+        # Same script/call sites as above -- the line-2 (toplevel, 1 call)
+        # site is filtered out by a threshold the line-1 (recursive, dozens
+        # of calls) site clears.
+        src = _write(
+            tmp_path, "profile4.scad",
+            "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\ncube([fib(6)+1, 1, 1]);\n",
+        )
+        out = tmp_path / "profile4_out.stl"
+        report = tmp_path / "profile4_out.txt"
+        assert cli.main([str(src), "-o", str(out), "--profile", str(report), "--profile-min-calls", "10"]) == 0
+        text = report.read_text()
+        assert "profile4.scad:1" in text
+        assert "profile4.scad:2" not in text
+
+    def test_csv_format_writes_header_and_comma_separated_rows(self, tmp_path):
+        src = _write(
+            tmp_path, "profile5.scad",
+            "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\ncube([fib(4)+1, 1, 1]);\n",
+        )
+        out = tmp_path / "profile5_out.stl"
+        report = tmp_path / "profile5_out.csv"
+        assert cli.main([str(src), "-o", str(out), "--profile", str(report), "--profile-format", "csv"]) == 0
+        text = report.read_text()
+        assert "# total_time," in text
+        assert "kind,name,caller,call_origin,call_line,call_count,self_time,cumulative_time\n" in text
+        assert "function,fib," in text
+
+    def test_invalid_profile_sort_returns_2(self, tmp_path, capsys):
+        # argparse's own `choices=` validation rejects this before main()
+        # ever runs -- exit code 2 and a SystemExit, same as an invalid
+        # --format value already does (an existing, not new, precedent).
+        src = _write(tmp_path, "profile6.scad", CUBE_SCRIPT)
+        out = tmp_path / "profile6_out.stl"
+        report = tmp_path / "profile6_out.txt"
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([str(src), "-o", str(out), "--profile", str(report), "--profile-sort", "bogus"])
+        assert exc_info.value.code == 2
+        assert not report.exists()
+
+    def test_invalid_profile_format_returns_2(self, tmp_path, capsys):
+        src = _write(tmp_path, "profile7.scad", CUBE_SCRIPT)
+        out = tmp_path / "profile7_out.stl"
+        report = tmp_path / "profile7_out.txt"
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main([str(src), "-o", str(out), "--profile", str(report), "--profile-format", "bogus"])
+        assert exc_info.value.code == 2
+        assert not report.exists()
+
 
 class TestErrorHandling:
     def test_syntax_error_returns_1(self, tmp_path):
