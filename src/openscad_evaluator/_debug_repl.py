@@ -17,6 +17,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+try:
+    # Importing this is the entire fix: it hooks stdlib input() into
+    # GNU readline (or libedit, which is what Python's own readline module
+    # actually links against on macOS) for the rest of the process, giving
+    # every input() call arrow-key history/line-editing for free -- no
+    # other code here needs to change. Not available on Windows (no
+    # built-in equivalent), so this degrades to plain input() there.
+    import readline  # noqa: F401
+except ImportError:
+    pass
+
 
 def _fmt(v) -> str:
     if v is None:
