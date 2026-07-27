@@ -125,6 +125,61 @@ reuses its previous result instead of recomputing it.
   repo's own perf-tracking memory): `--profile-format csv --profile-sort cumulative
   --profile-min-calls 100` cuts an 873-line unfiltered report down to 107 lines.
 
+  **Stop/Restart/`info variables|modules|functions`/blank-line-repeat, added right after**: a
+  meaningfully bigger debug-REPL change than any prior one -- the first to touch `cli.main()`'s own
+  control flow rather than just `DebugRepl` internals. Before this, the CLI ran `evaluate()` exactly
+  once per process; "quit" was the only way to abort, always exiting the whole CLI (exit 1, no
+  export). Confirmed with the user up front (a real design decision, not an obvious one): **`stop`**
+  aborts the current evaluation but -- unlike `quit` -- returns to the *pre-run* prompt instead of
+  exiting, mirroring gdb's `kill` vs `quit` distinction; **`restart`** (while paused) aborts and
+  immediately re-runs from the top with no intervening prompt, and is *also* accepted at the pre-run
+  prompt itself (behaving exactly like `run` there) so a user who just typed `stop` can reflexively
+  type `restart` again without hitting "Undefined command". `cli.main()` is now a `while True:` loop
+  around one `Evaluator`+`evaluate()` attempt per iteration -- without `--debug` this loop still runs
+  exactly once (every `repl`-related branch is `if args.debug`-guarded), so it's the identical
+  single-pass behavior as before. `DEBUGGING_STOPPED_MESSAGE` (a new exported constant in
+  `evaluator.py`, replacing an inline `"Debugging stopped."` literal at the one `raise EvalError(...)`
+  site) is how `cli.py` tells "the debugger itself asked to abort" apart from a genuine script error
+  by comparing `str(e)` against it, rather than trusting `DebugRepl`'s own mutated
+  `_post_run_action` alone -- `error_break()` discards its own `_interact()`'s return value entirely
+  (evaluation aborts regardless, since the *real* error is what's about to re-raise), so if a user
+  typed `stop` while inspecting a genuine `assert()` failure, `_post_run_action` would still get set
+  to `"stopped"` as a side effect; only the exception's own message being the exact sentinel
+  prevents a real error from ever being misreported as a clean "Evaluation stopped." Verified this
+  exact scenario deliberately, not just assumed safe by inspection. `DebugRepl.prepare_for_run()`
+  resets exactly what a fresh run needs (`_break_on_first`/`_step_cmd`/`_step_to_child_targets`/
+  `_pending_mods`) -- breakpoints, print-counter, and declared-function/module names all carry over,
+  matching gdb's own `run`-after-`kill` behavior.
+
+  `info variables`/`info modules`/`info functions` extend the existing `info breakpoints` dispatch.
+  `info variables` is paused-only (reuses the exact `visible_vars` dict `print` already reads --
+  zero new plumbing) and reports `No variables to show before "run".` at the pre-run prompt rather
+  than silently doing nothing. `info functions`/`info modules` are static (available in both
+  prompts): `_collect_declared_lines()` (`cli.py`) scans the fully use-resolved top-level node list
+  (the same `nodes` `resolve_use_scopes()` already returns) for `FunctionDeclaration`/
+  `ModuleDeclaration` instances directly -- only *top-level* declarations, matching what's
+  realistically ever declared in practice. `DebugRepl.set_declared_names()` receives already-
+  formatted, already-sorted `"name(params) at file:line"` strings computed once by `cli.py` (which
+  has direct AST access), keeping `DebugRepl` itself fully decoupled from parser types -- reusing
+  each `ParameterDeclaration`'s own `__str__` for the `name`/`name=default` rendering rather than
+  re-deriving that formatting logic a second time.
+
+  Blank-Enter-repeats-last-command (`step`/`next`/`child`/`restart`/`continue`/`finish`/`list`, plus
+  `restart`/`list` specifically at the pre-run prompt too) mirrors gdb's own convention exactly.
+  `_last_repeatable_cmd`/`_last_repeatable_arg` are set at each relevant dispatch branch (not looked
+  up via a separate command-name set, so alias handling falls out of each branch's own existing
+  `cmd in (...)` check rather than a second, easy-to-drift-out-of-sync enumeration) and persist
+  across the whole debug session (matching gdb's own single persistent "last command" register) -- a
+  blank line before any repeatable command has ever been issued is an unchanged no-op.
+
+  Manually verified every one of these end to end (not just via the test suite), same exact script
+  and command sequence run against both this reference's own CLI and the C++ port's side by side --
+  outputs matched. Ported identically (same command names/aliases, same `PostRunAction`-equivalent
+  string values, same shared `DEBUGGING_STOPPED_MESSAGE` constant, same declared-lines scan) to the
+  C++ port -- see that port's own `CLAUDE.md` for its side of the writeup, including why a
+  `Scope`-enumeration API in the `openscad_cpp_parser` submodule was considered and rejected in favor
+  of scanning the node list the CLI already owns.
+
 ### Design Patterns
 
 - **Callback injection, not GUI coupling**: `Evaluator.__init__` takes `echo_fn`/`debug_hook`/

@@ -328,3 +328,136 @@ class TestDebugRepl:
         # debugger was actually paused in, so this string could never appear
         # (main.scad's own line 2 is "lib_cube(5);", not "cube(s);").
         assert "cube(s);" in capsys.readouterr().out
+
+    def test_stop_returns_to_pre_run_prompt_then_run_exports(self, tmp_path, monkeypatch, capsys):
+        # "stop" aborts the current evaluation but -- unlike "quit" --
+        # returns to the pre-run prompt instead of exiting the CLI; a
+        # plain "run" from there starts a fresh evaluation that completes
+        # normally.
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "stop", "run", "continue", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "Evaluation stopped." in capsys.readouterr().out
+        assert out.stat().st_size > 0
+
+    def test_stop_then_quit_aborts_without_exporting(self, tmp_path, monkeypatch):
+        # If the user never restarts after "stop", quitting from the
+        # pre-run prompt behaves exactly like never having run at all --
+        # no export, but a clean exit (0), matching
+        # test_quit_before_run_exits_cleanly_without_exporting.
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "stop", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert not out.exists()
+
+    def test_restart_while_paused_aborts_and_runs_again_from_start(self, tmp_path, monkeypatch, capsys):
+        # "restart" while paused aborts the current run and immediately
+        # re-runs (no intervening pre-run prompt) -- breakpoints carry
+        # over, so the fresh run pauses at the same breakpoint again
+        # before finally being allowed to complete. Each full run pauses
+        # twice (break-on-first at line 1, then the explicit breakpoint at
+        # line 2); running twice means "Breakpoint hit" must appear
+        # exactly 4 times -- proving the second run genuinely started over
+        # rather than "restart" being a no-op or immediately finishing.
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["break 2", "run", "continue", "restart", "continue", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert capsys.readouterr().out.count("Breakpoint hit") == 4
+        assert out.stat().st_size > 0
+
+    def test_restart_accepted_at_pre_run_prompt_after_stop(self, tmp_path, monkeypatch, capsys):
+        # A user who just typed "stop" naturally reaches for "restart"
+        # again out of habit -- with nothing currently running, it must
+        # behave exactly like "run" at the pre-run prompt, not
+        # "Undefined command".
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "stop", "restart", "continue", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "Undefined command" not in capsys.readouterr().out
+        assert out.exists()
+
+    def test_exit_alias_works_like_quit_before_and_during_run(self, tmp_path, monkeypatch):
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out1 = tmp_path / "m1.stl"
+        _feed_input(monkeypatch, ["exit"])
+        assert cli.main([str(src), "-o", str(out1), "--debug"]) == 0
+        assert not out1.exists()
+
+        out2 = tmp_path / "m2.stl"
+        _feed_input(monkeypatch, ["run", "exit"])
+        assert cli.main([str(src), "-o", str(out2), "--debug"]) == 1
+        assert not out2.exists()
+
+    def test_info_functions_and_modules_list_user_declarations_before_and_during_run(self, tmp_path, monkeypatch, capsys):
+        src = _write(
+            tmp_path, "m.scad",
+            "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\n"
+            "module wrapper(s) {\n"
+            "    children();\n"
+            "}\n"
+            "wrapper(1) {\n"
+            "    cube(1);\n"
+            "}\n",
+        )
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["info functions", "info modules", "run", "info functions", "info modules", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        text = capsys.readouterr().out
+        assert "User-defined functions:" in text
+        assert "fib(n) at m.scad:1" in text
+        assert "User-defined modules:" in text
+        assert "wrapper(s) at m.scad:2" in text
+
+    def test_info_functions_and_modules_report_none_when_script_declares_neither(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", CUBE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["info functions", "info modules", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        text = capsys.readouterr().out
+        assert "No user-defined functions." in text
+        assert "No user-defined modules." in text
+
+    def test_info_variables_shows_currently_visible_variables_only_while_paused(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        # Pre-run: no variables to show yet (nothing has executed). Paused
+        # after "next" (past the `width` assignment): `width` is visible.
+        _feed_input(monkeypatch, ["info variables", "run", "next", "info variables", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        text = capsys.readouterr().out
+        assert 'No variables to show before "run".' in text
+        assert "width = 10" in text
+
+    def test_blank_line_repeats_last_step_command(self, tmp_path, monkeypatch):
+        # "next" once, then two blank lines -- mirrors gdb's own repeat-
+        # last-command convention. Four statement lines means four total
+        # pauses (break-on-first at line 1, then one "next" advance per
+        # subsequent command) if the repeat genuinely re-issued "next"
+        # each time.
+        src = _write(tmp_path, "m.scad", "a = 1;\nb = 2;\nc = 3;\ncube(1);\n")
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "next", "", "", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert out.exists()
+
+    def test_info_unrecognized_sub_command_reports_undefined(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["info bogus_sub_command", "run", "info bogus_sub_command", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert capsys.readouterr().out.count('Undefined info command: "bogus_sub_command"') == 2
+
+    def test_blank_line_before_any_repeatable_command_is_a_noop(self, tmp_path, monkeypatch, capsys):
+        # A blank line before any of step/next/child/restart/continue/
+        # finish/list has ever been issued has nothing to repeat -- must
+        # fall back to the pre-feature behavior (silently re-prompt), not
+        # crash or treat it as some other command.
+        src = _write(tmp_path, "m.scad", MODULE_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "", "print width", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "Undefined command" not in capsys.readouterr().out
