@@ -26,6 +26,19 @@ CHILDREN_SCRIPT = (
     "}\n"
 )
 
+# A function and a module deliberately sharing the name "fib" -- for
+# "list fib" ambiguity tests.
+AMBIGUOUS_NAME_SCRIPT = (
+    "function fib(n) = n < 2 ? n : fib(n-1) + fib(n-2);\n"
+    "module thing(x) {\n"
+    "    cube(x);\n"
+    "}\n"
+    "module fib() {\n"
+    "    sphere(1);\n"
+    "}\n"
+    "thing(1);\n"
+)
+
 
 def _write(tmp_path, name, text):
     p = tmp_path / name
@@ -461,3 +474,55 @@ class TestDebugRepl:
         _feed_input(monkeypatch, ["run", "", "print width", "continue"])
         assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
         assert "Undefined command" not in capsys.readouterr().out
+
+    def test_list_by_name_jumps_to_unambiguous_declaration(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["list thing", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "module thing(x) {" in capsys.readouterr().out
+
+    def test_list_by_ambiguous_name_reports_both_namespaces_and_lists_nothing(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["list fib", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        text = capsys.readouterr().out
+        assert 'Both a function and a module are named "fib"' in text
+        assert "list function:fib" in text
+        assert "list module:fib" in text
+        # Ambiguous means nothing gets listed -- neither declaration's own
+        # source line should appear.
+        assert "function fib(n)" not in text
+        assert "module fib() {" not in text
+
+    def test_list_with_function_qualifier_disambiguates_from_module(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["list function:fib", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "function fib(n)" in capsys.readouterr().out
+
+    def test_list_with_module_qualifier_disambiguates_from_function(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["list module:fib", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "module fib() {" in capsys.readouterr().out
+
+    def test_list_by_unknown_name_reports_no_symbol(self, tmp_path, monkeypatch, capsys):
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["list bogus_name", "quit"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert 'No symbol "bogus_name" in current context.' in capsys.readouterr().out
+
+    def test_list_by_name_works_from_paused_prompt_too(self, tmp_path, monkeypatch, capsys):
+        # Jumping to a named declaration's own source works while paused
+        # too, and shows source from *that* declaration's location, not
+        # wherever the debugger is currently paused.
+        src = _write(tmp_path, "m.scad", AMBIGUOUS_NAME_SCRIPT)
+        out = tmp_path / "m.stl"
+        _feed_input(monkeypatch, ["run", "list thing", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert "module thing(x) {" in capsys.readouterr().out

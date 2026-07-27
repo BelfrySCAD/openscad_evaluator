@@ -155,14 +155,14 @@ reuses its previous result instead of recomputing it.
   `info variables` is paused-only (reuses the exact `visible_vars` dict `print` already reads --
   zero new plumbing) and reports `No variables to show before "run".` at the pre-run prompt rather
   than silently doing nothing. `info functions`/`info modules` are static (available in both
-  prompts): `_collect_declared_lines()` (`cli.py`) scans the fully use-resolved top-level node list
+  prompts): `_collect_declarations()` (`cli.py`) scans the fully use-resolved top-level node list
   (the same `nodes` `resolve_use_scopes()` already returns) for `FunctionDeclaration`/
   `ModuleDeclaration` instances directly -- only *top-level* declarations, matching what's
-  realistically ever declared in practice. `DebugRepl.set_declared_names()` receives already-
-  formatted, already-sorted `"name(params) at file:line"` strings computed once by `cli.py` (which
-  has direct AST access), keeping `DebugRepl` itself fully decoupled from parser types -- reusing
-  each `ParameterDeclaration`'s own `__str__` for the `name`/`name=default` rendering rather than
-  re-deriving that formatting logic a second time.
+  realistically ever declared in practice. `DebugRepl.set_declared_names()` receives already-sorted
+  `DeclInfo(name, params, origin, line)` dataclass instances computed once by `cli.py` (which has
+  direct AST access), keeping `DebugRepl` itself fully decoupled from parser types beyond this one
+  dataclass -- reusing each `ParameterDeclaration`'s own `__str__` for the `name`/`name=default`
+  rendering rather than re-deriving that formatting logic a second time.
 
   Blank-Enter-repeats-last-command (`step`/`next`/`child`/`restart`/`continue`/`finish`/`list`, plus
   `restart`/`list` specifically at the pre-run prompt too) mirrors gdb's own convention exactly.
@@ -179,6 +179,30 @@ reuses its previous result instead of recomputing it.
   C++ port -- see that port's own `CLAUDE.md` for its side of the writeup, including why a
   `Scope`-enumeration API in the `openscad_cpp_parser` submodule was considered and rejected in favor
   of scanning the node list the CLI already owns.
+
+  **`list <name>`, added right after**: the user's own follow-up question ("Can you do a
+  `list funcname`?") surfaced a real gap -- `_list_source()` only ever accepted a line number,
+  silently falling back to the current/start line for anything else (including a function name --
+  not an error, just quietly wrong). Fixed with a `[line|name]` argument: an unparsable-as-int `arg`
+  is now looked up by name in `_declared_functions`/`_declared_modules` (the same `DeclInfo` data
+  `info functions`/`info modules` already has) and jumps to *that declaration's own* file:line --
+  which may be a completely different file than wherever the debugger happens to be paused right now
+  (e.g. a `use <file>`-injected declaration), so `list_origin` is set from `decl.origin`, not the
+  caller's own `origin` parameter. The one real design question, flagged by the user up front:
+  OpenSCAD's function and module namespaces are genuinely separate (`function foo(x)=x;` and
+  `module foo(){}` can coexist), so an unqualified `list foo` must handle real ambiguity, not just
+  pick one arbitrarily. Solved with `function:name`/`module:name` qualifiers -- reusing this REPL's
+  own existing `[file:]line` colon convention (`break`/`delete` already parse a `prefix:rest` this
+  exact way) rather than inventing a new syntax -- and an explicit "Both a function and a module are
+  named ..." error (listing nothing) when `list foo` is ambiguous and unqualified. No `"->"` marker
+  is drawn for a name-based jump (`current_line` is cleared) since it's not the paused line. An
+  unrecognized, non-numeric `arg` (name matches neither namespace) now prints
+  `No symbol "..." in current context.` instead of the old silent current/start-line fallback -- a
+  small, deliberate behavior change on an edge case with no prior test depending on its output.
+  Manually verified all five cases (unambiguous name, ambiguous name error, `function:`-qualified,
+  `module:`-qualified, unknown name) plus that this still works identically while paused. Ported
+  identically (same qualifier syntax, same error messages) to the C++ port -- see that port's own
+  `CLAUDE.md` for its side of the writeup.
 
 ### Design Patterns
 
