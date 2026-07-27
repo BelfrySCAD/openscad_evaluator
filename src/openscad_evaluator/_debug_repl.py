@@ -108,8 +108,11 @@ Commands (while paused):
   restart, r              Abort the current evaluation and run again from the start
   print <name>, p         Print a variable's value
   backtrace, bt, where    Show the call stack (innermost first)
+  up                      Select the caller frame (view its variables)
+  down                    Select the callee frame
+  frame [n], f            Select frame #n (no arg: show the current frame)
   info breakpoints        List breakpoints
-  info variables          List currently visible variables
+  info variables          List the selected frame's variables
   info modules            List user-defined modules
   info functions          List user-defined functions
   list [line|name], l     Show source around a line, or a function/module
@@ -318,18 +321,24 @@ class DebugRepl:
         self._print_count += 1
         print(f"${self._print_count} = {_fmt(visible_vars[name])}")
 
-    def _print_backtrace(self, call_stack: list, origin: str | None, line: int):
-        frames = list(call_stack)  # outermost..innermost
-        n = len(frames)
+    def _frame_location(self, k: int, call_stack: list, origin: str | None, line: int):
+        """(origin, line) shown for backtrace/frame level `k` -- walks call
+        positions outward. Shared by backtrace and up/down/frame."""
+        n = len(call_stack)
         cur_origin, cur_line = origin, line
+        for i in range(min(k, n)):
+            call_pos = call_stack[n - 1 - i][2]
+            cur_origin = getattr(call_pos, "origin", None) or self._source_path
+            cur_line = getattr(call_pos, "line", "?")
+        return cur_origin, cur_line
+
+    def _print_backtrace(self, call_stack: list, origin: str | None, line: int):
+        n = len(call_stack)  # call_stack is outermost..innermost
         for k in range(n + 1):
-            name = frames[n - 1 - k][1] if k < n else None
+            name = call_stack[n - 1 - k][1] if k < n else None
             label = f"{name}()" if name else "<toplevel>"
-            print(f"#{k}  {label} at {os.path.basename(cur_origin) if cur_origin else '?'}:{cur_line}")
-            if k < n:
-                call_pos = frames[n - 1 - k][2]
-                cur_origin = getattr(call_pos, "origin", None) or self._source_path
-                cur_line = getattr(call_pos, "line", "?")
+            o, l = self._frame_location(k, call_stack, origin, line)
+            print(f"#{k}  {label} at {os.path.basename(o) if o else '?'}:{l}")
 
     @staticmethod
     def _visible_vars(frame: dict) -> dict:
@@ -526,8 +535,7 @@ class DebugRepl:
         else:
             print(f"\nBreakpoint hit at {os.path.basename(resolved)}:{line}")
         self._list_source("", current_line=line, origin=resolved)
-        visible_vars = self._visible_vars(all_frames[0]) if all_frames else {}
-        return self._interact(line, depth, resolved, visible_vars, call_stack)
+        return self._interact(line, depth, resolved, all_frames, call_stack)
 
     def error_break(self, line, msg, all_frame_locals, call_stack, origin=None):
         if self._quit:
@@ -535,9 +543,8 @@ class DebugRepl:
         resolved = self._resolve(origin)
         print(f"\n{msg}")
         self._list_source("", current_line=line, origin=resolved)
-        visible_vars = self._visible_vars(all_frame_locals[0]) if all_frame_locals else {}
         print("(evaluation will abort once you resume; inspect state, then continue/quit)")
-        self._interact(line, len(call_stack), resolved, visible_vars, call_stack)
+        self._interact(line, len(call_stack), resolved, all_frame_locals, call_stack)
 
     def return_hook(self, name, value, depth):
         if self._step_cmd == "out" and depth == self._step_depth:
@@ -548,7 +555,22 @@ class DebugRepl:
     # Paused prompt
     # ------------------------------------------------------------------
 
-    def _interact(self, line: int, depth: int, origin: str, visible_vars: dict, call_stack: list):
+    def _interact(self, line: int, depth: int, origin: str, all_frames: list, call_stack: list):
+        # Which frame `print`/`info variables` inspect. 0 = innermost (the
+        # paused statement); `up`/`down`/`frame n` move it. Aligns with
+        # backtrace #k. The closures read cur_frame live (late binding).
+        cur_frame = 0
+
+        def visible():
+            return self._visible_vars(all_frames[cur_frame]) if cur_frame < len(all_frames) else {}
+
+        def print_frame_header():
+            n = len(call_stack)
+            name = call_stack[n - 1 - cur_frame][1] if cur_frame < n else None
+            label = f"{name}()" if name else "<toplevel>"
+            o, l = self._frame_location(cur_frame, call_stack, origin, line)
+            print(f"#{cur_frame}  {label} at {os.path.basename(o) if o else '?'}:{l}")
+
         while True:
             try:
                 raw = input("(scad-dbg) ")
@@ -593,7 +615,34 @@ class DebugRepl:
                 self._post_run_action = "restart"
                 return "stop", {}
             elif cmd in ("print", "p"):
-                self._print_var(arg, visible_vars)
+                self._print_var(arg, visible())
+            elif cmd == "up":
+                if cur_frame + 1 < len(all_frames):
+                    cur_frame += 1
+                    print_frame_header()
+                else:
+                    print("Already at the outermost frame.")
+            elif cmd == "down":
+                if cur_frame > 0:
+                    cur_frame -= 1
+                    print_frame_header()
+                else:
+                    print("Already at the innermost frame.")
+            elif cmd in ("frame", "f"):
+                a = arg.strip()
+                if not a:
+                    print_frame_header()
+                else:
+                    try:
+                        idx = int(a)
+                    except ValueError:
+                        print("Usage: frame <n>")
+                    else:
+                        if 0 <= idx < len(all_frames):
+                            cur_frame = idx
+                            print_frame_header()
+                        else:
+                            print(f"No frame #{a} (have 0..{len(all_frames) - 1}).")
             elif cmd in ("backtrace", "bt", "where"):
                 self._print_backtrace(call_stack, origin, line)
             elif cmd == "info":
@@ -601,7 +650,7 @@ class DebugRepl:
                 if sub.startswith("break"):
                     self._print_breakpoints()
                 elif sub == "variables":
-                    self._print_variables(visible_vars)
+                    self._print_variables(visible())
                 elif sub == "modules":
                     self._print_declared_modules()
                 elif sub == "functions":
