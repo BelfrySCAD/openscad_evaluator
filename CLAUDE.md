@@ -74,6 +74,20 @@ reuses its previous result instead of recomputing it.
   port's own `CLAUDE.md` for the fuller writeup, including a real bug caught in `child`'s own
   target-position matching (raw vs. realpath'd origins disagreeing across a symlink).
 
+  **Arrow-key command history**, added right after Ctrl+C: neither port's `DebugRepl` had any
+  line-editing before this (raw `input()`/`std::getline` means up/down arrow keys just insert their
+  own escape bytes instead of recalling a previous command). Here the fix is a one-liner --
+  `import readline` at the top of `_debug_repl.py` (wrapped in `try`/`except ImportError`, since the
+  module doesn't exist on Windows) hooks stdlib `input()` into GNU readline (or libedit, what
+  Python's own `readline` module actually links against on macOS) for the rest of the process, no
+  other code changed. The C++ port has no stdlib equivalent and needed a real vendored dependency
+  (`yhirose/cpp-linenoise`) -- see that port's own `CLAUDE.md` for the fuller writeup, including how
+  both sides were verified end to end with a `pty.openpty()`-driven harness (a real pty, not a piped
+  file, since arrow-key bytes only mean anything to a raw terminal) and a real pitfall that harness
+  itself hit (a synthetic pty's zeroed window size sending the C++ side's vendored library down a
+  cursor-position-query fallback path that then hangs forever with no real terminal to answer it --
+  an artifact of the test harness, not a bug in either port).
+
 ### Design Patterns
 
 - **Callback injection, not GUI coupling**: `Evaluator.__init__` takes `echo_fn`/`debug_hook`/
