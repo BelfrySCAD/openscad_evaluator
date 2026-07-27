@@ -1464,6 +1464,30 @@ class TestDollarPrefixedParameterBinding:
         # unpolluted by f()'s private dyn write.
         assert lines == ["ECHO: 99", "ECHO: 0"]
 
+    def test_share_dyn_fast_path_does_not_leak_undeclared_dollar_arg_into_caller(self):
+        # _has_dollar_param alone is a purely static property of the
+        # DECLARATION -- it misses a $-prefixed *named* call-site argument
+        # that doesn't match any declared parameter at all. _bind_args
+        # writes ANY named argument into `bound` unconditionally (that's
+        # how an undeclared `$fn=64`-style dynamic-scope override works
+        # for a call in general), so f() below -- which declares no
+        # $-parameter -- still gets "$fn" written into child_ctx.dyn via
+        # the bound-argument loop. Before _bound_has_dollar_key was added,
+        # share_dyn was True here (no declared $-param), so child_ctx.dyn
+        # was the SAME dict as the caller's ctx.dyn, and that write leaked
+        # $fn=99 into the caller's own scope, visible to the trailing
+        # echo($fn). Found while porting this optimization to the C++
+        # port's own evaluator (see its Scoping.
+        # DollarArgUndeclaredByCalleeFunctionDoesNotLeakToCallerDyn),
+        # reproduced here, and fixed in both places the same way.
+        src = """
+        function f(x) = x;
+        a = f(x=1, $fn=99);
+        echo($fn);
+        """
+        _, lines = run(src)
+        assert lines == ["ECHO: 0"]
+
 
 # ---------------------------------------------------------------------------
 # Control flow
@@ -3407,6 +3431,42 @@ class TestScoping:
         """
         _, lines = run(src)
         assert lines == ["ECHO: [2, 3, 4]"]
+
+    def test_children_forwarded_through_isolated_call_with_same_named_param_still_sees_ancestor_binding(self):
+        # A real bug found running a real BOSL2 script (attachable()/
+        # trapezoid(), which deep-forwards children() through several more
+        # calls while an intermediate ISOLATED call -- attachable() itself,
+        # with its own unbound "path"/"h" parameters -- stays on the call
+        # stack throughout). `wrapper(path)` below mirrors that shape: an
+        # isolated (non-closure) call whose own declared parameter shares a
+        # name with an ancestor's variable, forwarding children() straight
+        # through past itself via `leaf()`. The deferred child block
+        # (`echo(path)`, lexically inside `outer()`) must resolve `path`
+        # against OUTER's own binding, not wrapper's own same-named
+        # (unbound, undef) parameter -- even though wrapper's own scope is
+        # still open (unpopped) the entire time the deferred block runs.
+        #
+        # This was broken by an earlier trail-storage design (tried first in
+        # the C++ port) that judged visibility purely by level-number
+        # ordering ("pushed no later than my own level"): wrapper's own
+        # undef "path" binding is chronologically *more recent* than
+        # outer's real one, so a numeric-only check picked it up as if it
+        # were an ancestor, even though wrapper is not an ancestor of the
+        # deferred child block at all -- just an unrelated, still-open
+        # branch. Fixed (in both ports) by tracking true parent-chain
+        # ancestry per level instead of comparing level numbers -- ported
+        # here with that fix already in place, not re-derived.
+        src = """
+        module leaf() { children(0); }
+        module wrapper(path) { leaf() children(0); }
+        module outer() {
+            path = [1, 2, 3];
+            wrapper() echo(path);
+        }
+        outer();
+        """
+        _, lines = run(src)
+        assert lines == ["ECHO: [1, 2, 3]"]
 
 
 # ---------------------------------------------------------------------------

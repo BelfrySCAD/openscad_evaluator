@@ -5740,20 +5740,34 @@ class Evaluator:
             self._decl_dollar_param[decl_id] = cached
         return cached
 
+    @staticmethod
+    def _bound_has_dollar_key(bound: dict) -> bool:
+        """See _has_dollar_param's docstring -- the per-call half of the
+        share_dyn safety check it can't provide by itself. _bind_args
+        writes ANY named call-site argument into `bound` unconditionally,
+        including one that doesn't match any declared parameter -- that's
+        how an undeclared `$fn=64`-style dynamic-scope override works for
+        a call in general. share_dyn must also stay False whenever this
+        particular call's own `bound` contains such a key, or the
+        bound-argument loop mutates the ALIASED (shared, not copied) dyn
+        dict in place, leaking the override into the caller's own scope
+        once the call returns."""
+        return any(k[0] == '$' for k in bound)
+
     def _eval_user_function(self, name: str, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node=None) -> Any:
         params = decl.parameters or []
         bound = self._bind_args(params, arguments, ctx)
         fn_scope = decl.scope or ctx.scope
-        # No $-prefixed parameter is declared at all -- the common case,
-        # and the ONLY case where child_ctx.dyn is guaranteed untouched by
-        # either the bound-argument loop below or _apply_defaults (every
-        # declared $-param writes to dyn exactly once, via whichever of the
-        # two actually applies) -- safe to skip copying dyn/dyn_explicit and
-        # share ctx's own dict/set by reference instead. A real, measured
-        # optimization: on a BOSL2-heavy script (Anklet.scad, ~1.1M user
-        # function calls), context-creation machinery was ~9.6% of total
-        # evaluate() time, and this is its single biggest piece.
-        share_dyn = not self._has_dollar_param(id(decl), params)
+        # No $-prefixed parameter is declared AND this call's own bound
+        # arguments include no $-prefixed key either -- the common case,
+        # and the only case where child_ctx.dyn is guaranteed untouched by
+        # either the bound-argument loop below or _apply_defaults -- safe
+        # to skip copying dyn/dyn_explicit and share ctx's own dict/set by
+        # reference instead. A real, measured optimization: on a
+        # BOSL2-heavy script (Anklet.scad, ~1.1M user function calls),
+        # context-creation machinery was ~9.6% of total evaluate() time,
+        # and this is its single biggest piece.
+        share_dyn = not self._has_dollar_param(id(decl), params) and not self._bound_has_dollar_key(bound)
         child_ctx = self._call_ctx_for(decl, ctx, scope=fn_scope, share_dyn=share_dyn)
         for k, v in bound.items():
             if k[0] == '$':
@@ -5783,7 +5797,7 @@ class Evaluator:
         bound = self._bind_args(params, arguments, ctx)
         fn_scope = func_node.scope or ctx.scope
         # See _eval_user_function's matching comment -- same optimization.
-        share_dyn = not self._has_dollar_param(id(func_node), params)
+        share_dyn = not self._has_dollar_param(id(func_node), params) and not self._bound_has_dollar_key(bound)
         child_ctx = self._call_ctx_for(func_node, ctx, scope=fn_scope, share_dyn=share_dyn)
         for k, v in bound.items():
             if k[0] == '$':
