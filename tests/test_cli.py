@@ -15,6 +15,16 @@ MODULE_SCRIPT = (
     "echo(\"hi\");\n"
 )
 
+CHILDREN_SCRIPT = (
+    "module wrapper() {\n"
+    "    children();\n"
+    "}\n"
+    "wrapper() {\n"
+    "    cube(1);\n"
+    "    sphere(1);\n"
+    "}\n"
+)
+
 
 def _write(tmp_path, name, text):
     p = tmp_path / name
@@ -149,6 +159,38 @@ class TestDebugRepl:
         _feed_input(monkeypatch, ["run", "continue"])
         assert cli.main([str(src), "-o", str(out), "--debug"]) == 1
         assert "boom" in capsys.readouterr().err
+
+    def test_child_steps_to_children_call_forwarded_statement(self, tmp_path, monkeypatch, capsys):
+        # Paused at the `wrapper() { cube(1); sphere(1); } ` call itself
+        # (line 4), "child" should run until wrapper's own `children();`
+        # (line 2) forwards control to one of that call's own children --
+        # here, `cube(1)` at line 5, its first child statement -- not stop
+        # at line 2 itself (children() is not one of the snapshotted
+        # targets, only the block's own top-level statements are).
+        src = _write(tmp_path, "m.scad", CHILDREN_SCRIPT)
+        out = tmp_path / "m.stl"
+        # "run" itself already pauses directly at line 4 (break-on-first and
+        # the explicit breakpoint coincide there, since line 1 is a
+        # declaration and never checked) -- no preceding "continue" needed.
+        _feed_input(monkeypatch, ["break 4", "run", "child", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        stdout = capsys.readouterr().out
+        assert "Breakpoint hit at m.scad:5" in stdout
+        assert "cube(1);" in stdout
+
+    def test_child_falls_back_to_call_return_when_children_never_invoked(self, tmp_path, monkeypatch, capsys):
+        # A module that never calls children() at all -- the target
+        # position is never reached, so "child" relies purely on the
+        # depth-drop fallback (or, issued at top level with nothing
+        # shallower to drop to, simply lets the rest of the script run
+        # normally) -- either way evaluation must still complete, not hang.
+        src = _write(tmp_path, "m.scad", "module noop() {\n}\nnoop() {\n    cube(1);\n}\nsphere(1);\n")
+        out = tmp_path / "m.stl"
+        # "run" pauses directly at line 3 (break-on-first + the explicit
+        # breakpoint coincide, same reasoning as the test above).
+        _feed_input(monkeypatch, ["break 3", "run", "child", "continue"])
+        assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
+        assert out.stat().st_size > 0
 
     def test_list_shows_source_from_use_injected_file_when_paused_there(self, tmp_path, monkeypatch, capsys):
         # A breakpoint hit inside a `use <file>`-injected module's own body
