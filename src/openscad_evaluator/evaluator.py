@@ -48,6 +48,7 @@ from openscad_lalr_parser.nodes import (
 
 
 _MANIFOLD_OK = m3d.Error.NoError
+_NO_OPERAND = object()  # a unary operator's missing right operand
 
 _HEX = frozenset("0123456789abcdefABCDEF")
 
@@ -1495,6 +1496,10 @@ def _osc_type_name(v) -> str:
         return "vector"
     if isinstance(v, OscObject):
         return "object"
+    if isinstance(v, OscRange):
+        return "range"
+    if isinstance(v, (Closure, FunctionLiteral, FunctionDeclaration)):
+        return "function"
     return "undefined"
 
 
@@ -1586,6 +1591,8 @@ def _format_number(v: float) -> str:
 
 
 def _matmul(a, b):
+    if not a or not b:
+        return None
     a_is_mat = bool(a) and isinstance(a[0], list)
     b_is_mat = bool(b) and isinstance(b[0], list)
     try:
@@ -1606,6 +1613,67 @@ def _matmul(a, b):
         return np.dot(na, nb).tolist()
     except (TypeError, ValueError, IndexError):
         return None
+
+
+def _matmul_error(a, b):
+    """Why ``a * b`` on two lists is undef, in the reference's words (a port of
+    multiply_visitor's messages). Only asked once _matmul has already failed."""
+    def num(v):
+        return type(v) in (int, float)
+
+    def vec_mat(vec, mat):
+        cols = len(mat[0]) if type(mat[0]) is list else 0
+        for i in range(cols):
+            for j in range(len(vec)):
+                row = mat[j]
+                if type(row) is not list or len(row) != cols:
+                    return f"Matrix must be rectangular. Problem at row {j}"
+                if not num(vec[j]):
+                    return f"Vector must contain only numbers. Problem at index {j}"
+                if not num(row[i]):
+                    return f"Matrix must contain only numbers. Problem at row {j}, col {i}"
+        return None
+
+    if not a or not b:
+        return "Multiplication is undefined on empty vectors"
+    e1, e2 = a[0], b[0]
+    if num(e1) and num(e2):
+        if len(a) != len(b):
+            return f"vector*vector requires matching lengths ({len(a)} != {len(b)})"
+        for x, y in zip(a, b):
+            if not num(x) or not num(y):
+                return f"undefined operation ({_osc_type_name(x)} * {_osc_type_name(y)})"
+    elif num(e1) and type(e2) is list:
+        if len(a) != len(b):
+            return f"vector*matrix requires vector length to match matrix row count ({len(a)} != {len(b)})"
+        return vec_mat(a, b)
+    elif type(e1) is list and num(e2):
+        if len(e1) != len(b):
+            return f"matrix*vector requires matrix column count to match vector length ({len(e1)} != {len(b)})"
+        for i, row in enumerate(a):
+            if type(row) is not list or len(row) != len(b):
+                return f"Matrix must be rectangular. Problem at row {i}"
+            for j, x in enumerate(row):
+                if not num(x):
+                    return f"Matrix must contain only numbers. Problem at row {i}, col {j}"
+                if not num(b[j]):
+                    return f"Vector must contain only numbers. Problem at index {j}"
+    elif type(e1) is list and type(e2) is list:
+        if len(e1) != len(b):
+            return ("matrix*matrix requires left operand column count to match right operand "
+                    f"row count ({len(e1)} != {len(b)})")
+        for i, row in enumerate(a):
+            if type(row) is not list or len(row) != len(b):
+                n = len(row) if type(row) is list else 0
+                return ("matrix*matrix left operand row length does not match right operand "
+                        f"row count ({n} != {len(b)}) at row {i}")
+            err = vec_mat(row, b)
+            if err:
+                return f"{err}: while processing left operand at row {i}"
+    else:
+        return ("undefined vector*vector multiplication where first elements are types "
+                f"{_osc_type_name(e1)} and {_osc_type_name(e2)}")
+    return None
 
 
 class OscRange:
@@ -5586,22 +5654,47 @@ class Evaluator:
 
     # _expr_listcomp and _expr_range removed — dispatch table points directly
 
+    def _undefined_op(self, node, op: str, a, b=_NO_OPERAND):
+        """OpenSCAD's warning for an operator applied to types it has no
+        meaning for -- "undefined operation (number + string)" -- which was
+        missing; the result was already undef."""
+        types = f"{op}{_osc_type_name(a)}" if b is _NO_OPERAND else \
+            f"{_osc_type_name(a)} {op} {_osc_type_name(b)}"
+        self._echo_fn(f"WARNING: undefined operation ({types}){self._loc(getattr(node, 'position', None))}")
+
     def _expr_add(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
         ta, tb = type(a), type(b)
         if (ta is int or ta is float) and (tb is int or tb is float):
             return a + b
-        return _vec_add(a, b)
+        r = _vec_add(a, b)
+        if r is None:
+            self._undefined_op(node, "+", a, b)
+        return r
 
     def _expr_sub(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
         ta, tb = type(a), type(b)
         if (ta is int or ta is float) and (tb is int or tb is float):
             return a - b
-        return _vec_sub(a, b)
+        r = _vec_sub(a, b)
+        if r is None:
+            self._undefined_op(node, "-", a, b)
+        return r
 
     def _expr_mul(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        r = self._mul_value(a, b)
+        if r is None:
+            err = _matmul_error(a, b) if type(a) is list and type(b) is list else None
+            if err:
+                self._echo_fn(f"WARNING: {err}{self._loc(getattr(node, 'position', None))}")
+            else:
+                self._undefined_op(node, "*", a, b)
+        return r
+
+    @staticmethod
+    def _mul_value(a, b):
         ta, tb = type(a), type(b)
         if (ta is int or ta is float) and (tb is int or tb is float):
             return a * b
@@ -5620,6 +5713,13 @@ class Evaluator:
 
     def _expr_div(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
+        r = self._div_value(a, b)
+        if r is None:
+            self._undefined_op(node, "/", a, b)
+        return r
+
+    @staticmethod
+    def _div_value(a, b):
         ta, tb = type(a), type(b)
         if (ta is int or ta is float) and (tb is int or tb is float):
             if b == 0:
@@ -5637,9 +5737,8 @@ class Evaluator:
 
     def _expr_mod(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
-        if type(a) is bool or type(b) is bool:
-            return None
         if type(a) not in (int, float) or type(b) not in (int, float):
+            self._undefined_op(node, "%", a, b)
             return None
         # C's fmod, as OpenSCAD: the sign follows the dividend (-7 % 3 is -1,
         # Python's % gave 2) and x % 0 is nan (it was undef).
@@ -5650,9 +5749,8 @@ class Evaluator:
 
     def _expr_exp(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
-        if type(a) is bool or type(b) is bool:
-            return None
         if type(a) not in (int, float) or type(b) not in (int, float):
+            self._undefined_op(node, "^", a, b)
             return None
         return self._builtin_pow(a, b)  # 0^-1 is inf, as for pow() (it was undef)
 
@@ -5660,12 +5758,10 @@ class Evaluator:
         v = self._eval_expr(node.expr, ctx)
         if type(v) is list:
             return self._negate_list(v)
-        if type(v) is bool:
-            return None
-        try:
+        if type(v) in (int, float):
             return -v
-        except TypeError:
-            return None
+        self._undefined_op(node, "-", v)
+        return None
 
     # Bitwise/shift operators, added by real OpenSCAD in PR #4833 (merged
     # 2025-03-14, "Bitwise operators. Fixes #3345."). No real integer type:
@@ -6277,12 +6373,9 @@ class Evaluator:
                     positional = [args[i] for i in range(len(args)) if i in args]
                     if not positional:
                         positional = [args[k] for k in args if type(k) is str]
-                    if name in self._NUMERIC_ONLY_MATH_FNS:
-                        for a in positional:
-                            if isinstance(a, bool) or (
-                                isinstance(a, list) and any(isinstance(x, bool) for x in a)
-                            ):
-                                return None
+                    if name in self._NUMERIC_ONLY_MATH_FNS or name in ("len", "ord"):
+                        if not self._check_builtin_args(name, positional, node):
+                            return None
                     try:
                         return fn(*positional)
                     except Exception:
@@ -6302,6 +6395,69 @@ class Evaluator:
             self._echo_fn(f"WARNING: Ignoring unknown function '{name}'{self._loc(pos)}")
 
         return None
+
+    # How many leading arguments of each numeric builtin must be numbers.
+    _NUMBER_ARGS = {
+        "abs": 1, "sign": 1, "ceil": 1, "floor": 1, "round": 1, "sqrt": 1, "exp": 1, "ln": 1,
+        "log": 2, "sin": 1, "cos": 1, "tan": 1, "asin": 1, "acos": 1, "atan": 1, "atan2": 2, "pow": 2,
+    }
+
+    def _check_builtin_args(self, name: str, args: list, node) -> bool:
+        """Whether a numeric builtin's arguments have the types it needs; if
+        not, OpenSCAD's warning -- "cos() parameter could not be converted:
+        argument 0: expected number, found string ("a")" -- and the caller
+        returns undef. The value was already undef; only the warning was
+        missing. A bool is not a number here."""
+        def is_num(v):
+            return type(v) in (int, float)
+
+        loc = self._loc(getattr(node, "position", None))
+
+        def bad(i, expected, v=None, what="argument"):
+            v = args[i] if v is None and what == "argument" else v
+            self._echo_fn(f"WARNING: {name}() parameter could not be converted: {what} {i}: "
+                          f"expected {expected}, found {_osc_type_name(v)} ({self._fmt_val(v)}){loc}")
+            return False
+
+        def warn(msg):
+            self._echo_fn(f"WARNING: {msg}{loc}")
+            return False
+
+        if name in self._NUMBER_ARGS:
+            for i in range(min(len(args), self._NUMBER_ARGS[name])):
+                if not is_num(args[i]):
+                    return bad(i, "number")
+            return True
+        if name in ("max", "min"):
+            if len(args) == 1 and type(args[0]) is list:
+                for i, v in enumerate(args[0]):
+                    if not is_num(v):
+                        return bad(i, "number", v, "vector element")
+                return True
+            for i, v in enumerate(args):
+                if not is_num(v):
+                    return bad(i, "number")
+            return True
+        if name == "norm":
+            if not args or type(args[0]) is not list:
+                return bool(args) and bad(0, "vector")
+            return all(is_num(v) for v in args[0]) or warn("Incorrect arguments to norm()")
+        if name == "ord":
+            return bool(args) and (type(args[0]) is str or bad(0, "string"))
+        if name == "len":
+            return bool(args) and (type(args[0]) in (list, str, OscObject) or bad(0, "string"))
+        if name == "cross":
+            ok = (len(args) == 2 and all(type(v) is list and len(v) in (2, 3) for v in args)
+                  and len(args[0]) == len(args[1]))
+            if not ok:
+                return warn("Invalid vector size of parameter for cross()")
+            for x in (x for v in args for x in v):
+                if type(x) not in (int, float):
+                    return warn("Invalid value in parameter vector for cross()")
+                if not math.isfinite(x):
+                    return warn(f"Invalid value ({'NaN' if x != x else 'INF'}) in parameter vector for cross()")
+            return True
+        return True
 
     def _builtin_minmax(self, op, args):
         """Shared logic for OpenSCAD's `min`/`max`.

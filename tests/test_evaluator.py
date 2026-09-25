@@ -25,6 +25,11 @@ def run(src: str):
     return bodies, echo_lines
 
 
+def _echoes(lines):
+    """The ECHO lines alone, for a test about values whose script also warns."""
+    return [l for l in lines if not l.startswith("WARNING:")]
+
+
 def run_tree(src: str):
     """Like run(), but also returns the Evaluator so tests can inspect
     its csg_tree. Returns (bodies, echo_lines, evaluator)."""
@@ -104,7 +109,7 @@ class TestExpressions:
         # OpenSCAD has no `+` for strings (unlike Python's str.__add__,
         # which would silently concatenate them).
         _, lines = run('echo("ab" + "cd");')
-        assert lines == ["ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef"]
 
     def test_vector_scale_right(self):
         _, lines = run("echo([1,2,3] * 2);")
@@ -902,7 +907,7 @@ class TestBuiltinFunctions:
         # min/max of its elements) or multiple scalar arguments; mixing in
         # more than one vector is undef.
         _, lines = run("echo(min([1,5],[3,2]), max([1,5],[3,2]));")
-        assert lines == ["ECHO: undef, undef"]
+        assert _echoes(lines) == ["ECHO: undef, undef"]
 
     def test_sin(self):
         _, lines = run("echo(sin(90));")
@@ -1062,41 +1067,41 @@ class TestBuiltinFunctions:
 class TestMathBuiltinsNanInfUndef:
     def test_abs(self):
         _, lines = run("echo(abs(1/0), abs(-1/0), abs(0/0), abs(undef));")
-        assert lines == ["ECHO: inf, inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, inf, nan, undef"]
 
     def test_sign(self):
         _, lines = run("echo(sign(1/0), sign(-1/0), sign(0/0), sign(undef));")
-        assert lines == ["ECHO: 1, -1, 0, undef"]
+        assert _echoes(lines) == ["ECHO: 1, -1, 0, undef"]
 
     def test_ceil(self):
         _, lines = run("echo(ceil(1/0), ceil(-1/0), ceil(0/0), ceil(undef));")
-        assert lines == ["ECHO: inf, -inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, -inf, nan, undef"]
 
     def test_floor(self):
         _, lines = run("echo(floor(1/0), floor(-1/0), floor(0/0), floor(undef));")
-        assert lines == ["ECHO: inf, -inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, -inf, nan, undef"]
 
     def test_round(self):
         _, lines = run("echo(round(1/0), round(-1/0), round(0/0), round(undef));")
-        assert lines == ["ECHO: inf, -inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, -inf, nan, undef"]
 
     def test_sqrt(self):
         # sqrt of a negative (including -inf) is nan, not a crash.
         _, lines = run("echo(sqrt(1/0), sqrt(-1/0), sqrt(0/0), sqrt(undef));")
-        assert lines == ["ECHO: inf, nan, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, nan, nan, undef"]
 
     def test_ln(self):
         _, lines = run("echo(ln(1/0), ln(-1/0), ln(0/0), ln(undef));")
-        assert lines == ["ECHO: inf, nan, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, nan, nan, undef"]
 
     def test_log(self):
         _, lines = run("echo(log(1/0), log(-1/0), log(0/0), log(undef));")
-        assert lines == ["ECHO: inf, nan, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, nan, nan, undef"]
 
     def test_exp(self):
         # exp(-inf) underflows to 0, not nan.
         _, lines = run("echo(exp(1/0), exp(-1/0), exp(0/0), exp(undef));")
-        assert lines == ["ECHO: inf, 0, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, 0, nan, undef"]
 
     def test_sin_cos_tan(self):
         # _deg_trig explicitly returns nan for any nan/inf input (its
@@ -1108,7 +1113,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(cos(1/0), cos(-1/0), cos(0/0), cos(undef));"
             "echo(tan(1/0), tan(-1/0), tan(0/0), tan(undef));"
         )
-        assert lines == [
+        assert _echoes(lines) == [
             "ECHO: nan, nan, nan, undef",
             "ECHO: nan, nan, nan, undef",
             "ECHO: nan, nan, nan, undef",
@@ -1121,7 +1126,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(asin(1/0), asin(-1/0), asin(0/0), asin(undef));"
             "echo(acos(1/0), acos(-1/0), acos(0/0), acos(undef));"
         )
-        assert lines == [
+        assert _echoes(lines) == [
             "ECHO: nan, nan, nan, undef",
             "ECHO: nan, nan, nan, undef",
         ]
@@ -1130,20 +1135,20 @@ class TestMathBuiltinsNanInfUndef:
         # atan has no domain restriction -- +-inf -> +-90 degrees exactly,
         # only nan input produces nan output.
         _, lines = run("echo(atan(1/0), atan(-1/0), atan(0/0), atan(undef));")
-        assert lines == ["ECHO: 90, -90, nan, undef"]
+        assert _echoes(lines) == ["ECHO: 90, -90, nan, undef"]
 
     def test_atan2(self):
         _, lines = run(
             "echo(atan2(1/0, 1), atan2(1, 1/0), atan2(0/0, 1), atan2(undef, 1));"
         )
-        assert lines == ["ECHO: 90, 0, nan, undef"]
+        assert _echoes(lines) == ["ECHO: 90, 0, nan, undef"]
 
     def test_pow(self):
         _, lines = run(
             "echo(pow(1/0, 2), pow(2, 1/0), pow(0/0, 2), pow(0, -1/0), "
             "pow(-2, 0.5), pow(undef, 2));"
         )
-        assert lines == ["ECHO: inf, inf, nan, inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, inf, nan, inf, nan, undef"]
 
     def test_max_min_nan_position_dependent(self):
         # Regression/documentation: max/min dispatch to Python's own
@@ -1159,7 +1164,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(min(0/0, 1), min(1, 0/0));"
             "echo(max([0/0, 1, 3]), max([1, 3, 0/0]));"
         )
-        assert lines == [
+        assert _echoes(lines) == [
             "ECHO: nan, 1",
             "ECHO: nan, 1",
             "ECHO: nan, 3",
@@ -1170,7 +1175,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(max(1, 1/0), min(1, -1/0));"
             "echo(max([1, 1/0, 3]));"
         )
-        assert lines == ["ECHO: inf, -inf", "ECHO: inf"]
+        assert _echoes(lines) == ["ECHO: inf, -inf", "ECHO: inf"]
 
     def test_max_min_undef_in_multi_arg_form_is_undef(self):
         # Mixing undef into the multi-scalar-argument form of max/min
@@ -1179,13 +1184,13 @@ class TestMathBuiltinsNanInfUndef:
         # which raises TypeError comparing None to a number, caught by
         # the outer try/except and surfaced as undef.
         _, lines = run("echo(max(1, undef), min(1, undef));")
-        assert lines == ["ECHO: undef, undef"]
+        assert _echoes(lines) == ["ECHO: undef, undef"]
 
     def test_norm(self):
         _, lines = run(
             "echo(norm([1/0, 0]), norm([0/0, 0]), norm([undef, 0]));"
         )
-        assert lines == ["ECHO: inf, nan, undef"]
+        assert _echoes(lines) == ["ECHO: inf, nan, undef"]
 
     def test_cross_rejects_non_finite_components(self):
         # Confirmed against real OpenSCAD 2022.08.22: cross() validates
@@ -1198,7 +1203,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(cross([0/0,0,0],[0,1,0]));"
             "echo(cross([1,0,0],[0,1,0]));"
         )
-        assert lines == ["ECHO: undef", "ECHO: undef", "ECHO: [0, 0, 1]"]
+        assert _echoes(lines) == ["ECHO: undef", "ECHO: undef", "ECHO: [0, 0, 1]"]
 
     def test_is_num_excludes_nan_but_not_inf(self):
         # is_num(nan) is explicitly false (evaluator.py's is_num lambda
@@ -1207,11 +1212,11 @@ class TestMathBuiltinsNanInfUndef:
         _, lines = run(
             "echo(is_num(1/0), is_num(-1/0), is_num(0/0), is_num(undef));"
         )
-        assert lines == ["ECHO: true, true, false, false"]
+        assert _echoes(lines) == ["ECHO: true, true, false, false"]
 
     def test_str_formatting(self):
         _, lines = run("echo(str(1/0), str(-1/0), str(0/0), str(undef));")
-        assert lines == ['ECHO: "inf", "-inf", "nan", "undef"']
+        assert _echoes(lines) == ['ECHO: "inf", "-inf", "nan", "undef"']
 
     def test_chr_non_finite_or_undef_returns_empty_string(self):
         # Confirmed against real OpenSCAD 2022.08.22: chr() returns ""
@@ -1222,7 +1227,7 @@ class TestMathBuiltinsNanInfUndef:
             "echo(chr(1/0), chr(0/0), chr(undef));"
             "echo(chr([65, 1/0, 66]));"
         )
-        assert lines == ['ECHO: "", "", ""', 'ECHO: "AB"']
+        assert _echoes(lines) == ['ECHO: "", "", ""', 'ECHO: "AB"']
 
     def test_ord_undef_is_undef(self):
         # ord() indexes into a string, which raises on None -- caught by
@@ -1230,7 +1235,7 @@ class TestMathBuiltinsNanInfUndef:
         # builtin here (unlike chr(), ord()'s real-OpenSCAD behavior for
         # undef input is undef, not "").
         _, lines = run("echo(ord(undef));")
-        assert lines == ["ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef"]
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1264,7 @@ class TestMathBuiltinsNonNumericArgs:
         for fn in fns:
             for arg in ("[1,2,3]", 'object(a=1)', '"hi"'):
                 _, lines = run(f"echo({fn}({arg}));")
-                assert lines == ["ECHO: undef"], f"{fn}({arg})"
+                assert _echoes(lines) == ["ECHO: undef"], f"{fn}({arg})"
 
     def test_unary_functions_reject_bool(self):
         # Confirmed against real OpenSCAD: abs(true), sign(true),
@@ -1269,29 +1274,29 @@ class TestMathBuiltinsNonNumericArgs:
                "sin", "cos", "tan", "asin", "acos", "atan"]
         for fn in fns:
             _, lines = run(f"echo({fn}(true), {fn}(false));")
-            assert lines == ["ECHO: undef, undef"], fn
+            assert _echoes(lines) == ["ECHO: undef, undef"], fn
 
     def test_atan2_rejects_bool(self):
         _, lines = run("echo(atan2(true, false), atan2(1, true), atan2(true, 1));")
-        assert lines == ["ECHO: undef, undef, undef"]
+        assert _echoes(lines) == ["ECHO: undef, undef, undef"]
 
     def test_pow_rejects_bool_in_either_position(self):
         _, lines = run("echo(pow(true, 2), pow(2, true), pow(false, 2));")
-        assert lines == ["ECHO: undef, undef, undef"]
+        assert _echoes(lines) == ["ECHO: undef, undef, undef"]
 
     def test_max_min_reject_bool_multi_arg_and_list_forms(self):
         _, lines = run(
             "echo(max(true, 1), max(1, true), min(true, 1));"
             "echo(max([true, 1, 2]));"
         )
-        assert lines == ["ECHO: undef, undef, undef", "ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef, undef, undef", "ECHO: undef"]
 
     def test_norm_cross_reject_bool_vector_component(self):
         _, lines = run(
             "echo(norm([true, 0]));"
             "echo(cross([true,0,0],[0,1,0]));"
         )
-        assert lines == ["ECHO: undef", "ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef", "ECHO: undef"]
 
     def test_numeric_only_fns_still_work_normally(self):
         # Sanity check the guard doesn't over-reject legitimate numeric
@@ -1300,7 +1305,7 @@ class TestMathBuiltinsNonNumericArgs:
             "echo(abs(5), sqrt(4), pow(2,3), atan2(1,1));"
             "echo(max(1,2), min(1,2), norm([3,4]), cross([1,0,0],[0,1,0]));"
         )
-        assert lines == ["ECHO: 5, 2, 8, 45", "ECHO: 2, 1, 5, [0, 0, 1]"]
+        assert _echoes(lines) == ["ECHO: 5, 2, 8, 45", "ECHO: 2, 1, 5, [0, 0, 1]"]
 
 
 # ---------------------------------------------------------------------------
@@ -1368,8 +1373,12 @@ class TestDefaultParamScoping:
 
     def test_default_cannot_see_sibling_param(self):
         _, lines = run("function f(a, b=a*2) = a + b; echo(f(3));")
-        assert lines[0] == "WARNING: Ignoring unknown variable \"a\" in file <string>, line 1"
-        assert lines[1] == "ECHO: undef"
+        assert lines == [
+            'WARNING: Ignoring unknown variable "a" in file <string>, line 1',
+            "WARNING: undefined operation (undefined * number) in file <string>, line 1",
+            "WARNING: undefined operation (number + undefined) in file <string>, line 1",
+            "ECHO: undef",
+        ]
 
     def test_function_body_already_ignores_caller_let(self):
         # Sanity check: the function BODY (not a default) already correctly
@@ -2335,11 +2344,11 @@ class TestExpressionEdgeCases:
 
     def test_bool_arithmetic_is_undef(self):
         _, lines = run("echo(true + 1);")
-        assert lines == ["ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef"]
 
     def test_bool_mul_is_undef(self):
         _, lines = run("echo(true * 5);")
-        assert lines == ["ECHO: undef"]
+        assert _echoes(lines) == ["ECHO: undef"]
 
     def test_scalar_times_matrix(self):
         _, lines = run("echo(2 * [[1,2],[3,4]]);")
@@ -3772,7 +3781,49 @@ class TestObject:
 
     def test_addition_on_objects_is_undef(self):
         _, echoes = run("echo(object(a=1) + object(b=2));")
-        assert echoes == ["ECHO: undef"]
+        assert _echoes(echoes) == ["ECHO: undef"]
+
+
+class TestOperandWarnings:
+    """Output checked against OpenSCAD 2026.02.01 byte for byte."""
+
+    def test_operators(self):
+        _, lines = run('echo(1+"a"); echo(-"a"); echo(true*2); echo(object(a=1)+object(b=2));')
+        assert lines == [
+            "WARNING: undefined operation (number + string) in file <string>, line 1",
+            "ECHO: undef",
+            "WARNING: undefined operation (-string) in file <string>, line 1",
+            "ECHO: undef",
+            "WARNING: undefined operation (bool * number) in file <string>, line 1",
+            "ECHO: undef",
+            "WARNING: undefined operation (object + object) in file <string>, line 1",
+            "ECHO: undef",
+        ]
+
+    def test_products(self):
+        _, lines = run("echo([1,2]*[1,2,3]); echo([[1,2]]*[1]); echo([1]*[[1,2],[3,4]]);"
+                       'echo([[1,2]]*[[1,2]]); echo(["a",1]*[1,2]); echo([[1,"a"]]*[1,2]); echo([]*[]);')
+        assert [l.removesuffix(" in file <string>, line 1") for l in lines if l != "ECHO: undef"] == [
+            "WARNING: vector*vector requires matching lengths (2 != 3)",
+            "WARNING: matrix*vector requires matrix column count to match vector length (2 != 1)",
+            "WARNING: vector*matrix requires vector length to match matrix row count (1 != 2)",
+            "WARNING: matrix*matrix requires left operand column count to match right operand row count (2 != 1)",
+            "WARNING: undefined vector*vector multiplication where first elements are types string and number",
+            "WARNING: Matrix must contain only numbers. Problem at row 0, col 1",
+            "WARNING: Multiplication is undefined on empty vectors",
+        ]
+
+    def test_builtin_parameters(self):
+        _, lines = run('echo(cos("a")); echo(max([true,1])); echo(ord(1)); echo(norm([true,0]));'
+                       "echo(cross([1,0],[1,0,0])); echo(cross([1/0,0,0],[0,1,0]));")
+        assert [l.removesuffix(" in file <string>, line 1") for l in lines if l != "ECHO: undef"] == [
+            'WARNING: cos() parameter could not be converted: argument 0: expected number, found string ("a")',
+            "WARNING: max() parameter could not be converted: vector element 0: expected number, found bool (true)",
+            "WARNING: ord() parameter could not be converted: argument 0: expected string, found number (1)",
+            "WARNING: Incorrect arguments to norm()",
+            "WARNING: Invalid vector size of parameter for cross()",
+            "WARNING: Invalid value (INF) in parameter vector for cross()",
+        ]
 
 
 class TestTextMetrics:
