@@ -1773,29 +1773,22 @@ class TestModifiers:
         assert bb[3] - bb[0] == approx(2)
 
     def test_showonly_produces_geometry(self):
-        # ! (show-only) filters other geometry; produces role="show_only" body
+        # ! (show-only) makes its subtree the whole model
         bodies, _ = run("!cube(3);")
         assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
         bb = bbox(bodies)
         assert bb[3] - bb[0] == approx(3)
 
     def test_showonly_filters_others(self):
-        # ! filters out normal geometry, keeping only show_only bodies
+        # ! drops its siblings
         bodies, _ = run("cube(1); !cube(3);")
-        assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(27)
 
     def test_showonly_inside_union_keeps_role(self):
-        # Regression: _split_by_role used to fold show_only bodies into
-        # the ordinary "foreground" group, so union() (like any CSG op)
-        # unioned the !-tagged child together with its siblings and the
-        # combined result lost the show_only role entirely -- ! silently
-        # stopped isolating its subtree the moment it was nested inside a
-        # boolean op instead of sitting at the top level.
+        # Nested in a boolean, ! still isolates its subtree: the tree is
+        # re-rooted there before generation, so the union never happens.
         bodies, _ = run("union() { !cube(5); translate([10,0,0]) sphere(3); }")
         assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
         bb = bbox(bodies)
         assert bb[3] - bb[0] == approx(5)
 
@@ -1804,22 +1797,21 @@ class TestModifiers:
             "difference() { cube(10); !translate([2,2,-1]) cylinder(h=12, r=2); }"
         )
         assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
+        bb = bbox(bodies)  # the cylinder alone, not cut from the cube
+        assert (bb[2], bb[3], bb[5]) == approx((-1, 4, 11))
 
     def test_showonly_inside_intersection_keeps_role(self):
         bodies, _ = run("intersection() { cube(10); !sphere(8); }")
         assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
+        assert bbox(bodies)[0] == approx(-8, rel=1e-2)  # the sphere alone, not clipped
 
     def test_showonly_inside_hull_keeps_role(self):
         bodies, _ = run("hull() { !cube(5); translate([10,0,0]) sphere(3); }")
-        assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(125)
 
     def test_showonly_inside_minkowski_keeps_role(self):
         bodies, _ = run("minkowski() { !cube(5); sphere(1); }")
-        assert len(bodies) == 1
-        assert bodies[0].role == "show_only"
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(125)
 
     def test_background_role(self):
         # % (background) produces a ghost body tagged role="background"
@@ -4233,17 +4225,13 @@ class TestCSGTree:
         assert flatten_csg_tree(ev.csg_tree) == bodies
 
     def test_flatten_vs_evaluate_with_top_level_show_only(self):
-        # Documented exception: evaluate()'s own post-hoc show_only filter
-        # (applied once, outside any single tree node) makes evaluate()'s
-        # result a strict subset of the flattened (pre-filter) tree.
+        # Both statements are resolved into the tree, but only the `!`
+        # subtree is generated, so flattening the tree gives the result.
         src = "cube(1); !cube(3);"
         bodies, _, ev = run_tree(src)
-        flat = flatten_csg_tree(ev.csg_tree)
-        assert len(flat) == 2                        # both top-level statements recorded
-        assert len(bodies) == 1                       # evaluate()'s post-filter result
-        assert bodies[0].role == "show_only"
-        filtered = [b for b in flat if b.role in ("show_only", "highlight")]
-        assert filtered == bodies                     # replaying evaluate()'s own filter matches exactly
+        assert len(ev.csg_tree) == 2                  # both top-level statements recorded
+        assert flatten_csg_tree(ev.csg_tree) == bodies
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(27)
 
     def test_error_mid_subtree_leaves_valid_partial_tree(self):
         # An EvalError raised deep inside a subtree must not corrupt the
@@ -5657,3 +5645,93 @@ def test_top_level_block_is_drawn():
     # bare list, and build_scopes() crashed on it; OpenSCAD draws the contents.
     bodies, _ = run("x = 1; { cube(2); }")
     assert len(bodies) == 1 and bodies[0].body.volume() == approx(8)
+
+
+class TestCSGBackports:
+    """Four CSG bugs backported from openscad_cpp_evaluator; every expected
+    value is what OpenSCAD 2026.02.01 renders for the same source."""
+
+    # --- 2D shapes under a 3D transform take its in-plane part ---
+
+    @pytest.mark.parametrize("src, bounds", [
+        ("rotate([60,0,0]) square(10);", (0, 0, 10, 5)),        # was left flat: 10 x 10
+        ("rotate(90, [1,0,0]) square(10);", (0, 0, 10, 0)),     # edge-on: no area left
+        ("mirror([0,0,1]) square(10);", (0, 0, 10, 10)),        # was degenerate
+        ("scale([1,1,3]) square(10);", (0, 0, 10, 10)),
+        ("translate([1,2,5]) square(10);", (1, 2, 11, 12)),     # z is dropped
+        ("resize([20,5]) square(10);", (0, 0, 20, 5)),          # was ignored in 2D
+    ])
+    def test_2d_takes_the_in_plane_part(self, src, bounds):
+        bodies, _ = run(src)
+        assert bodies[0].section.bounds() == pytest.approx(bounds, abs=1e-9)
+
+    def test_extruded_after_an_out_of_plane_rotation(self):
+        bodies, _ = run("linear_extrude(1) rotate([60,0,0]) square(10);")
+        assert bodies[0].body.volume() == approx(50)
+
+    # --- mixed 2D/3D children: the first child's dimension wins ---
+
+    @pytest.mark.parametrize("src, dim, kept, dropped, size", [
+        ("union(){cube(2); square(3);}", 3, "3D", "2D", 8),     # crashed: None + CrossSection
+        ("union(){square(3); cube(2);}", 2, "2D", "3D", 9),
+        ("difference(){cube(10); square(3);}", 3, "3D", "2D", 1000),
+        ("difference(){square(10); cube(3);}", 2, "2D", "3D", 100),
+        ("translate([1,0,0]) {cube(2); square(3);}", 3, "3D", "2D", 8),
+        ('color("red") {cube(2); square(3);}', 3, "3D", "2D", 8),
+    ])
+    def test_mixed_children(self, src, dim, kept, dropped, size):
+        bodies, lines = run(src)
+        assert lines == ["WARNING: Mixing 2D and 3D objects is not supported in file <string>, line 1",
+                         f"WARNING: Ignoring {dropped} child object for {kept} operation in file <string>, line 1"]
+        assert len(bodies) == 1
+        assert (bodies[0].body.volume() if dim == 3 else bodies[0].section.area()) == approx(size)
+
+    def test_dropped_child_is_an_empty_operand(self):
+        bodies, _ = run("intersection(){cube(10); square(3); cube(3);}")
+        assert bodies == []
+
+    def test_top_level_keeps_both(self):
+        bodies, lines = run("cube(2); square(3);")
+        assert lines == [] and len(bodies) == 2
+
+    # --- ! makes its subtree the whole model ---
+
+    def test_ancestors_of_the_root_are_not_applied(self):
+        bodies, _ = run("translate([50,0,0]) !cube(5);")
+        assert bbox(bodies)[0] == approx(0)  # was 50
+
+    def test_root_under_an_extrude_stays_2d(self):
+        bodies, _ = run("linear_extrude(height=10) !circle(10);")
+        assert bodies[0].body is None and bodies[0].section is not None
+
+    def test_highlighted_sibling_goes_too(self):
+        bodies, _ = run("#cube(3); !cube(5);")
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(125)
+
+    def test_second_root_warns_and_the_first_wins(self):
+        bodies, lines = run("cube(1);\n!cube(5);\n\n!translate([10,0,0]) cube(2);\n")
+        assert lines == ["WARNING: More than one Root Modifier (!) in file <string>, line 4"]
+        assert bodies[0].body.volume() == approx(125)
+
+    def test_root_inside_the_root_is_part_of_it(self):
+        bodies, lines = run("!union() { cube(5); !translate([10,0,0]) cube(1); }")
+        assert "More than one Root Modifier" in lines[0]
+        assert bodies[0].body.volume() == approx(126)
+
+    # --- 2D minkowski() ---
+
+    @pytest.mark.parametrize("src, area, bounds", [
+        ("minkowski() { square([30,20]); circle(4, $fn=24); }", 1049.693178, (-4, -4, 34, 24)),
+        ("minkowski() { polygon([[0,0],[30,0],[30,10],[10,10],[10,30],[0,30]]); circle(3, $fn=16); }",
+         885.4412927, (-3, -3, 33, 33)),                                          # concave A
+        ("minkowski() { square(10); polygon([[0,0],[6,0],[6,2],[2,2],[2,6],[0,6]]); }",
+         240, (0, 0, 16, 16)),                                              # concave B
+        ("minkowski() { square(10); translate([16,0]) square(2); }", 144, (16, 0, 28, 12)),  # off-origin B
+        ("minkowski() { square(10); circle(2, $fn=12); square([1,3]); }", 251.0001658, (-2, -2, 13, 15)),
+        ("minkowski() { difference() { square(30); translate([10,10]) square(10); } circle(2, $fn=12); }",
+         1116.000166, (-2, -2, 32, 32)),                                           # a hole
+    ])
+    def test_2d_minkowski(self, src, area, bounds):
+        bodies, _ = run(src)  # produced nothing
+        assert bodies[0].section.area() == approx(area, rel=1e-5)  # OpenSCAD's, via float32 OFF
+        assert bodies[0].section.bounds() == pytest.approx(bounds, abs=1e-6)

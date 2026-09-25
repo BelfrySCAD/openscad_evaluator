@@ -72,14 +72,51 @@ def _vnf_from_mesh(verts: np.ndarray, tris: np.ndarray) -> tuple[list, list]:
     return verts.tolist(), tris[:, [0, 2, 1]].tolist()
 
 
+def _minkowski_2d(a: m3d.CrossSection, b: m3d.CrossSection) -> m3d.CrossSection:
+    """The Minkowski sum of two 2D shapes, which Manifold has no operation
+    for. For a convex B containing the origin,
+
+        A (+) B  =  A  union  (the boundary of A swept by B)
+
+    and each edge of A sweeps to the hull of B at its two ends -- so A is
+    never cut up, however concave or holed; only its edges are walked. B is
+    split into convex pieces (it has to be convex for the per-edge hull),
+    and each piece is moved to contain the origin and the result moved back
+    (a piece off the origin would otherwise keep an unmoved copy of A).
+    Minkowski distributes over union, so the pieces' sums are unioned."""
+    b_polys = [np.asarray(p, dtype=np.float64) for p in b.to_polygons()]
+    if len(b_polys) == 1 and abs(b.hull().area() - b.area()) <= 1e-9 * max(b.area(), 1.0):
+        pieces = b_polys
+    else:
+        verts = np.vstack(b_polys)
+        pieces = [verts[t] for t in np.asarray(m3d.triangulate(b_polys))]
+    a_polys = [np.asarray(p, dtype=np.float64) for p in a.to_polygons()]
+    sums = []
+    for piece in pieces:
+        c = piece.mean(axis=0)
+        q = piece - c
+        swept = [a]
+        for poly in a_polys:
+            for p0, p1 in zip(poly, np.roll(poly, -1, axis=0)):
+                swept.append(m3d.CrossSection.hull_points(np.vstack([q + p0, q + p1])))
+        sums.append(m3d.CrossSection.batch_boolean(swept, m3d.OpType.Add).translate(c.tolist()))
+    return m3d.CrossSection.batch_boolean(sums, m3d.OpType.Add)
+
+
+def _cos_sin_deg(deg: float) -> tuple[float, float]:
+    """cos and sin of `deg` degrees, exact at multiples of 90, so a quarter
+    turn leaves no 6e-17 residue (a 2D shape turned edge-on would keep a
+    sliver of area instead of none)."""
+    q, r = divmod(round(deg, 12), 90)
+    if r == 0:
+        return ((1, 0), (0, 1), (-1, 0), (0, -1))[int(q) % 4]
+    return math.cos(math.radians(deg)), math.sin(math.radians(deg))
+
+
 def _rot_deg(deg: float, axis: int) -> np.ndarray:
     """Rotation matrix about x/y/z (0/1/2) by `deg` degrees, exact at
-    multiples of 90 so a quarter turn leaves no 6e-17 residue."""
-    q, r = divmod(deg, 90)
-    if r == 0:
-        c, s = ((1, 0), (0, 1), (-1, 0), (0, -1))[int(q) % 4]
-    else:
-        c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    multiples of 90."""
+    c, s = _cos_sin_deg(deg)
     i, j = [k for k in range(3) if k != axis]
     m = np.eye(3)
     m[i, i], m[i, j], m[j, i], m[j, j] = c, -s, s, c
@@ -2581,7 +2618,7 @@ class Evaluator:
         for node in others:
             self._eval_statement(node, ctx)
         t_resolve_end = time.perf_counter() if self._profiling else 0.0
-        result = self.generate_tree(self.csg_tree)
+        result = self.generate_tree(self._show_only_root())
         t_generate_end = time.perf_counter() if self._profiling else 0.0
         if self._profiling:
             resolve_time = t_resolve_end - t_resolve_start
@@ -2594,11 +2631,31 @@ class Evaluator:
                 total_time=resolve_time + generate_time,
                 unattributed_time=max(0.0, resolve_time - self_sum),
             )
-        # ! (show_only) modifier: if any body is show_only, display only those + highlights
-        show_only = [b for b in result if b.role == "show_only"]
-        if show_only:
-            result = [b for b in result if b.role in ("show_only", "highlight")]
         return result, self.id_to_node
+
+    def _show_only_root(self) -> list[CSGNode]:
+        """What to generate: the whole tree, or -- if a `!` is anywhere in it
+        -- just that subtree, as OpenSCAD does. `!` makes its subtree the
+        whole model, so its siblings AND every operation wrapped round it go:
+        `translate([50,0,0]) !cube(5);` stays at the origin, and
+        `linear_extrude(10) !circle(10);` stays a circle. Tagging the bodies
+        and filtering at the end could not express that -- by then every
+        ancestor had been applied. The first `!` wins; another warns, once,
+        where it is (a `!` inside the root is just part of it)."""
+        roots: list[CSGNode] = []
+
+        def collect(nodes):
+            for n in nodes:
+                if n.kind == "show_only" and n.is_builtin:
+                    roots.append(n)
+                collect(n.children)
+        collect(self.csg_tree)
+        if not roots:
+            return self.csg_tree
+        if len(roots) > 1:
+            self._echo_fn(f"WARNING: More than one Root Modifier (!)"
+                          f"{self._loc(getattr(roots[1].node, 'position', None))}")
+        return [roots[0]]
 
     # ------------------------------------------------------------------
     # Statement dispatch
@@ -3139,7 +3196,8 @@ class Evaluator:
         return [replace(b, role="background") for b in flatten_csg_tree(children)]
 
     def _generate_show_only(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
-        return [replace(b, role="show_only") for b in flatten_csg_tree(children)]
+        # Being the root is all `!` does -- see _show_only_root.
+        return flatten_csg_tree(children)
 
     def _resolve_args(self, arguments, ctx: EvalContext) -> dict:
         result = {}
@@ -3327,10 +3385,28 @@ class Evaluator:
         self._eval_children(node.children, ctx)
         return {"name": name, "args": args}
 
+    def _one_dimension(self, bodies: list[ColoredBody], node) -> list[ColoredBody]:
+        """What a node combining its children keeps of them: the dimension of
+        the first, as OpenSCAD renders it, dropping the other with its two
+        warnings. `union() { cube(2); square(3); }` crashed (None +
+        CrossSection); OpenSCAD keeps the cube. Used by the booleans, the
+        transforms and color(); the top level keeps both."""
+        dims = [b.section is not None for b in bodies
+                if b.body is not None or b.section is not None or b.raw_mesh is not None]
+        if not dims or all(d == dims[0] for d in dims):
+            return bodies
+        keep_2d = dims[0]
+        loc = self._loc(getattr(node, "position", None))
+        kept, dropped = ("2D", "3D") if keep_2d else ("3D", "2D")
+        self._echo_fn(f"WARNING: Mixing 2D and 3D objects is not supported{loc}")
+        self._echo_fn(f"WARNING: Ignoring {dropped} child object for {kept} operation{loc}")
+        return [b for b in bodies if (b.section is not None) == keep_2d
+                or (b.body is None and b.section is None and b.raw_mesh is None)]
+
     def _generate_transform(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
         name, args = params["name"], params["args"]
         result = []
-        for b in flatten_csg_tree(children):
+        for b in self._one_dimension(flatten_csg_tree(children), node):
             if b.section is not None:
                 result.append(replace(b, section=self._apply_transform_2d(name, args, b.section)))
             elif b.body is not None:
@@ -3345,6 +3421,15 @@ class Evaluator:
         """_apply_transform_3d for a raw_mesh, which has no Manifold to call:
         the same transform as a matrix, flipping the winding when it mirrors."""
         verts, tris = raw
+        span = verts.max(axis=0) - verts.min(axis=0) if len(verts) else np.zeros(3)
+        m = self._transform_matrix(name, args, span)
+        verts = verts @ m[:3, :3].T + m[:3, 3]
+        if np.linalg.det(m[:3, :3]) < 0:
+            tris = tris[:, [0, 2, 1]]
+        return verts, tris
+
+    def _transform_matrix(self, name: str, args: dict, span) -> np.ndarray:
+        """The 4x4 matrix of a transform; `span` is the extent resize() scales to."""
         m = np.eye(4)
         if name == "translate":
             m[:3, 3] = self._to_vec3(self._get_arg(args, 0, "v", [0, 0, 0]))
@@ -3366,18 +3451,24 @@ class Evaluator:
                 m[:3, :3] -= 2 * np.outer(n, n) / (n @ n)
         elif name == "resize":
             newsize = [float(x) for x in self._get_arg(args, 0, "newsize", [0, 0, 0])]
-            span = verts.max(axis=0) - verts.min(axis=0) if len(verts) else np.zeros(3)
+            newsize += [0.0] * (3 - len(newsize))
             m[:3, :3] = np.diag([ns / sp if ns and sp else 1 for ns, sp in zip(newsize, span)])
         elif name == "multmatrix":
             mat = self._get_arg(args, 0, "m", None)
             if mat is not None:
                 m[:3, :] = np.array(self._to_matrix4x3(mat), dtype=np.float64)
-        verts = verts @ m[:3, :3].T + m[:3, 3]
-        if np.linalg.det(m[:3, :3]) < 0:
-            tris = tris[:, [0, 2, 1]]
-        return verts, tris
+        return m
 
     def _apply_transform_2d(self, name: str, args: dict, cs: "m3d.CrossSection") -> "m3d.CrossSection":
+        if name == "resize" or (name == "rotate" and self._rotates_out_of_plane(args)) or (
+                name == "mirror" and self._to_vec3(self._get_arg(args, 0, "v", [1, 0, 0]))[2] != 0):
+            # A 2D shape takes the in-plane part of a 3D transform, as in
+            # OpenSCAD: rotate([60,0,0]) square(10) is 10 x 5, and
+            # mirror([0,0,1]) leaves it as it was. It was left flat
+            # (x/y rotation dropped) or, for a z mirror, degenerate.
+            x0, y0, x1, y1 = cs.bounds()
+            m = self._transform_matrix(name, args, np.array([x1 - x0, y1 - y0, 0.0]))
+            return cs.transform([[m[0, 0], m[0, 1], m[0, 3]], [m[1, 0], m[1, 1], m[1, 3]]])
         if name == "translate":
             v = self._get_arg(args, 0, "v", [0, 0])
             cs = cs.translate([float(v[0]), float(v[1])])
@@ -3442,6 +3533,13 @@ class Evaluator:
                 body = body.transform(mat)
         return body
 
+    def _rotates_out_of_plane(self, args: dict) -> bool:
+        a = self._get_arg(args, 0, "a", 0)
+        if isinstance(a, list):
+            return any(float(x) != 0 for x in a[:2])
+        v = self._get_arg(args, 1, "v", None)
+        return v is not None and any(float(x) != 0 for x in self._to_vec3(v)[:2])
+
     def _apply_rotate(self, body: m3d.Manifold, a, v) -> m3d.Manifold:
         if isinstance(a, (list, tuple)):
             # rotate([x,y,z]) — Euler angles in degrees, applied Z then Y then X
@@ -3465,8 +3563,7 @@ class Evaluator:
         if length == 0:
             return [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
         ax, ay, az = ax/length, ay/length, az/length
-        c = math.cos(angle_rad)
-        s = math.sin(angle_rad)
+        c, s = _cos_sin_deg(math.degrees(angle_rad))
         t = 1 - c
         return [
             [t*ax*ax+c,    t*ax*ay-s*az, t*ax*az+s*ay, 0],
@@ -3516,13 +3613,14 @@ class Evaluator:
         # children -- `module c(x) { color(x) children(); }`, as BOSL2 does --
         # are born in the caller's colourless context.
         rgba = params["rgba"]
-        for b in flatten_csg_tree(children):
+        bodies = self._one_dimension(flatten_csg_tree(children), node)
+        for b in bodies:
             if b.body is not None:
                 oid = b.body.original_id()
                 ids = (oid,) if oid >= 0 else b.body.to_mesh().run_original_id
                 for rid in ids:
                     self.id_to_color[int(rid)] = rgba
-        return [replace(b, color=rgba, tri_colors=None) for b in flatten_csg_tree(children)]
+        return [replace(b, color=rgba, tri_colors=None) for b in bodies]
 
     def _css_color(self, name: str, alpha: float = 1.0) -> tuple:
         if name.startswith("#"):
@@ -3607,11 +3705,15 @@ class Evaluator:
         # a merge the way _attach_tri_colors does for 3D.
         parts_2d: Optional[list[ColoredBody]] = None
         idx = 0
+        # The first child's dimension wins; a child of the other dimension is
+        # dropped (and, dropped, is an empty operand -- intersection() with
+        # one is empty, as in OpenSCAD).
+        kept = {id(b) for b in self._one_dimension(flatten_csg_tree(children), node)}
 
         for size in params["group_sizes"]:
             group_nodes = children[idx:idx + size]
             idx += size
-            stmt_bodies = flatten_csg_tree(group_nodes)
+            stmt_bodies = [b for b in flatten_csg_tree(group_nodes) if id(b) in kept]
 
             bg, fg, hi, so = self._split_by_role(stmt_bodies)
             all_bg.extend(bg)
@@ -4817,7 +4919,15 @@ class Evaluator:
         bg, fg, hi, so = self._split_by_role(bodies)
         bodies_3d = [c for c in fg if c.body is not None]
         if not bodies_3d:
-            return bg + hi + so
+            sections = [c for c in fg if c.section is not None]
+            if len(sections) > 1:
+                # 2D children were dropped: linear_extrude(6) minkowski() {
+                # square(...); circle(4); } drew nothing.
+                result = sections[0].section
+                for c in sections[1:]:
+                    result = _minkowski_2d(result, c.section)
+                return [ColoredBody(section=result, color=sections[0].color)] + bg + hi + so
+            return sections + bg + hi + so
         if len(bodies_3d) == 1:
             return bodies_3d + bg + hi + so
         try:
