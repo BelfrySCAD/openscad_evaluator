@@ -56,11 +56,8 @@ Diagnostics
   and iterate zero times (f614e0d); `[for(i=[0:1:1/0]) i]` hangs instead (#147)
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)
-- Open polyhedron gives no warning; report boundary-edge count and first location (#188, #189)
 
 Meshes
-- **silent** Open polyhedron/`import()` vanishes; draw it as a display-only surface (needs a raw
-  mesh on `ColoredBody`, kept out of CSG) (57fa5d4); `hull()` of one is empty (#135)
 - Polyhedron fan-triangulates faces; reuse `_triangulate_planar_face` (#88)
 - Polyhedron vertices cast to float32 (#94)
 - Polyhedron always welds coincident vertices, fusing touching shells; keep the weld only if

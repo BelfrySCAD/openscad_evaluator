@@ -25,11 +25,31 @@ def format_for_path(path: str) -> str:
     return _EXTENSION_FORMATS[ext]
 
 
+def _body_mesh(b: ColoredBody):
+    """(verts float (N, 3), tris int (M, 3)) for a solid or an open raw_mesh
+    body, or None if it has no triangles."""
+    if b.body is not None and not b.body.is_empty():
+        mesh = b.body.to_mesh()
+        return np.asarray(mesh.vert_properties[:, :3]), np.asarray(mesh.tri_verts)
+    if b.raw_mesh is not None and len(b.raw_mesh[1]):
+        return b.raw_mesh
+    return None
+
+
 def _compose_mesh(bodies: list[ColoredBody]):
+    """Every body's triangles as one (verts, tris) pair -- solids composed as
+    before, then any open raw_mesh surfaces appended -- or None if empty."""
+    parts = []
     manifolds = [b.body for b in bodies if b.body is not None and not b.body.is_empty()]
-    if not manifolds:
+    if manifolds:
+        mesh = m3d.Manifold.compose(manifolds).to_mesh()
+        parts.append((np.asarray(mesh.vert_properties[:, :3]), np.asarray(mesh.tri_verts)))
+    parts += [b.raw_mesh for b in bodies if b.body is None and b.raw_mesh is not None and len(b.raw_mesh[1])]
+    if not parts:
         return None
-    return m3d.Manifold.compose(manifolds).to_mesh()
+    offsets = np.cumsum([0] + [len(v) for v, _ in parts[:-1]])
+    return (np.vstack([v for v, _ in parts]).astype(np.float32),
+            np.vstack([t + o for (_, t), o in zip(parts, offsets)]).astype(np.int32))
 
 
 def write_stl(path: str, bodies: list[ColoredBody]) -> None:
@@ -37,8 +57,7 @@ def write_stl(path: str, bodies: list[ColoredBody]) -> None:
     mesh = _compose_mesh(bodies)
     if mesh is None:
         raise ValueError("No geometry to export")
-    verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float32)
-    tris = np.asarray(mesh.tri_verts, dtype=np.int32)
+    verts, tris = mesh
 
     v0, v1, v2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
     normals = np.cross(v1 - v0, v2 - v0).astype(np.float32)
@@ -66,8 +85,7 @@ def write_obj(path: str, bodies: list[ColoredBody]) -> None:
     mesh = _compose_mesh(bodies)
     if mesh is None:
         raise ValueError("No geometry to export")
-    verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float32)
-    tris = np.asarray(mesh.tri_verts, dtype=np.int32)
+    verts, tris = mesh
 
     with open(path, "w", encoding="utf-8") as f:
         for v in verts:
@@ -83,8 +101,7 @@ def write_off(path: str, bodies: list[ColoredBody]) -> None:
     mesh = _compose_mesh(bodies)
     if mesh is None:
         raise ValueError("No geometry to export")
-    verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float32)
-    tris = np.asarray(mesh.tri_verts, dtype=np.int32)
+    verts, tris = mesh
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("OFF\n")
@@ -142,11 +159,11 @@ def write_3mf(path: str, bodies: list[ColoredBody]) -> None:
     object_ids = []
 
     for colored_body in bodies:
-        if colored_body.body is None or colored_body.body.is_empty():
+        mesh = _body_mesh(colored_body)
+        if mesh is None:
             continue
-        mesh = colored_body.body.to_mesh()
-        verts = np.asarray(mesh.vert_properties[:, :3], dtype=np.float64)
-        tris = np.asarray(mesh.tri_verts, dtype=np.int64)
+        verts = np.asarray(mesh[0], dtype=np.float64)
+        tris = np.asarray(mesh[1], dtype=np.int64)
         if len(tris) == 0:
             continue
 

@@ -5441,3 +5441,92 @@ class TestBackportedSilentBugs:
                         'union() { setcolor("red") cube(5); color("blue") translate([10, 0, 0]) cube(5); }')
         colours = {tuple(round(float(v), 2) for v in c[:3]) for c in bodies[0].tri_colors}
         assert colours == {(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)}
+
+
+_OPEN_TETRA = "polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], [[0,1,2],[0,3,1],[0,2,3]])"
+
+
+class TestOpenMeshes:
+    """An open mesh -- faces that don't close a solid -- used to vanish without
+    a word, since Manifold returns an empty body for it. OpenSCAD draws it; so
+    do we now, as a display-only raw_mesh. Expected results checked against
+    OpenSCAD 2026.02.01."""
+
+    def test_open_polyhedron_is_drawn_and_named(self):
+        bodies, lines = run(_OPEN_TETRA + ";")
+        (b,) = bodies
+        assert b.body is None and b.section is None
+        verts, tris = b.raw_mesh
+        assert len(verts) == 4 and len(tris) == 3
+        assert lines == [
+            "WARNING: polyhedron: mesh is not closed -- 3 boundary edge(s), first at "
+            "[0, 0, 10] - [0, 10, 0]; drawing the object as an open surface rather than a "
+            "solid -- nothing is patched. hull() can still use its points, but it cannot "
+            "take part in union/difference/intersection in file <string>, line 1"]
+
+    def test_closed_polyhedron_is_silent(self):
+        bodies, lines = run("polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], "
+                            "[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]);")
+        assert lines == [] and bodies[0].body.volume() == approx(1000 / 6)
+
+    def test_nan_vertex_says_nothing_is_drawn(self):
+        bodies, lines = run("polyhedron([[0,0,0],[1,0,0],[0,1,0],[0,0,0/0]], "
+                            "[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]);")
+        assert bodies[0].raw_mesh is None
+        assert "NonFiniteVertex" in lines[0] and "nothing is drawn" in lines[0]
+
+    def test_transform_and_colour_carry_it(self):
+        bodies, _ = run(f'color("red") translate([20, 0, 0]) mirror([1, 0, 0]) {_OPEN_TETRA};')
+        verts, _ = bodies[0].raw_mesh
+        assert verts.min(axis=0).tolist() == approx([10, 0, 0])
+        assert verts.max(axis=0).tolist() == approx([20, 10, 10])
+        assert bodies[0].color[:3] == (1.0, 0.0, 0.0)
+
+    @pytest.mark.parametrize("tr", [
+        "rotate([30, 45, 60])", "rotate([90, 180, 270])", "rotate(33, [1, 2, 3])",
+        "scale([2, -1, 3])", "mirror([1, 1, 0])", "resize([5, 0, 20])",
+        "multmatrix([[1, 0.5, 0, 3], [0, 1, 0, 0], [0.2, 0, 1, 1]])",
+    ])
+    def test_transform_matches_the_solid_face_for_face(self, tr):
+        # The same transform applied to the closed tetrahedron (by Manifold)
+        # and to the open one (by _transform_raw_mesh) must give the same
+        # triangles, facing the same way -- mirrors included.
+        closed = ("polyhedron([[0,0,0],[10,0,0],[0,10,0],[1,2,10]], "
+                  "[[0,1,2],[0,3,1],[0,2,3],[1,3,2]])")
+        opened = "polyhedron([[0,0,0],[10,0,0],[0,10,0],[1,2,10]], [[0,1,2],[0,3,1],[0,2,3]])"
+        m = run(f"{tr} {closed};")[0][0].body.to_mesh()
+        sv, st = np.asarray(m.vert_properties[:, :3], dtype=float), np.asarray(m.tri_verts)
+        rv, rt = run(f"{tr} {opened};")[0][0].raw_mesh
+
+        def faces(v, t):
+            out = {}
+            for tri in t:
+                n = np.cross(v[tri[1]] - v[tri[0]], v[tri[2]] - v[tri[0]])
+                out[frozenset(tuple(np.round(v[i], 3)) for i in tri)] = n / np.linalg.norm(n)
+            return out
+        solid = faces(sv, st)
+        for key, normal in faces(rv, rt).items():
+            assert key in solid and solid[key] @ normal > 0.999
+
+    def test_boolean_drops_it_like_openscad(self):
+        bodies, lines = run(f"union() {{ cube(2); translate([20, 0, 0]) {_OPEN_TETRA}; }}")
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(8)
+        assert "mesh is not closed" in lines[0]
+
+    def test_hull_uses_its_points_silently(self):
+        bodies, lines = run(f"hull() {{ cube(1); {_OPEN_TETRA}; }}")
+        assert bodies[0].body.volume() == approx(1000 / 6) and lines == []
+
+    def test_warning_outside_a_hull_survives_one_inside(self):
+        _, lines = run(f"hull() {_OPEN_TETRA}; {_OPEN_TETRA};")
+        assert len(lines) == 1 and "mesh is not closed" in lines[0]
+
+    def test_open_stl_import_is_drawn(self, tmp_path):
+        stl = tmp_path / "open.stl"
+        stl.write_text("solid t\n"
+                       "facet normal 0 0 -1\nouter loop\nvertex 0 0 0\nvertex 0 10 0\nvertex 10 0 0\nendloop\nendfacet\n"
+                       "facet normal 0 -1 0\nouter loop\nvertex 0 0 0\nvertex 10 0 0\nvertex 0 0 10\nendloop\nendfacet\n"
+                       "endsolid t\n")
+        bodies, lines = run(f'import("{stl.as_posix()}");')
+        assert len(bodies[0].raw_mesh[1]) == 2
+        assert lines[0].startswith("WARNING: import: mesh is not closed -- 4 boundary edge(s)")
