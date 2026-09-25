@@ -3694,17 +3694,21 @@ class Evaluator:
         params = getattr(decl, 'parameters', None) or []
         args = self._bind_args(params, call.arguments, ctx, call)
 
+        # Expanded, so a children(separate=true) in the block is one real
+        # statement per child it forwards: $children counts them, and
+        # children(i) indexes them.
+        children_nodes = self._expand_child_statements(call.children, ctx)
         child_ctx = self._call_ctx_for(
             decl, ctx,
             scope=child_scope,
-            children_nodes=call.children,
+            children_nodes=children_nodes,
             children_caller_ctx=ctx,
         )
         # $children is the number of module-instantiation children passed in
         # `{}`, not the number of geometries they produced — e.g. `children()`
         # counts as one child even if the caller passed it none to forward.
         child_ctx.dyn["$children"] = len([
-            c for c in call.children
+            c for c in children_nodes
             if not isinstance(c, (Assignment, ModuleDeclaration, FunctionDeclaration))
         ])
         for k, v in args.items():
@@ -3768,7 +3772,7 @@ class Evaluator:
         "multmatrix": ("m",), "resize": ("newsize", "auto", "convexity"),
         "color": ("c", "alpha"),
         "union": (), "difference": (), "intersection": (), "hull": (), "fill": (),
-        "minkowski": ("convexity",), "children": ("index",), "render": ("convexity",),
+        "minkowski": ("convexity",), "children": ("index", "separate"), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
                    "filename", "layername", "center", "dpi", "id"),
         "linear_extrude": ("height", "v", "scale", "center", "twist", "slices", "segments", "convexity"),
@@ -4356,8 +4360,9 @@ class Evaluator:
         op = node.name.name
         args, ctx = self._resolve_call_args(node, ctx)
         ctx = self._block_ctx(node.children, ctx)
-        assign_nodes = [c for c in node.children if isinstance(c, Assignment)]
-        geo_nodes = [c for c in node.children
+        block = self._expand_child_statements(node.children, ctx)
+        assign_nodes = [c for c in block if isinstance(c, Assignment)]
+        geo_nodes = [c for c in block
                      if not isinstance(c, (Assignment, ModuleDeclaration, FunctionDeclaration))]
 
         # Process assignments first for side-effects (they update ctx.dyn in-place)
@@ -5676,6 +5681,73 @@ class Evaluator:
                 eval_ctx.let[k] = v
         return self._eval_children(ctx.children_nodes, eval_ctx)
 
+    @staticmethod
+    def _is_separating_children_call(stmt) -> bool:
+        """Syntactically `children(..., separate=...)` or `children(i, s)` --
+        gated on the text first, so an ordinary children() never has its
+        arguments resolved twice."""
+        if type(stmt) is not ModularCall or stmt.name.name != "children":
+            return False
+        positional = 0
+        for a in stmt.arguments:
+            if type(a) is NamedArgument:
+                if a.name.name == "separate":
+                    return True
+            else:
+                positional += 1
+                if positional == 2:
+                    return True
+        return False
+
+    def _expand_child_statements(self, block: list, ctx: EvalContext) -> list:
+        """`block` with each `children(..., separate=true)` replaced by one
+        synthetic `children(k)` per child it selects (none if it selects
+        nothing). They are real statements, so an operator gives each its
+        own operand -- `difference() children(separate=true)` subtracts
+        children 1..n from child 0 -- while a `for` inside one child stays
+        one operand, and nothing leaks into another module's operator.
+        Not in OpenSCAD, which silently ignores `separate` (cpp #110-#112).
+        The synthetic calls carry the author's position and no scope."""
+        if not any(self._is_separating_children_call(stmt) for stmt in block):
+            return block
+        out = []
+        for stmt in block:
+            if not self._is_separating_children_call(stmt):
+                out.append(stmt)
+                continue
+            args, eff_ctx = self._resolve_call_args(stmt, ctx)
+            if not self._get_arg(args, 1, "separate", False):
+                out.append(stmt)  # written but false: ponytail, re-resolves its args once
+                continue
+            pos = stmt.position
+            out.extend(ModularCall(position=pos, scope=None, name=Identifier(position=pos, scope=None, name="children"),
+                                   arguments=[PositionalArgument(position=pos, scope=None,
+                                                                 expr=NumberLiteral(position=pos, scope=None, val=i))],
+                                   children=[])
+                       for i in self._children_indices(args, eff_ctx, stmt))
+        return out
+
+    def _children_indices(self, args: dict, ctx: EvalContext, node) -> list[int]:
+        """Which of ctx's forwarded children a children() call selects, with
+        the reference's out-of-bounds warning."""
+        geo_nodes = [c for c in (ctx.children_nodes or [])
+                     if not isinstance(c, (Assignment, ModuleDeclaration, FunctionDeclaration))]
+        idx = self._get_arg(args, 0, "index", None)
+        if idx is None:
+            return list(range(len(geo_nodes)))
+        indices = [idx] if type(idx) in (int, float) else self._loop_values(idx, node)
+        picked = []
+        for i in indices:
+            if type(i) not in (int, float):
+                continue
+            i = int(i)
+            if 0 <= i < len(geo_nodes):
+                picked.append(i)
+            else:
+                self._echo_fn(f"WARNING: Children index ({i}) out of bounds ({len(geo_nodes)} children)"
+                              f"{self._loc(getattr(node, 'position', None))}")
+        return picked
+
     def _builtin_children(self, args: dict, ctx: EvalContext, node=None) -> list[ColoredBody]:
         idx = self._get_arg(args, 0, "index", None)
         if idx is None:
@@ -5798,6 +5870,7 @@ class Evaluator:
         # children into one body (_combine, a real Manifold call) is
         # deferred to generate — only the plain-data grouping happens here.
         body_node = node.body if isinstance(node.body, list) else [node.body]
+        body_node = self._expand_child_statements(body_node, ctx)
         _debugging = self._debugging
         group_sizes: list[int] = []
         assigns = node.assignments
