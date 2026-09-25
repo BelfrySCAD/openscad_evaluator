@@ -5957,3 +5957,33 @@ class TestBuiltinArguments:
         _, lines = run('echo(search("x", ["x", "yx", "x"], 0));')
         assert lines == ['WARNING: Invalid entry in search vector at index 0, required number of values in '
                          'the entry: 1. Invalid entry: "x" in file <string>, line 1', "ECHO: []"]
+
+
+class TestNumbersAndStrings:
+    """Byte-for-byte OpenSCAD 2026.02.01 output."""
+
+    def test_mod_and_power(self):
+        _, lines = run("echo(-7%3, 7%0, 7.5%2, -7.5%2, 7%-3, 0^-1, (-8)^(1/3), 0^0, 2^-1, (-2)^3, 10^400);")
+        assert lines == ["ECHO: -1, nan, 1.5, -1.5, 1, inf, nan, 1, 0.5, -8, inf"]
+
+    def test_degree_trig_is_exact(self):
+        _, lines = run("echo(sin(45)-cos(45), sin(30), cos(60), tan(45), cos(90), tan(90), tan(270), "
+                       "sin(135)==cos(45), asin(0.5), acos(0.5), atan(1), atan2(1,1), sin(1e30));")
+        assert lines == ["ECHO: 0, 0.5, 0.5, 1, 0, inf, -inf, true, 30, 60, 45, 45, nan"]
+
+    def test_range_equality(self):
+        _, lines = run("echo([5:1:0]==[5:1:0], [0:2]==[0:1:2], [1:3]!=[1:4], [5:1:0]==[6:1:0], [0:2]==[0,1,2]);")
+        assert lines == ["ECHO: true, true, true, true, false"]
+
+    def test_function_values_print_like_openscad(self):
+        _, lines = run('echo(str(function(x, y=2) x*y+1), function(a) a ? 1 : 2, '
+                       'function(v) [for (i=[0:len(v)-1]) if (v[i] > 0) v[i]*2], '
+                       'function(a) let(b=a+1) -b^2, function(o) o.x[0](1e7, t="s"));')
+        assert lines == ['ECHO: "function(x, y = 2) ((x * y) + 1)", function(a) (a ? 1 : 2), '
+                         'function(v) [for(i = [0 : (len(v) - 1)]) (if((v[i] > 0)) ((v[i] * 2)))], '
+                         'function(a) let(b = (a + 1)) -(b ^ 2), function(o) (o.x[0])(1e+7, t = "s")']
+
+    def test_undefined_escape_warns_once_per_escape(self):
+        _, lines = run('echo("\\q\\x80"); for (i=[0:2]) echo("\\z");')
+        warn = "WARNING: Undefined escape sequence in file <string>, line 1"
+        assert lines == [warn, warn, 'ECHO: "qx80"', warn, 'ECHO: "z"', 'ECHO: "z"', 'ECHO: "z"']

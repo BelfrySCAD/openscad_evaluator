@@ -17,14 +17,6 @@ Builtin arguments
 - `font` style ignored in `text()`/`textmetrics()`/`fontmetrics()` (#163, #164); `:style=bold`
   falls back to Regular when `fc-match` is missing, i.e. always on macOS (#171)
 
-Numbers and strings
-- Undefined escape sequences (`\q`, `\x80`) should warn "Undefined escape sequence";
-  backslash-newline inside a string waits on openscad_lalr_parser, which rejects it
-- `-7%3` should be -1, `7%0` nan, `0^-1` inf (#99)
-- Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
-- `[5:1:0]==[5:1:0]` is false (#146)
-- `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
-
 Diagnostics
 - Numeric builtins don't warn on a non-number ("cos() parameter could not be converted")
   (04797d0); argument/operand warnings in general, `abs(undef)`, `1+"a"` (#99)

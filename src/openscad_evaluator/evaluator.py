@@ -144,6 +144,119 @@ def _signed_area(poly) -> float:
     return 0.5 * float(np.dot(p[:, 0], np.roll(p[:, 1], -1)) - np.dot(np.roll(p[:, 0], -1), p[:, 1]))
 
 
+_TRIG_HUGE = float(1 << 26) * 360.0 * float(1 << 26)
+_SQRT1_2, _SQRT3_4, _SQRT1_3, _SQRT3 = 0.70710678118654752440, 0.86602540378443859659, 0.57735026918962573106, 1.73205080756887719318
+
+
+def _reduce_deg(x: float, period: float):
+    """x wrapped into [0, period), or None when it is too large (or not
+    finite) for the wrap to mean anything."""
+    if 0.0 <= x < period:
+        return x
+    if -_TRIG_HUGE < x < _TRIG_HUGE:
+        return x - period * math.floor(x / period)
+    return None
+
+
+def _sin_deg(x: float) -> float:
+    """OpenSCAD's sin() in degrees (degree_trig.cc): folded into [0, 90]
+    and read off exact values at 30/45/60, sin below 45 and cos above -- so
+    sin(45) and cos(45) are the SAME double and sin(45) - cos(45) is 0."""
+    x = _reduce_deg(x, 360.0)
+    if x is None:
+        return math.nan
+    oppose = x >= 180.0
+    if oppose:
+        x -= 180.0
+    if x > 90.0:
+        x = 180.0 - x
+    if x < 45.0:
+        x = 0.5 if x == 30.0 else math.sin(math.radians(x))
+    elif x == 45.0:
+        x = _SQRT1_2
+    elif x == 60.0:
+        x = _SQRT3_4
+    else:
+        x = math.cos(math.radians(90.0 - x))
+    return -x if oppose else x
+
+
+def _cos_deg(x: float) -> float:
+    x = _reduce_deg(x, 360.0)
+    if x is None:
+        return math.nan
+    oppose = x >= 180.0
+    if oppose:
+        x -= 180.0
+    if x > 90.0:
+        x = 180.0 - x
+        oppose = not oppose
+    if x > 45.0:
+        x = 0.5 if x == 60.0 else math.sin(math.radians(90.0 - x))
+    elif x == 45.0:
+        x = _SQRT1_2
+    elif x == 30.0:
+        x = _SQRT3_4
+    else:
+        x = math.cos(math.radians(x))
+    return -x if oppose else x
+
+
+def _tan_deg(x: float) -> float:
+    if not math.isfinite(x):
+        return math.nan
+    cycles = math.floor(x / 180.0)
+    x = _reduce_deg(x, 180.0)
+    if x is None:
+        return math.nan
+    even = cycles % 2 == 0
+    oppose = x > 90.0
+    if oppose:
+        x = 180.0 - x
+    if x == 0.0:
+        x = 0.0 if even else -0.0
+    elif x == 30.0:
+        x = _SQRT1_3
+    elif x == 45.0:
+        x = 1.0
+    elif x == 60.0:
+        x = _SQRT3
+    elif x == 90.0:
+        x = math.inf if even else -math.inf
+    else:
+        x = math.tan(math.radians(x))
+    return -x if oppose else x
+
+
+def _snap_inverse(degs: float, forward, x: float) -> float:
+    """An inverse's result snaps to whole degrees when the forward function
+    gives back x exactly: asin(sin(30)) is 30, not 30.000000000000004."""
+    if not math.isfinite(degs):
+        return degs
+    whole = round(degs)
+    return whole if forward(whole) == x else degs
+
+
+def _asin_deg(x):
+    return math.nan if abs(x) > 1 else _snap_inverse(math.degrees(math.asin(x)), _sin_deg, x)
+
+
+def _acos_deg(x):
+    return math.nan if abs(x) > 1 else _snap_inverse(math.degrees(math.acos(x)), _cos_deg, x)
+
+
+def _atan_deg(x):
+    return _snap_inverse(math.degrees(math.atan(x)), _tan_deg, x)
+
+
+def _atan2_deg(y, x):
+    degs = math.degrees(math.atan2(y, x))
+    if not math.isfinite(degs):
+        return degs
+    whole = round(degs)
+    return whole if abs(degs - whole) < 3.0e-14 else degs
+
+
 def _cos_sin_deg(deg: float) -> tuple[float, float]:
     """cos and sin of `deg` degrees, exact at multiples of 90, so a quarter
     turn leaves no 6e-17 residue (a 2D shape turned edge-on would keep a
@@ -164,6 +277,30 @@ def _rot_deg(deg: float, axis: int) -> np.ndarray:
     if axis == 1:  # y: z-x plane, so the sine terms swap sign
         m[i, j], m[j, i] = s, -s
     return m
+
+
+@functools.lru_cache(maxsize=4096)
+def _undefined_escapes(raw: str) -> int:
+    """How many escapes in a literal's source OpenSCAD calls undefined --
+    one it warns about, each: an unknown letter (`\\q`), a `\\x` past 7F or
+    short of digits, a short `\\u`/`\\U`, a backslash before a line end."""
+    n, i = 0, 0
+    while True:
+        i = raw.find("\\", i)
+        if i < 0 or i + 1 >= len(raw):
+            return n
+        e = raw[i + 1]
+        if e in "ntr\\\"":
+            pass
+        elif e in "xuU":
+            width = {"x": 2, "u": 4, "U": 6}[e]
+            digits = raw[i + 2:i + 2 + width]
+            if not (len(digits) == width and all(d in _HEX for d in digits)
+                    and (e != "x" or int(digits, 16) <= 0x7F)):
+                n += 1
+        else:
+            n += 1
+        i += 2
 
 
 @functools.lru_cache(maxsize=4096)
@@ -1501,6 +1638,17 @@ class OscRange:
     def __repr__(self):
         return f"OscRange({self.start}, {self.step}, {self.end})"
 
+    def __eq__(self, other):
+        # By value, as OpenSCAD compares ranges: [0:2] == [0:1:2], and two
+        # empty ranges are equal. It was identity, so [5:1:0] != [5:1:0].
+        if type(other) is not OscRange:
+            return NotImplemented
+        if (self.start, self.step, self.end) == (other.start, other.step, other.end):
+            return True
+        return _range_count(self) == 0 and _range_count(other) == 0
+
+    __hash__ = None
+
 
 class OscObject:
     """OpenSCAD `object()` value — an ordered string-keyed map."""
@@ -1538,7 +1686,80 @@ class Closure:
         self.let = let
 
     def __str__(self):
-        return str(self.fn)
+        return _fmt_fn(self.fn)
+
+
+_BINARY_OPS = {
+    "AdditionOp": "+", "SubtractionOp": "-", "MultiplicationOp": "*", "DivisionOp": "/",
+    "ModuloOp": "%", "ExponentOp": "^", "BitwiseAndOp": "&", "BitwiseOrOp": "|",
+    "BitwiseShiftLeftOp": "<<", "BitwiseShiftRightOp": ">>", "LogicalAndOp": "&&",
+    "LogicalOrOp": "||", "EqualityOp": "==", "InequalityOp": "!=", "GreaterThanOp": ">",
+    "GreaterThanOrEqualOp": ">=", "LessThanOp": "<", "LessThanOrEqualOp": "<=",
+}
+_UNARY_OPS = {"UnaryMinusOp": "-", "LogicalNotOp": "!", "BitwiseNotOp": "~"}
+
+
+def _fmt_fn(n) -> str:
+    """A function value as OpenSCAD's str()/echo() print it: every binary and
+    ternary expression parenthesised, `=` spaced -- `function(x, y = 2)
+    ((x * y) + 1)`. The parser's own printing (`function(x, y=2) x * y + 1`)
+    is for reformatting source, not this. Port of openscad_cpp_evaluator's
+    format_closure.cpp."""
+    t = type(n).__name__
+    j = lambda items: ", ".join(_fmt_fn(i) for i in items)  # noqa: E731
+    w = lambda x: f"({_fmt_fn(x)})"  # noqa: E731 -- a list-comprehension body is wrapped
+    if t in _BINARY_OPS:
+        return f"({_fmt_fn(n.left)} {_BINARY_OPS[t]} {_fmt_fn(n.right)})"
+    if t in _UNARY_OPS:
+        return _UNARY_OPS[t] + _fmt_fn(n.expr)
+    if t == "Identifier":
+        return n.name
+    if t == "NumberLiteral":
+        return _format_number(n.val)
+    if t in ("StringLiteral", "BooleanLiteral", "UndefinedLiteral"):
+        return str(n)
+    if t == "RangeLiteral":
+        step = "" if getattr(n, "implicit_step", False) else f"{_fmt_fn(n.step)} : "
+        return f"[{_fmt_fn(n.start)} : {step}{_fmt_fn(n.end)}]"
+    if t == "TernaryOp":
+        return f"({_fmt_fn(n.condition)} ? {_fmt_fn(n.true_expr)} : {_fmt_fn(n.false_expr)})"
+    if t == "PrimaryCall":  # a callee that isn't a plain name is parenthesised: (o.f)(1)
+        callee = _fmt_fn(n.left)
+        return f"{callee if type(n.left).__name__ == 'Identifier' else f'({callee})'}({j(n.arguments)})"
+    if t == "PrimaryIndex":
+        return f"{_fmt_fn(n.left)}[{_fmt_fn(n.index)}]"
+    if t == "PrimaryMember":
+        return f"{_fmt_fn(n.left)}.{n.member}"
+    if t == "PositionalArgument":
+        return _fmt_fn(n.expr)
+    if t in ("NamedArgument", "Assignment"):
+        return f"{n.name.name} = {_fmt_fn(n.expr)}"
+    if t == "ParameterDeclaration":
+        has_default = n.default is not None and type(n.default).__name__ != "UndefinedLiteral"
+        return f"{n.name.name} = {_fmt_fn(n.default)}" if has_default else n.name.name
+    if t == "FunctionLiteral":
+        return f"function({j(n.parameters)}) {_fmt_fn(n.body)}"
+    if t in ("LetOp", "ListCompLet"):
+        return f"let({j(n.assignments)}) {_fmt_fn(n.body)}"
+    if t == "EchoOp":
+        return f"echo({j(n.arguments)}) {_fmt_fn(n.body)}"
+    if t == "AssertOp":
+        return f"assert({j(n.arguments)}) {_fmt_fn(n.body)}"
+    if t == "ListComprehension":
+        return f"[{j(n.elements)}]"
+    if t == "ListCompFor":
+        return f"for({j(n.assignments)}) {w(n.body)}"
+    if t == "ListCompCFor":  # no space after the semicolons, body unwrapped
+        return f"for({j(n.inits)};{_fmt_fn(n.condition)};{j(n.incrs)}) {_fmt_fn(n.body)}"
+    if t == "ListCompIf":
+        return f"if({_fmt_fn(n.condition)}) {w(n.true_expr)}"
+    if t == "ListCompIfElse":
+        return f"if({_fmt_fn(n.condition)}) {w(n.true_expr)} else {w(n.false_expr)}"
+    if t == "ListCompEach":
+        return f"each {w(n.body)}"
+    if t == "CommentedExpr":
+        return _fmt_fn(n.expr)
+    return str(n)
 
 
 _FONT_PATH = Path(__file__).parent / "resources" / "fonts" / "LiberationSans-Regular.ttf"
@@ -2266,6 +2487,7 @@ class Evaluator:
         self._hull_depth = 0  # hull() nodes enclosing the one being generated
         self._if_taken = False  # whether the last `if` ran a branch; see _is_operand_when_empty
         self._builtin_shadow: dict[tuple, Any] = {}  # (id(scope), builtin name) -> user decl or None
+        self._escapes_checked: set[int] = set()  # StringLiterals already checked for bad escapes
         self._param_names: dict[int, tuple] = {}  # id(parameter list) -> its names, for _bind_args
         self._global_values: dict[int, Any] = {}  # id(root-scope Assignment) -> value; see _eval_identifier
         self.csg_tree: list[CSGNode] = []
@@ -2399,10 +2621,10 @@ class Evaluator:
             "sin": self._builtin_sin,
             "cos": self._builtin_cos,
             "tan": self._builtin_tan,
-            "asin": lambda x: float('nan') if abs(x) > 1 else math.degrees(math.asin(x)),
-            "acos": lambda x: float('nan') if abs(x) > 1 else math.degrees(math.acos(x)),
-            "atan": lambda x: math.degrees(math.atan(x)),
-            "atan2": lambda y, x: math.degrees(math.atan2(y, x)),
+            "asin": _asin_deg,
+            "acos": _acos_deg,
+            "atan": _atan_deg,
+            "atan2": _atan2_deg,
             "max": self._builtin_max, "min": self._builtin_min,
             "pow": self._builtin_pow,
             "norm": lambda v: math.sqrt(sum(x*x for x in v)),
@@ -2640,6 +2862,7 @@ class Evaluator:
         self._frame_ctxs.clear()
         self._global_values = {}
         self._builtin_shadow = {}
+        self._escapes_checked = set()
         self.csg_tree = []
         self._tree_stack = [self.csg_tree]
         self._profile_sites = {}
@@ -5330,7 +5553,12 @@ class Evaluator:
         if t is NumberLiteral or t is BooleanLiteral:
             return node.val
         if t is StringLiteral:
-            return _unescape_string(node.val)
+            raw = node.val
+            if "\\" in raw and id(node) not in self._escapes_checked:
+                self._escapes_checked.add(id(node))  # once per literal, as OpenSCAD warns at parse time
+                for _ in range(_undefined_escapes(raw)):
+                    self._echo_fn(f"WARNING: Undefined escape sequence{self._loc(getattr(node, 'position', None))}")
+            return _unescape_string(raw)
         if t is Identifier:
             name = node.name
             let = ctx.let
@@ -5411,20 +5639,22 @@ class Evaluator:
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
         if type(a) is bool or type(b) is bool:
             return None
-        try:
-            return a % b
-        except (TypeError, ZeroDivisionError):
+        if type(a) not in (int, float) or type(b) not in (int, float):
             return None
+        # C's fmod, as OpenSCAD: the sign follows the dividend (-7 % 3 is -1,
+        # Python's % gave 2) and x % 0 is nan (it was undef).
+        try:
+            return math.fmod(a, b)
+        except ValueError:  # an infinite dividend, or a zero divisor
+            return math.nan
 
     def _expr_exp(self, node, ctx):
         a, b = self._eval_expr(node.left, ctx), self._eval_expr(node.right, ctx)
         if type(a) is bool or type(b) is bool:
             return None
-        try:
-            result = a ** b
-            return float('nan') if type(result) is complex else result
-        except (TypeError, ZeroDivisionError):
+        if type(a) not in (int, float) or type(b) not in (int, float):
             return None
+        return self._builtin_pow(a, b)  # 0^-1 is inf, as for pow() (it was undef)
 
     def _expr_unary_minus(self, node, ctx):
         v = self._eval_expr(node.expr, ctx)
@@ -6094,29 +6324,17 @@ class Evaluator:
         return self._builtin_minmax(min, args)
 
     def _builtin_pow(self, a, b):
-        if a < 0 and not float(b).is_integer():
+        if math.isnan(a) or math.isnan(b):
+            return math.nan
+        if a < 0 and not float(b).is_integer() and not math.isinf(b):
             return float('nan')
         if a == 0 and b < 0:
             # 0 ** negative is +inf in OpenSCAD; Python's pow()/math.pow() raise.
             return float('inf')
-        return pow(a, b)
-
-    # At exact multiples of 90 degrees, sin/cos/tan use exact table values
-    # instead of math.sin/cos/tan(radians(x)), which accumulate floating-point
-    # noise (e.g. cos(90) -> 6.12e-17, tan(90) -> 1.63e+16) — matching real
-    # OpenSCAD's degree-based trig, which special-cases these angles.
-    _SIN_90 = (0.0, 1.0, 0.0, -1.0)
-    _COS_90 = (1.0, 0.0, -1.0, 0.0)
-    _TAN_90 = (0.0, math.inf, 0.0, -math.inf)
-
-    def _deg_trig(self, x, table, fallback):
-        if math.isnan(x) or math.isinf(x):
-            return float('nan')
-        n = x / 90.0
-        rn = round(n)
-        if rn == n:
-            return table[int(rn) % 4]
-        return fallback(math.radians(x))
+        try:
+            return pow(a, b)
+        except OverflowError:  # 10^400: inf, as in C (negative for an odd power of a negative)
+            return -math.inf if a < 0 and float(b).is_integer() and int(b) % 2 else math.inf
 
     def _negate_list(self, v):
         if _is_flat_numeric(v):
@@ -6137,13 +6355,13 @@ class Evaluator:
         return result
 
     def _builtin_sin(self, x):
-        return self._deg_trig(x, self._SIN_90, math.sin)
+        return _sin_deg(x)
 
     def _builtin_cos(self, x):
-        return self._deg_trig(x, self._COS_90, math.cos)
+        return _cos_deg(x)
 
     def _builtin_tan(self, x):
-        return self._deg_trig(x, self._TAN_90, math.tan)
+        return _tan_deg(x)
 
     def _builtin_cross(self, a, b):
         # Real OpenSCAD validates every component up front and returns
