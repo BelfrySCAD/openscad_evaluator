@@ -34,7 +34,7 @@ from openscad_lalr_parser.nodes import (
     EqualityOp, InequalityOp, GreaterThanOp, GreaterThanOrEqualOp, LessThanOp, LessThanOrEqualOp,
     TernaryOp,
     PrimaryCall, PrimaryIndex, PrimaryMember,
-    RangeLiteral,
+    RangeLiteral, RenderExpression,
     ModularCall, ModularIf, ModularIfElse, ModularFor, ModularLet,
     ModularEcho, ModularAssert, ModularIntersectionFor,
     ModularModifierShowOnly, ModularModifierHighlight,
@@ -50,6 +50,26 @@ from openscad_lalr_parser.nodes import (
 _MANIFOLD_OK = m3d.Error.NoError
 
 _HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _vnf_from_mesh(verts: np.ndarray, tris: np.ndarray) -> tuple[list, list]:
+    """Manifold (verts, CCW tris) -> VNF ([x,y,z] points, CW faces), the
+    shape polyhedron() and BOSL2 take.
+
+    Winding is reversed, since VNF faces are clockwise seen from outside; a
+    reversed mesh still builds, only inside out (negative volume). Vertices
+    Manifold split at seams are welded by exact position, so a cube is 8
+    points, not 24 -- but only when the welded mesh stays manifold: two
+    shells that touch have distinct vertices at the same place, and fusing
+    them makes edges with four faces."""
+    uniq, remap = np.unique(verts, axis=0, return_inverse=True)
+    remap = remap.reshape(-1)
+    if len(uniq) < len(verts):
+        welded = remap[tris]
+        probe = m3d.Manifold(m3d.Mesh64(vert_properties=uniq, tri_verts=welded.astype(np.uint64)))
+        if probe.status() == _MANIFOLD_OK:
+            verts, tris = uniq, welded
+    return verts.tolist(), tris[:, [0, 2, 1]].tolist()
 
 
 def _rot_deg(deg: float, axis: int) -> np.ndarray:
@@ -5345,6 +5365,75 @@ class Evaluator:
             self.error(err, node, innermost_frame="assert")
         return self._eval_expr(node.body, ctx)
 
+    def _expr_render(self, node: RenderExpression, ctx: EvalContext) -> OscObject:
+        """`obj = render() { ... };`: builds the children's geometry, measures
+        it, and throws it away -- nothing is drawn, from any context, which is
+        what keeps a function using it pure. The only way a script can inspect
+        its own geometry. See openscad_cpp_evaluator's CLAUDE.md for the
+        contract this follows (the key sets and their order are part of it)."""
+        _, ctx = self._resolve_call_args(node, ctx)  # $fn etc. reach the children; convexity is ignored
+        self._tree_stack.append([])
+        try:
+            self._eval_children(node.children, ctx)
+        finally:
+            sub = self._tree_stack.pop()
+        bodies = self.generate_tree(sub)
+        return self._measure(bodies, node)
+
+    def _measure(self, bodies: list[ColoredBody], node) -> OscObject:
+        """The render() object for a generated subtree, taken as one implicit
+        union. 3D: vertices, faces, volume, area, genus, boundingbox, dim, vnf.
+        2D: vertices, paths, area, perimeter, boundingbox, dim. Nothing: the 3D
+        keys, zero, with boundingbox undef rather than an infinite box."""
+        pos = getattr(node, "position", None)
+        _, fg, _, _ = self._split_by_role(bodies)
+        solids = [b.body for b in fg if b.body is not None and b.body.status() == _MANIFOLD_OK
+                  and not b.body.is_empty()]
+        sections = [b.section for b in fg if b.section is not None]
+        if solids:
+            body = solids[0] if len(solids) == 1 else m3d.Manifold.batch_boolean(solids, m3d.OpType.Add)
+            mesh = body.to_mesh64()
+            verts, faces = _vnf_from_mesh(np.asarray(mesh.vert_properties[:, :3], dtype=np.float64),
+                                          np.asarray(mesh.tri_verts, dtype=np.int64))
+            bb = body.bounding_box()
+            return OscObject({
+                "vertices": verts, "faces": faces,
+                "volume": body.volume(), "area": body.surface_area(), "genus": float(body.genus()),
+                "boundingbox": [list(bb[:3]), list(bb[3:])], "dim": 3.0, "vnf": [verts, faces],
+            })
+        if sections:
+            cs = sections[0]
+            for s in sections[1:]:
+                cs = cs + s
+            if not cs.is_empty():
+                verts, paths, perimeter = [], [], 0.0
+                for poly in cs.to_polygons():
+                    pts = [[float(x), float(y)] for x, y in poly]
+                    paths.append(list(range(len(verts), len(verts) + len(pts))))
+                    verts += pts
+                    perimeter += sum(math.dist(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts)))
+                x0, y0, x1, y1 = cs.bounds()
+                return OscObject({
+                    "vertices": verts, "paths": paths, "area": cs.area(), "perimeter": perimeter,
+                    "boundingbox": [[x0, y0], [x1, y1]], "dim": 2.0,
+                })
+        raw = [b.raw_mesh for b in fg if b.raw_mesh is not None]
+        if raw:
+            # An open surface has no solid to measure, but the script still
+            # gets its mesh back. The polyhedron/import warning already said
+            # where the holes are.
+            v, t = raw[0]
+            verts, faces = _vnf_from_mesh(v, t)
+            self._echo_fn(f"WARNING: render(): result is not a closed solid; volume and genus "
+                          f"are unavailable{self._loc(pos)}")
+            return OscObject({
+                "vertices": verts, "faces": faces, "volume": 0.0, "area": 0.0, "genus": None,
+                "boundingbox": [v.min(axis=0).tolist(), v.max(axis=0).tolist()] if len(v) else None,
+                "dim": 3.0, "vnf": [verts, faces],
+            })
+        return OscObject({"vertices": [], "faces": [], "volume": 0.0, "area": 0.0, "genus": 0.0,
+                          "boundingbox": None, "dim": 0.0, "vnf": [[], []]})
+
     def _expr_function_literal(self, node, ctx):
         return Closure(node, dict(ctx.let))
 
@@ -5596,6 +5685,14 @@ class Evaluator:
         start = float(start) if start is not None else 0.0
         stop = float(stop) if stop is not None else 0.0
         increment = float(increment) if increment is not None else 1.0
+        # [5:0] iterates nothing and is almost always [5:-1:0] mistyped.
+        # Reported where the range is written, as OpenSCAD does, so `r = [5:0];`
+        # warns even if r is never iterated. Only for an implicit step, unlike
+        # OpenSCAD: writing [5:1:0] out says it is meant. The epsilon lets
+        # float arithmetic landing a hair past the end go unremarked.
+        if node.implicit_step and start - stop > 1e-10:
+            pos = getattr(node, 'position', None)
+            self._echo_fn(f"WARNING: begin is greater than the end, but step is positive{self._loc(pos)}")
         return OscRange(start, increment, stop)
 
     def _eval_function_call(self, node: PrimaryCall, ctx: EvalContext) -> Any:
@@ -6142,4 +6239,5 @@ _EXPR_DISPATCH: dict[type, callable] = {
     EchoOp: Evaluator._expr_echo,
     AssertOp: Evaluator._expr_assert,
     FunctionLiteral: Evaluator._expr_function_literal,
+    RenderExpression: Evaluator._expr_render,
 }

@@ -562,7 +562,7 @@ requires-dist = [
     { name = "genbadge", extras = ["coverage"], marker = "extra == 'dev'", specifier = ">=1.1.0" },
     { name = "manifold3d", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "openscad-lalr-parser", specifier = ">=1.1.0" },
+    { name = "openscad-lalr-parser", specifier = ">=1.2.0" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1.0" },
@@ -573,14 +573,14 @@ provides-extras = ["dxf", "dev"]
 
 [[package]]
 name = "openscad-lalr-parser"
-version = "1.1.0"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lark" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7e/9b/d327dbc50ab8137d9bd3ba4c3d582f4e30e0e14d988cf5793599e65d9190/openscad_lalr_parser-1.1.0.tar.gz", hash = "sha256:5660a9f8b6429ecc11ea708a0558fd9bb3e643f6b679cf6a7f743cc671e2c682", size = 30942, upload-time = "2026-07-17T11:11:40.351Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/f2/9736afd930a43b8d4cdd1d859bc95f066cd5019e77a6c009641129ad5031/openscad_lalr_parser-1.2.0.tar.gz", hash = "sha256:a500b9c0b79df99802d47e88e45fae6b9b4ca261cdc98151edd13b9512c5043b", size = 35817, upload-time = "2026-09-25T02:42:05.082Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/29/1e/6b0d4093a9ceffb5c0b139d26f91967567e0067fefc3ec9a35bc675b158e/openscad_lalr_parser-1.1.0-py3-none-any.whl", hash = "sha256:ea3eaf528d3b67b46da494d0bd465db200ee5a06f044e86a0fcc1bcbb76a0588", size = 35476, upload-time = "2026-07-17T11:11:38.945Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/27/9657520cf15375bf4dabd464269d05a58e395c0c4c75cc6066e44f936bef/openscad_lalr_parser-1.2.0-py3-none-any.whl", hash = "sha256:32f56d8a1a7259aab70b7740e44825765c40f1febcd27ff9e4f141b8cb213a83", size = 40381, upload-time = "2026-09-25T02:42:03.956Z" },
 ]
 
 [[package]]

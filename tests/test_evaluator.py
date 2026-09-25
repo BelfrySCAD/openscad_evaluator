@@ -5290,7 +5290,7 @@ class TestCSGTreeStep6FinalCutover:
         # (an empty operand) still fires, even inside an
         # intersection() whose combined geometry result is discarded to ∅
         # by the first empty operand.
-        bodies, echo = run('intersection() { for (i = [1:0]) cube(10); echo("fired"); cube(2); }')
+        bodies, echo = run('intersection() { for (i = [1:1:0]) cube(10); echo("fired"); cube(2); }')
         assert bodies == []
         assert echo == ['ECHO: "fired"']
 
@@ -5530,3 +5530,88 @@ class TestOpenMeshes:
         bodies, lines = run(f'import("{stl.as_posix()}");')
         assert len(bodies[0].raw_mesh[1]) == 2
         assert lines[0].startswith("WARNING: import: mesh is not closed -- 4 boundary edge(s)")
+
+
+class TestRenderExpression:
+    """`obj = render() { ... };` measures geometry and draws nothing. Values
+    match openscad_cpp_evaluator's for the same scripts, key order included."""
+
+    def test_measures_the_union_and_draws_nothing(self):
+        bodies, lines = run("obj = render() { cube(2); translate([1, 1, 1]) cube(2); }; "
+                            "echo(obj.volume, obj.area, obj.genus, obj.boundingbox, obj.dim);")
+        assert bodies == []
+        assert lines == ["ECHO: 15, 42, 0, [[0, 0, 0], [3, 3, 3]], 3"]
+
+    def test_3d_keys_and_vnf_shape(self):
+        _, _, ev = run_tree("obj = render() { cube(1); };")
+        obj = ev._root_ctx.let["obj"]
+        assert list(obj) == ["vertices", "faces", "volume", "area", "genus", "boundingbox", "dim", "vnf"]
+        assert len(obj.get("vertices")) == 8 and len(obj.get("faces")) == 12  # welded, triangles
+        assert obj.get("vnf") == [obj.get("vertices"), obj.get("faces")]
+
+    def test_faces_are_clockwise_from_outside(self):
+        # Feeding the faces back through polyhedron() (which takes OpenSCAD's
+        # clockwise winding) gives a POSITIVE volume; reversed, it would be
+        # negative -- never abs() this.
+        bodies, _ = run("o = render() { cube([1, 2, 3]); }; polyhedron(o.vertices, o.faces);")
+        assert bodies[0].body.volume() == approx(6)
+
+    def test_touching_shells_are_not_welded(self):
+        # Welding the shared corner vertices would make edges with four faces.
+        bodies, lines = run("o = render() { cube(1); translate([1, 0, 0]) cube(1); }; "
+                            "echo(len(o.vertices), o.volume); polyhedron(o.vertices, o.faces);")
+        assert lines == ["ECHO: 12, 2"]
+        assert bodies[0].body.volume() == approx(2)
+
+    def test_2d(self):
+        _, lines = run("echo(render() { square([2, 3]); });")
+        assert lines == ["ECHO: object(vertices = [[0, 0], [2, 0], [2, 3], [0, 3]], paths = [[0, 1, 2, 3]], "
+                         "area = 6, perimeter = 10, boundingbox = [[0, 0], [2, 3]], dim = 2)"]
+
+    def test_empty(self):
+        _, lines = run("echo(render() {});")
+        assert lines == ["ECHO: object(vertices = [], faces = [], volume = 0, area = 0, genus = 0, "
+                         "boundingbox = undef, dim = 0, vnf = [[], []])"]
+
+    def test_cavity_genus_and_function_use(self):
+        _, lines = run("function v(w) = render() { cube(w); }.volume; echo(v(3)); "
+                       "o = render() { difference() { cube(10, center=true); cube(4, center=true); } }; "
+                       "echo(o.genus, o.volume);")
+        assert lines == ["ECHO: 27", "ECHO: -1, 936"]
+
+    def test_dollar_args_reach_the_children(self):
+        _, lines = run("echo(len(render($fn=6) { cylinder(1, 1, 1); }.vertices));")
+        assert lines == ["ECHO: 12"]
+
+    def test_open_surface_gives_its_mesh_and_says_why(self):
+        _, lines = run("o = render() { polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], "
+                       "[[0,1,2],[0,3,1],[0,2,3]]); }; echo(len(o.faces), o.volume, o.genus);")
+        assert "render(): result is not a closed solid" in lines[1]
+        assert lines[-1] == "ECHO: 3, 0, undef"
+
+
+class TestBackwardsRangeWarning:
+    def test_warns_where_the_range_is_written(self):
+        # r is never iterated; OpenSCAD still warns, at the literal
+        _, lines = run("r = [5:0];")
+        assert lines == ["WARNING: begin is greater than the end, but step is positive "
+                         "in file <string>, line 1"]
+
+    @pytest.mark.parametrize("src", [
+        "for (i = [3:1]) echo(i);",
+        "x = [for (i = [2:0]) i];",
+    ])
+    def test_every_use(self, src):
+        _, lines = run(src)
+        assert lines == ["WARNING: begin is greater than the end, but step is positive "
+                         "in file <string>, line 1"]
+
+    @pytest.mark.parametrize("src", [
+        "y = [5:1:0];",   # a written step is taken as meant (OpenSCAD warns here)
+        "z = [0:-1:5];",
+        "w = [1:1];",
+        "v = [1 + 1e-12 : 1];",  # float arithmetic a hair past the end
+    ])
+    def test_silent(self, src):
+        _, lines = run(src)
+        assert lines == []
