@@ -4165,6 +4165,51 @@ class TestMeshRepair:
             "WARNING: mesh_repair: tolerance must not be negative", "WARNING: mesh_repair: tolerance must be a number"]
 
 
+class TestCoverage:
+    """Evaluator(coverage=True) (cpp #169, #170, #175); spans and hits
+    identical to openscad_cpp_evaluator's on a probe of every kind."""
+
+    def _cov(self, tmp_path, main, lib=None):
+        from openscad_lalr_parser import getASTfromFile
+        if lib:
+            (tmp_path / "lib.scad").write_text(lib)
+        (tmp_path / "main.scad").write_text(main)
+        nodes = getASTfromFile(str(tmp_path / "main.scad"))
+        ev = Evaluator(echo_fn=lambda m: None, coverage=True)
+        ev.evaluate(nodes, build_scopes(nodes))
+        return ev.coverage_result, {(s["origin"].rsplit("/", 1)[-1], s["line"], s["column"], s["kind"]): s["hits"]
+                                    for s in ev.coverage_result["spans"]}
+
+    def test_statements_arms_and_bodies(self, tmp_path):
+        r, h = self._cov(tmp_path, "a = 3;\nfunction f(x) = x > 0 ? x : -x;\necho(f(a));\n"
+                                   "if (a > 2) { cube(1); } else { sphere(1); }\nd = a > 1 && a < 9;\n"
+                                   "module unused() { cube(1); }\n")
+        assert h[("main.scad", 2, 1, "body")] == 1
+        assert h[("main.scad", 2, 25, "branch")] == 1 and h[("main.scad", 2, 29, "branch")] == 0
+        assert h[("main.scad", 4, 14, "statement")] == 1 and h[("main.scad", 4, 32, "statement")] == 0
+        assert h[("main.scad", 5, 14, "branch")] == 1
+        assert h[("main.scad", 6, 1, "body")] == 0
+        assert r["total"]["bodies"] == 2 and r["total"]["bodies_hit"] == 1
+
+    def test_tail_called_body_counts(self, tmp_path):
+        _, h = self._cov(tmp_path, 'function inner(i) = i == 0 ? "done" : inner(i-1);\n'
+                                   "function tail_caller(i) = inner(i);\necho(tail_caller(3));\n")
+        assert h[("main.scad", 1, 1, "body")] == 4  # the sum of its arms' hits: 1 + 3
+        assert h[("main.scad", 2, 1, "body")] == 1
+
+    def test_used_file_globals_and_declarations(self, tmp_path):
+        _, h = self._cov(tmp_path, "use <lib.scad>\necho(libf(10));\n",
+                         "g = 5;\nfunction libf(x) = x > g ? 1 : 0;\nfunction never(x) = x;\n")
+        assert h[("lib.scad", 1, 1, "statement")] == 1
+        assert h[("lib.scad", 2, 1, "body")] == 1 and h[("lib.scad", 3, 1, "body")] == 0
+
+    def test_off_by_default(self):
+        nodes = getASTfromString("cube(1);", include_comments=False)
+        ev = Evaluator(echo_fn=lambda m: None)
+        ev.evaluate(nodes, build_scopes(nodes))
+        assert ev.coverage_result is None
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
