@@ -8,8 +8,6 @@
   (25.4/72 mm per unit) and flips Y about the height, so a 100-unit drawing's rect at y=0..10
   lands at y=31.75..35.28 there and y=-10..0 here. openscad_cpp_evaluator does the same as this
   package, so fix both together
-- Tail Recursion Optimizations — `function acc(n,a=0)=n<=0?a:acc(n-1,a+1); acc(200)` dies with
-  "AST too deeply nested"; OpenSCAD handles millions (cpp 968aaf7, 169d440)
 
 ## Backports from openscad_cpp_evaluator
 
