@@ -3895,6 +3895,57 @@ class TestFeatureDetection:
         assert lines == ["ECHO: true"]
 
 
+class TestDxfDimCross:
+    """dxf_dim()/dxf_cross() (cpp #100). Checked against OpenSCAD 2026.02.01
+    on its own dim-all.dxf and example009.dxf; this synthetic file covers
+    the same paths without shipping those."""
+
+    DXF = "\n".join([
+        "0", "SECTION", "2", "ENTITIES",
+        # aligned dimension "w", from (1,1) to (4,5): length 5
+        "0", "DIMENSION", "8", "dims", "1", "w", "70", "1", "13", "1", "23", "1", "14", "4", "24", "5",
+        # horizontal (rotated, angle 0) dimension "h" over the same points: 3
+        "0", "DIMENSION", "8", "dims", "1", "h", "70", "0", "50", "0", "13", "1", "23", "1", "14", "4", "24", "5",
+        # a cross whose strokes meet at (2,3)
+        "0", "LINE", "8", "cross", "10", "0", "20", "3", "11", "4", "21", "3",
+        "0", "LINE", "8", "cross", "10", "2", "20", "0", "11", "2", "21", "6",
+        # two lines joined end to end: an outline, not a cross
+        "0", "LINE", "8", "outline", "10", "0", "20", "0", "11", "5", "21", "0",
+        "0", "LINE", "8", "outline", "10", "5", "20", "0", "11", "5", "21", "5",
+        "0", "ENDSEC", "0", "EOF", ""])
+
+    def _run(self, tmp_path, body):
+        from openscad_lalr_parser import getASTfromFile
+        (tmp_path / "t.dxf").write_text(self.DXF)
+        (tmp_path / "t.scad").write_text(body)
+        lines = []
+        nodes = getASTfromFile(str(tmp_path / "t.scad"))
+        Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes))
+        return [l.split(" in file ")[0] for l in lines]
+
+    def test_dimensions_and_cross(self, tmp_path):
+        assert self._run(tmp_path, 'echo(dxf_dim(file="t.dxf", name="w"), dxf_dim(file="t.dxf", name="h"), '
+                                   'dxf_dim(file="t.dxf", name="w", scale=2), '
+                                   'dxf_cross(file="t.dxf", layer="cross"));') == ["ECHO: 5, 3, 10, [2, 3]"]
+
+    def test_failures_warn(self, tmp_path):
+        assert self._run(tmp_path, 'echo(dxf_dim(file="t.dxf", name="x")); echo(dxf_dim(file="no.dxf", name="x"));'
+                                   'echo(dxf_cross(file="t.dxf", layer="outline"));') == [
+            "WARNING: Can't find dimension 'x' in 't.dxf', layer ''!", "ECHO: undef",
+            "WARNING: Can't open DXF file 'no.dxf'!", "ECHO: undef",
+            "WARNING: Can't find cross in 't.dxf', layer 'outline'!", "ECHO: undef"]
+
+
+class TestListFonts:
+    def test_bundled_faces_are_listed_and_their_specs_resolve(self):
+        from openscad_evaluator import list_fonts
+        bundled = [f for f in list_fonts() if f["path"] == "<bundled>"]
+        assert [f["style"] for f in bundled] == ["Bold", "Bold Italic", "Italic", "Regular"]
+        for f in bundled:
+            _, lines = run(f'echo(fontmetrics(10, "{f["spec"]}").font.style);')
+            assert lines == [f'ECHO: "{f["style"]}"']
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
