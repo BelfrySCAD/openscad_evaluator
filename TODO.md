@@ -38,7 +38,6 @@ Numbers and strings
 - `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
 
 Diagnostics
-- Undeclared / extra arguments are silently dropped in `_bind_args` (#92)
 - Numeric builtins don't warn on a non-number ("cos() parameter could not be converted")
   (04797d0); argument/operand warnings in general, `abs(undef)`, `1+"a"` (#99)
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too

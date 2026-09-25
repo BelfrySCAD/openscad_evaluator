@@ -2240,6 +2240,7 @@ class Evaluator:
         self._hull_depth = 0  # hull() nodes enclosing the one being generated
         self._if_taken = False  # whether the last `if` ran a branch; see _is_operand_when_empty
         self._builtin_shadow: dict[tuple, Any] = {}  # (id(scope), builtin name) -> user decl or None
+        self._param_names: dict[int, tuple] = {}  # id(parameter list) -> its names, for _bind_args
         self._global_values: dict[int, Any] = {}  # id(root-scope Assignment) -> value; see _eval_identifier
         self.csg_tree: list[CSGNode] = []
         self._tree_stack: list[list[CSGNode]] = [self.csg_tree]
@@ -3094,7 +3095,7 @@ class Evaluator:
         # Bind parameters
         child_scope = getattr(decl, 'scope', None) or ctx.scope
         params = getattr(decl, 'parameters', None) or []
-        args = self._bind_args(params, call.arguments, ctx)
+        args = self._bind_args(params, call.arguments, ctx, call)
 
         child_ctx = self._call_ctx_for(
             decl, ctx,
@@ -3133,19 +3134,83 @@ class Evaluator:
             if prof is not None:
                 self._profile_exit(*prof)
 
-    def _bind_args(self, params, arguments, ctx: EvalContext) -> dict[str, Any]:
+    def _bind_args(self, params, arguments, ctx: EvalContext, call=None) -> dict[str, Any]:
         result = {}
         positional_idx = 0
         nparams = len(params)
         _eval = self._eval_expr
+        suspicious = False
         for arg in arguments:
             if type(arg) is NamedArgument:
                 result[arg.name.name] = _eval(arg.expr, ctx)
+                suspicious = True  # checked below, off the common path
             else:
                 if positional_idx < nparams:
                     result[params[positional_idx].name.name] = _eval(arg.expr, ctx)
                 positional_idx += 1
+        if positional_idx > nparams or suspicious:
+            names = self._param_names.get(id(params))
+            if names is None:
+                names = self._param_names[id(params)] = tuple(p.name.name for p in params)
+            self._warn_unexpected_args(names, arguments, call)
         return result
+
+    # Builtin modules' parameters, as OpenSCAD declares them, for the same
+    # warnings a user module gives. Builtin FUNCTIONS read their arguments
+    # positionally and never warn (`sin(bogus=30)` is sin(30)), except these two.
+    _BUILTIN_PARAMS = {
+        "cube": ("size", "center"),
+        "sphere": ("r", "d"),
+        "cylinder": ("h", "r1", "r2", "center", "r", "d", "d1", "d2"),
+        "polyhedron": ("points", "faces", "convexity", "triangles"),
+        "square": ("size", "center"),
+        "circle": ("r", "d"),
+        "polygon": ("points", "paths", "convexity"),
+        "translate": ("v",), "rotate": ("a", "v"), "scale": ("v",), "mirror": ("v",),
+        "multmatrix": ("m",), "resize": ("newsize", "auto", "convexity"),
+        "color": ("c", "alpha"),
+        "union": (), "difference": (), "intersection": (), "hull": (),
+        "minkowski": ("convexity",), "children": ("index",), "render": ("convexity",),
+        "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
+                   "filename", "layername", "center", "dpi", "id"),
+        "linear_extrude": ("height", "v", "scale", "center", "twist", "slices", "segments", "convexity"),
+        "rotate_extrude": ("angle", "start", "convexity"),
+        "projection": ("cut", "convexity"),
+        "roof": ("method", "convexity"),
+        "offset": ("r", "delta", "chamfer"),
+        "surface": ("file", "center", "convexity", "invert"),
+        "text": ("text", "size", "font", "direction", "language", "script", "halign", "valign", "spacing"),
+        "breakpoint": ("condition",),  # this package's debugger extension
+        "textmetrics": ("text", "size", "font", "direction", "language", "script", "halign", "valign", "spacing"),
+        "fontmetrics": ("size", "font"),
+    }
+
+    def _warn_unexpected_args(self, declared: tuple, arguments, call, builtin: bool = False) -> None:
+        """OpenSCAD's warnings for arguments a callee doesn't declare, which
+        were silently dropped -- a misspelt argument name went unnoticed,
+        the parameter keeping its default. $-names pass (they set a dynamic
+        variable), except $children, which is not settable that way."""
+        loc = self._loc(getattr(call, "position", None))
+        positional = 0
+        seen = set()
+        for arg in arguments:
+            if type(arg) is not NamedArgument:
+                positional += 1
+        if positional > len(declared):
+            self._echo_fn(f"WARNING: Too many unnamed arguments supplied{loc}")
+        for arg in arguments:
+            if type(arg) is not NamedArgument:
+                continue
+            name = arg.name.name
+            if builtin:
+                pass  # OpenSCAD's builtins word these their own way, per builtin
+            elif name in seen:
+                self._echo_fn(f'WARNING: argument "{name}" supplied more than once{loc}')
+            elif name in declared[:positional]:
+                self._echo_fn(f'WARNING: argument "{name}" overrides positional argument{loc}')
+            seen.add(name)
+            if name not in declared and (name[0] != "$" or name == "$children"):
+                self._echo_fn(f'WARNING: variable "{name}" not specified as parameter{loc}')
 
     # ------------------------------------------------------------------
     # Built-in modules
@@ -3158,6 +3223,9 @@ class Evaluator:
         migrated _resolve_* method (Phase 2), which bypass _eval_builtin's
         dispatch entirely and so need this logic themselves."""
         args = self._resolve_args(node.arguments, ctx)
+        declared = self._BUILTIN_PARAMS.get(node.name.name) if type(node) is ModularCall else None
+        if declared is not None:
+            self._warn_unexpected_args(declared, node.arguments, node, builtin=True)
         dyn_overrides = {k: v for k, v in args.items() if isinstance(k, str) and k.startswith("$")}
         if dyn_overrides:
             ctx = ctx.child_ctx(dyn={**ctx.dyn, **dyn_overrides})
@@ -5887,6 +5955,8 @@ class Evaluator:
                 return self._eval_user_function(name, decl, node.arguments, ctx, node)
             if name in self._BUILTIN_FN_NAMES:
                 args = self._resolve_args(node.arguments, ctx)
+                if name in ("textmetrics", "fontmetrics"):
+                    self._warn_unexpected_args(self._BUILTIN_PARAMS[name], node.arguments, node, builtin=True)
                 if name == "object":
                     return self._builtin_object(args, node)
                 if name == "textmetrics":
@@ -6304,7 +6374,7 @@ class Evaluator:
 
     def _eval_user_function(self, name: str, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node=None) -> Any:
         params = decl.parameters or []
-        bound = self._bind_args(params, arguments, ctx)
+        bound = self._bind_args(params, arguments, ctx, call_node)
         fn_scope = decl.scope or ctx.scope
         # No $-prefixed parameter is declared AND this call's own bound
         # arguments include no $-prefixed key either -- the common case,
@@ -6343,7 +6413,7 @@ class Evaluator:
     def _eval_function_literal(self, closure: Closure, arguments, ctx: EvalContext, call_node=None, name: str | None = None) -> Any:
         func_node = closure.fn
         params = func_node.parameters
-        bound = self._bind_args(params, arguments, ctx)
+        bound = self._bind_args(params, arguments, ctx, call_node)
         fn_scope = func_node.scope or ctx.scope
         # See _eval_user_function's matching comment -- same optimization.
         share_dyn = not self._has_dollar_param(id(func_node), params) and not self._bound_has_dollar_key(bound)
