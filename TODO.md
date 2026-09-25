@@ -1,6 +1,9 @@
 # TODO
 
 - Materials support
+- A missing `import()` file aborts the render (`ERROR: import: [Errno 2] ...`); OpenSCAD warns
+  `Can't open import file '...'` and carries on, and in expression position warns `Could not
+  read file '...'` and returns undef. openscad_cpp_evaluator aborts too, so fix both together
 - Tail Recursion Optimizations — `function acc(n,a=0)=n<=0?a:acc(n-1,a+1); acc(200)` dies with
   "AST too deeply nested"; OpenSCAD handles millions (cpp 968aaf7, 169d440)
 
@@ -16,7 +19,6 @@ Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
 Language extensions
-- `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
 - `levelset()` from grid or function, 2D contours, clean box cut (#124, #126, #127). Bring #136
   with it: never cache a subtree whose params hold a closure (`_canon` keys by identity), and
   #125's explicit-undef `isovalue` counting as absent

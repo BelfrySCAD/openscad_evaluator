@@ -2622,8 +2622,32 @@ class ManifoldCache:
             self._entries.clear()
 
 
+# supported_feature("name") -> the level this build implements that extension at,
+# 0 for one it does not -- including names it has never heard of, so probing
+# for a future feature is safe. OpenSCAD silently ignores unknown arguments
+# (children(separate=true) renders the wrong shape there), so guarding on this
+# is how a script refuses. Names shared with openscad_cpp_evaluator (#113, #115);
+# levelset, mesh-repair, svg-class and export-name are not implemented here.
+_FEATURE_LEVELS = {
+    "render-expr": 1, "linear-solve": 1, "polyhedron-vnf": 1, "separate-children": 1,
+    "minkowski-diff": 1, "sphere-styles": 1, "simplify-op": 1, "expr-import": 1,
+    "object-function": 1, "roof-op": 1,
+}
+
+
+def _package_version() -> list[int]:
+    try:
+        from importlib.metadata import version
+        return [int(p) for p in version("openscad_evaluator").split(".")[:3]]
+    except Exception:  # an unusual install: still a list, so `$_BELFRYSCAD != undef` holds
+        return [0, 0, 0]
+
+
 _DEFAULT_DOLLAR = {"$fn": 0, "$fa": 12.0, "$fs": 2.0, "$t": 0.0, "$parent_modules": 0,
-                   "$preview": False}  # a render; a previewing caller seeds true via viewport_params
+                   "$preview": False,  # a render; a previewing caller seeds true via viewport_params
+                   # Undef in OpenSCAD, so `!is_undef($_SUPPORTED_FEATURE) && supported_feature(...)`
+                   # is a portable, silent guard.
+                   "$_SUPPORTED_FEATURE": True, "$_BELFRYSCAD": _package_version()}
 
 
 class EvalContext:
@@ -2959,6 +2983,7 @@ class Evaluator:
             "version": lambda: list(_OPENSCAD_VERSION),
             "version_num": _version_num,
             "parent_module": self._builtin_parent_module,
+            "supported_feature": lambda feature=None: _FEATURE_LEVELS.get(feature, 0) if isinstance(feature, str) else 0,
         }
         self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics", "linear_solve"}
         # Functions that require an actual number (or a vector of numbers)
