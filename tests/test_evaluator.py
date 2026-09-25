@@ -5501,7 +5501,7 @@ class TestOpenMeshes:
         assert len(verts) == 4 and len(tris) == 3
         assert lines == [
             "WARNING: polyhedron: mesh is not closed -- 3 boundary edge(s), first at "
-            "[0, 0, 10] - [0, 10, 0]; drawing the object as an open surface rather than a "
+            "[10, 0, 0] - [0, 10, 0]; drawing the object as an open surface rather than a "
             "solid -- nothing is patched. hull() can still use its points, but it cannot "
             "take part in union/difference/intersection in file <string>, line 1"]
 
@@ -6038,3 +6038,38 @@ class TestNumbersAndStrings:
         _, lines = run('echo("\\q\\x80"); for (i=[0:2]) echo("\\z");')
         warn = "WARNING: Undefined escape sequence in file <string>, line 1"
         assert lines == [warn, warn, 'ECHO: "qx80"', warn, 'ECHO: "z"', 'ECHO: "z"', 'ECHO: "z"']
+
+
+class TestPolyhedronMeshes:
+    """Behaviour matches OpenSCAD 2026.02.01 and openscad_cpp_evaluator."""
+
+    def test_concave_face_is_ear_clipped_not_fanned(self):
+        # An L-prism whose caps start at a vertex that sees only part of the
+        # L: a fan overlapped itself and reported 30 units of area, not 22.
+        bodies, _ = run("""
+            L=[[0,0],[3,0],[3,1],[1,1],[1,3],[0,3]]; n=len(L);
+            pts=concat([for(p=L)[p[0],p[1],0]], [for(p=L)[p[0],p[1],1]]);
+            polyhedron(pts, concat([[for(i=[0:n-1]) (i+2)%n]], [[for(i=[n-1:-1:0]) n+(i+2)%n]],
+                                   [for(i=[0:n-1]) [i,n+i,n+(i+1)%n,(i+1)%n]]));""")
+        (b,) = bodies
+        assert b.body.volume() == pytest.approx(5.0)
+        assert b.body.surface_area() == pytest.approx(22.0)
+
+    def test_vertices_keep_double_precision(self):
+        # float32's spacing at 3e7 is 2 units, which flattened this to nothing.
+        bodies, _ = run("translate([-3e7,0,0]) polyhedron([for(z=[0,1],y=[0,1],x=[0,1])[3e7+x*0.5,y,z]],"
+                        "[[0,1,3,2],[4,6,7,5],[0,4,5,1],[2,3,7,6],[0,2,6,4],[1,5,7,3]]);")
+        assert bodies[0].body.volume() == pytest.approx(0.5)
+
+    def test_touching_shells_are_not_welded(self):
+        _, lines = run("""
+            o = render() { union() {
+              difference(){ cube([20,20,20],center=true); cylinder(d=8,h=60,center=true,$fn=16); }
+              difference(){ cylinder(d=8,h=60,center=true,$fn=16); cube([20,20,20],center=true); }
+            } };
+            rt = render() { polyhedron(o); };
+            c = render() { cube(10); };
+            echo(o.volume, o.genus, len(o.vertices));
+            echo(o.volume == rt.volume, len(o.vertices) == len(rt.vertices));
+            echo(len(c.vertices));""")
+        assert lines == ["ECHO: 8979.67, -1, 104", "ECHO: true, true", "ECHO: 8"]
