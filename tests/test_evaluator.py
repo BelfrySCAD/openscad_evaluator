@@ -6157,3 +6157,36 @@ class TestDebugStops:
         _, seen = self._stops("module framed(gap) {\n    children();\n}\nframed(20)\n    leaf();\n"
                               "module leaf() { cube(1); }")
         assert [t for line, depth, t in seen if line == 2] == [[("<string>", 5)]]
+
+
+class TestFontStyles:
+    """cpp #163, #164, #171. Widths from OpenSCAD 2026.02.01, which bundles
+    the same Liberation Sans faces; ours differ in the last digit or so, as
+    FreeType hinting isn't replicated (see TestTextMetrics)."""
+
+    def _width(self, expr):
+        _, lines = run(f"echo(textmetrics({expr}).size[0]);")
+        return float(lines[0].removeprefix("ECHO: "))
+
+    def test_bundled_styles(self):
+        assert self._width('"Hi", 10') == pytest.approx(11.0413, abs=0.01)
+        assert self._width('"Hi", 10, "Liberation Sans:style=Bold"') == pytest.approx(11.9821, abs=0.01)
+        assert self._width('"Hi", size=10, font=":style=Bold"') == pytest.approx(11.9821, abs=0.01)
+        assert self._width('"Hi", size=10, font="Liberation Sans:style=Italic"') == pytest.approx(13.0061, abs=0.01)
+        assert self._width('"Hi", size=10, font="Liberation Sans:style=Bold Italic"') == pytest.approx(13.8829, abs=0.01)
+
+    def test_fontmetrics_names_the_style(self):
+        _, lines = run('echo(fontmetrics(10, "Liberation Sans:style=Bold").font);')
+        assert lines == ['ECHO: { family = "Liberation Sans"; style = "Bold"; }']
+
+    def test_text_font_is_positional(self):
+        bold, _ = run('text("Hi", 10, "Liberation Sans:style=Bold");')
+        named, _ = run('text("Hi", 10, font="Liberation Sans:style=Bold");')
+        regular, _ = run('text("Hi", 10);')
+        assert bold[0].section.area() == pytest.approx(named[0].section.area())
+        assert bold[0].section.area() != pytest.approx(regular[0].section.area())
+
+    def test_textmetrics_takes_alignment_positionally(self):
+        _, lines = run('echo(textmetrics("Hi",10,undef,undef,undef,undef,"center","top",2).position ==\n'
+                       '     textmetrics("Hi",size=10,halign="center",valign="top",spacing=2).position);')
+        assert lines == ["ECHO: true"]
