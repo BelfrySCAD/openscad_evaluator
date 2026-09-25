@@ -3326,6 +3326,7 @@ class Evaluator:
         run?", as OpenSCAD's `-o out.term` asks (cpp #144)."""
         self._resolve_use_statements(nodes, root_scope)
         self._cov_hits = {}
+        self._files_run: set[int] = set()
         self._call_stack.clear()
         self._frame_ctxs.clear()
         self._global_values = {}
@@ -3634,6 +3635,23 @@ class Evaluator:
                     self._cache_producer[key] = node.node
             result.extend(node.bodies)
         return result
+
+    def _run_file_globals(self, root) -> None:
+        """A used file's globals: all of them, once per run, in source order,
+        on the first read of any -- as OpenSCAD and the C++ port run them, so
+        an echo in one it never reads still happens, and a read of a later
+        one from an earlier one's initializer is undef. (OpenSCAD re-runs
+        them on every call into the file, a known upstream bug not copied.)"""
+        self._files_run.add(id(root))
+        fctx = self._root_ctx.call_ctx(scope=root)
+        for name, a in list(root.variables.items()):
+            if type(a) is not Assignment:
+                continue
+            if self._coverage:
+                self._cov_hit(a)  # they run here, never as statements (cpp #170)
+            v = self._eval_expr(a.expr, fctx)
+            fctx.let[name] = v
+            self._global_values[id(a)] = v
 
     @staticmethod
     def _root_scope_of(scope):
@@ -7152,13 +7170,20 @@ class Evaluator:
         globals_ = self._global_values
         if key in globals_:
             return globals_[key]
-        v = self._eval_expr(decl.expr, ctx)
         if self._is_global(ctx.scope, name, decl):
-            globals_[key] = v
-            if self._coverage and self._root_scope_of(ctx.scope) is not self._root_ctx.scope:
-                # A used file's globals run here, never as statements (cpp #170).
-                self._cov_hit(decl)
-        return v
+            root = self._root_scope_of(ctx.scope)
+            if root is not self._root_ctx.scope and id(root) not in self._files_run:
+                self._run_file_globals(root)
+                if key in globals_:
+                    return globals_[key]
+            # Read before its own assignment has run -- from a function an
+            # earlier global's initializer called, in this file or a used one.
+            # OpenSCAD evaluates a file's globals in order, so it is unknown
+            # there; evaluating it on demand gave `c = d + 1; d = 5;` c = 6.
+            if warn_if_undef:
+                self._echo_fn(f'WARNING: Ignoring unknown variable "{name}"{self._loc(getattr(node, "position", None))}')
+            return None
+        return self._eval_expr(decl.expr, ctx)
 
     @staticmethod
     def _is_global(scope, name: str, decl) -> bool:
