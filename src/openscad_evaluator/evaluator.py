@@ -4386,11 +4386,22 @@ class Evaluator:
 
     def _resolve_cube(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
-        size = self._get_arg(args, 0, "size", 1.0)
+        size = self._get_arg(args, 0, "size", None)
         center = bool(self._get_arg(args, 1, "center", False))
-        if isinstance(size, (int, float)):
-            size = [size, size, size]
-        size = [float(s) for s in size]
+        # As OpenSCAD: a number or three numbers; undef is the default; any
+        # other size warns and falls back to 1. It raised a TypeError here.
+        def num(v):
+            return type(v) in (int, float)
+        if size is None:
+            size = [1.0] * 3
+        elif num(size):
+            size = [float(size)] * 3
+        elif type(size) is list and len(size) == 3 and all(num(v) for v in size):
+            size = [float(v) for v in size]
+        else:
+            self._echo_fn(f"WARNING: Unable to convert cube(size={self._fmt_val(size)}, ...) parameter to a "
+                          f"number or a vec3 of numbers{self._loc(getattr(node, 'position', None))}")
+            size = [1.0] * 3
         return {"size": size, "center": center, "color": ctx.color}
 
     def _generate_cube(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:

@@ -526,3 +526,26 @@ class TestDebugRepl:
         _feed_input(monkeypatch, ["run", "list thing", "continue"])
         assert cli.main([str(src), "-o", str(out), "--debug"]) == 0
         assert "module thing(x) {" in capsys.readouterr().out
+
+
+def test_strict_commas_rejects_2021_trailing_commas(tmp_path, capsys):
+    # cube(1,) was a syntax error in OpenSCAD 2021.01; list literals and
+    # parameter lists kept their trailing commas (openscad_cpp_evaluator #158).
+    src, out = tmp_path / "t.scad", tmp_path / "t.stl"
+    src.write_text("cube(1,);\n")
+    assert cli.main([str(src), "-o", str(out)]) == 0
+    assert cli.main([str(src), "-o", str(out), "--strict-commas"]) == 1
+    src.write_text("a = [1, 2,];\nmodule m(a, b,) cube(a);\nm(2);\n")
+    assert cli.main([str(src), "-o", str(out), "--strict-commas"]) == 0
+
+
+def test_strict_commas_reaches_used_files(tmp_path, capsys):
+    (tmp_path / "lib.scad").write_text("function f(a, b) = a + b;\nx = max(1, 2,);\n")
+    src, out = tmp_path / "main.scad", tmp_path / "t.stl"
+    src.write_text("use <lib.scad>\ncube(f(1, 2));\n")
+    assert cli.main([str(src), "-o", str(out)]) == 0
+    assert "Syntax error" not in capsys.readouterr().out
+    # As in OpenSCAD, a used file's syntax error is reported and the render
+    # carries on without it.
+    assert cli.main([str(src), "-o", str(out), "--strict-commas"]) == 0
+    assert "Syntax error in " + str(tmp_path / "lib.scad") in capsys.readouterr().out

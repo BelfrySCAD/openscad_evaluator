@@ -4332,6 +4332,21 @@ class TestSvgUnits:
         assert [round(v, 3) for v in bodies[0].section.bounds()] == pytest.approx([0.0, 11.906, 13.229, 26.458])
 
 
+class TestCubeSize:
+    """cube()'s size as OpenSCAD 2026.02.01 reads it: undef is the default,
+    anything but a number or three numbers warns and falls back to 1."""
+
+    @pytest.mark.parametrize("arg", ['undef', '"a"', '[1,2]', '[1,2,undef]', 'true', '[1,"a",3]'])
+    def test_bad_size_is_a_unit_cube(self, arg):
+        bodies, lines = run(f"cube({arg});")
+        assert bodies[0].body.volume() == pytest.approx(1)
+        if arg == "undef":
+            assert lines == []
+        else:
+            assert lines == [f"WARNING: Unable to convert cube(size={arg.replace(',', ', ')}, ...) parameter "
+                             "to a number or a vec3 of numbers in file <string>, line 1"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
