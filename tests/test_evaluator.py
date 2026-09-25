@@ -4210,6 +4210,29 @@ class TestCoverage:
         assert ev.coverage_result is None
 
 
+class TestGlobalOrder:
+    """A file's globals run in source order -- a read of a later one from an
+    earlier one's initializer is undef -- and a used file's run all at once,
+    on first read, once per run. Matches OpenSCAD 2026.02.01 (bar its
+    re-running them on every call) and openscad_cpp_evaluator."""
+
+    def test_main_file_forward_read_is_undef(self):
+        _, lines = run("function f() = b;\na = f();\nb = 5;\necho(a, b);")
+        assert [l.split(" in file ")[0] for l in lines] == ['WARNING: Ignoring unknown variable "b"', "ECHO: undef, 5"]
+
+    def test_used_file_globals_run_in_order_once(self, tmp_path):
+        from openscad_lalr_parser import getASTfromFile
+        (tmp_path / "ug.scad").write_text('a = echo("A") 1;\nb = echo("B") 2;\nc = d + 1;\nd = 5;\n'
+                                          "function getb() = b;\nfunction getc() = c;\n")
+        (tmp_path / "main.scad").write_text("use <ug.scad>\necho(getb());\necho(getc());\n")
+        lines = []
+        nodes = getASTfromFile(str(tmp_path / "main.scad"))
+        Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes))
+        assert [l.split(" in file ")[0] for l in lines if not l.startswith("TRACE")] == [
+            'ECHO: "A"', 'ECHO: "B"', 'WARNING: Ignoring unknown variable "d"',
+            "WARNING: undefined operation (undefined + number)", "ECHO: 2", "ECHO: undef"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
