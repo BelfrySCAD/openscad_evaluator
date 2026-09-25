@@ -24,7 +24,6 @@ Language extensions
   #125's explicit-undef `isovalue` counting as absent
 - Strict mesh check, `repair()`, `import(repair=true)`, export-time check (72ca136);
   `mesh_repair()` (#191)
-- `dxf_dim()` / `dxf_cross()` (#100), `list_fonts()` (#163)
 - SVG `import()` filtering by `id=`/`class=` (#182)
 
 Export

@@ -16,6 +16,7 @@ from openscad_evaluator.evaluator import (
     flatten_csg_tree,
     format_csg_tree,
     resolve_use_scopes,
+    list_fonts,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "flatten_csg_tree",
     "format_csg_tree",
     "resolve_use_scopes",
+    "list_fonts",
 ]

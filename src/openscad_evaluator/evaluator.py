@@ -2117,6 +2117,29 @@ def _resolve_font(font_spec: str) -> dict:
     return tables
 
 
+def list_fonts() -> list[dict]:
+    """Every font text()/textmetrics()/fontmetrics() can resolve, as dicts
+    of family, style, spec and path, sorted and deduplicated by family and
+    style (cpp #163). `spec` is the exact `font=` string -- the name a font
+    dialog shows is often not the one OpenSCAD takes. The bundled Liberation
+    Sans faces have path "<bundled>"; the rest come from `fc-list`, which is
+    what _resolve_font() matches against, so none without it. Scans the
+    system fonts: call it when someone asks for the list, not per render."""
+    found = {("Liberation Sans", style): "<bundled>" for style in ("Regular", "Bold", "Italic", "Bold Italic")}
+    try:
+        import subprocess as _sp
+        out = _sp.run(["fc-list", "--format", "%{family[0]}\t%{style[0]}\t%{file}\n"],
+                      capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0] and not parts[0].startswith("."):  # dot-names are system-private
+            found.setdefault((parts[0], parts[1] or "Regular"), parts[2])
+    return [{"family": f, "style": st, "spec": f"{f}:style={st}", "path": path}
+            for (f, st), path in sorted(found.items())]
+
+
 def _glyph_bounds(gname: str, font: dict) -> tuple[float, float, float, float] | None:
     """Return (xMin, yMin, xMax, yMax) in font units for glyph `gname`, or None
     if the glyph is empty/whitespace.  Works for both TrueType (glyf table) and
@@ -2985,7 +3008,8 @@ class Evaluator:
             "parent_module": self._builtin_parent_module,
             "supported_feature": lambda feature=None: _FEATURE_LEVELS.get(feature, 0) if isinstance(feature, str) else 0,
         }
-        self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics", "linear_solve"}
+        self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics", "linear_solve",
+                                                              "dxf_dim", "dxf_cross"}
         # Functions that require an actual number (or a vector of numbers)
         # and must reject a bool argument as a type error (-> undef),
         # confirmed against real OpenSCAD 2022.08.22 -- e.g. abs(true),
@@ -6917,6 +6941,8 @@ class Evaluator:
                     return self._builtin_textmetrics(args, node)
                 if name == "fontmetrics":
                     return self._builtin_fontmetrics(args, node)
+                if name in ("dxf_dim", "dxf_cross"):
+                    return self._builtin_dxf(name, args, node)
                 if name == "linear_solve":
                     self._warn_unexpected_args(self._BUILTIN_PARAMS[name], node.arguments, node, builtin=True)
                     # An explicit undef b is absent, not bad: BOSL2's fixed-signature
@@ -7274,6 +7300,30 @@ class Evaluator:
             "offset": [offset_x, offset_y],
             "advance": [advance_x, 0.0],
         })
+
+    def _builtin_dxf(self, name: str, args: dict, node):
+        """dxf_dim(file, name, layer, origin, scale) / dxf_cross(file, layer,
+        origin, scale): see dxf_dim.py."""
+        from .dxf_dim import dxf_cross, dxf_dim
+        file_arg = self._get_arg(args, 0, "file")
+        raw = file_arg if isinstance(file_arg, str) else self._fmt_val(file_arg)
+        path = self._resolve_import_path(raw, node)
+        layer = self._get_arg(args, None, "layer")
+        layer = layer if isinstance(layer, str) else ""
+        origin = self._get_arg(args, None, "origin")
+        origin = [float(origin[0]), float(origin[1])] if (
+            type(origin) is list and len(origin) >= 2
+            and all(type(v) in (int, float) for v in origin[:2])) else [0.0, 0.0]
+        scale = self._get_arg(args, None, "scale", 1.0)
+        scale = float(scale) if type(scale) in (int, float) else 1.0
+        if name == "dxf_dim":
+            dim = self._get_arg(args, None, "name")
+            value, warning = dxf_dim(path, raw, layer, origin, scale, dim if isinstance(dim, str) else "")
+        else:
+            value, warning = dxf_cross(path, raw, layer, origin, scale)
+        if warning:
+            self._echo_fn(f"WARNING: {warning}{self._loc(getattr(node, 'position', None))}")
+        return value
 
     def _builtin_linear_solve(self, a, b, node, nargs: int = 2) -> Optional[OscObject]:
         """`linear_solve(A, b)` -> object(x, det, singular). Port of the C++
