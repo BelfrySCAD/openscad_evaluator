@@ -2860,7 +2860,7 @@ def resolve_use_scopes(nodes, current_file, log_fn):
 class Evaluator:
     def __init__(self, echo_fn=None, debug_hook=None, error_break_fn=None, return_hook=None,
                  manifold_cache: "ManifoldCache | None" = None, profile: bool = False,
-                 keep_minuend_color: bool = False):
+                 keep_minuend_color: bool = False, coverage: bool = False):
         self.id_to_node: dict[int, ASTNode] = {}
         # originalID -> the call chain that reached it, innermost first, as
         # (call position, is_module) pairs; () for top-level geometry.
@@ -2890,6 +2890,12 @@ class Evaluator:
         # than the subtrahend's (or the cut green) -- what OpenCSG preview
         # cannot offer (openscad/openscad#4798; cpp #173). Off by default.
         self._keep_minuend_color = keep_minuend_color
+        # coverage=True: which statements, branch arms and bodies ran, as
+        # coverage_result after evaluate() -- see coverage.py (cpp #169).
+        # Hits are keyed by id(node); the AST outlives the run.
+        self._coverage = coverage
+        self._cov_hits: dict[int, int] = {}
+        self.coverage_result = None
         self._cache_producer: dict[tuple, ASTNode] = {}  # key -> node whose generate filled it
         self._warn_captures: list[list[str]] = []  # one per cacheable subtree generating now
         # Incremented by _builtin_rands -- lets _eval_statement detect
@@ -3319,6 +3325,7 @@ class Evaluator:
         geometry is built and the body list is empty -- "does this script
         run?", as OpenSCAD's `-o out.term` asks (cpp #144)."""
         self._resolve_use_statements(nodes, root_scope)
+        self._cov_hits = {}
         self._call_stack.clear()
         self._frame_ctxs.clear()
         self._global_values = {}
@@ -3347,6 +3354,9 @@ class Evaluator:
         for node in others:
             self._eval_statement(node, ctx)
         t_resolve_end = time.perf_counter() if self._profiling else 0.0
+        if self._coverage:  # resolve only: the geometry pass runs no script code
+            from .coverage import build_result
+            self.coverage_result = build_result(*self._coverage_universe(nodes, root_scope), self._cov_hits)
         result = self.generate_tree(self._show_only_root()) if generate else []
         t_generate_end = time.perf_counter() if self._profiling else 0.0
         if self._profiling:
@@ -3457,6 +3467,8 @@ class Evaluator:
         ModularCall, plus the #/%/! modifiers and intersection_for) would
         ever pause the debugger or advance step state.
         """
+        if self._coverage and type(node) is not ModuleDeclaration and type(node) is not FunctionDeclaration:
+            self._cov_hit(node)  # once per execution of every statement (cpp #169)
         if not isinstance(node, self._TREE_NODE_TYPES):
             return self._eval_statement_impl(node, ctx)
         self._last_ctx = ctx
@@ -3622,6 +3634,43 @@ class Evaluator:
                     self._cache_producer[key] = node.node
             result.extend(node.bodies)
         return result
+
+    @staticmethod
+    def _root_scope_of(scope):
+        while scope.parent is not None:
+            scope = scope.parent
+        return scope
+
+    def _cov_hit(self, node) -> None:
+        k = id(node)
+        self._cov_hits[k] = self._cov_hits.get(k, 0) + 1
+
+    def _coverage_universe(self, nodes, root_scope) -> tuple[list, list]:
+        """(roots, used-file globals) for the coverage walk: the run's own
+        top-level statements, every declaration of every file it use<>s --
+        shadowed or not, as the C++ port reports them -- and those files'
+        own global assignments."""
+        roots = [n for n in nodes if type(n) is not UseStatement]
+        extra, seen_files = [], set()
+        for node in nodes:
+            if type(node) is not UseStatement:
+                continue
+            origin = getattr(node.position, "origin", "") if node.position else ""
+            lib = findLibraryFile(origin, node.filepath.val)
+            if lib is None or lib in seen_files:
+                continue
+            seen_files.add(lib)
+            for n in getASTfromFile(lib) or []:
+                if type(n) in (ModuleDeclaration, FunctionDeclaration):
+                    roots.append(n)
+                elif type(n) is Assignment:
+                    extra.append(n)
+        # Declarations use<> injected are the very nodes this run executed,
+        # so prefer them over the fresh parse above: same span, but these
+        # carry the hits. build_result dedupes by position.
+        for decl in list(root_scope.modules.values()) + list(root_scope.functions.values()):
+            roots.insert(0, decl)
+        return roots, extra
 
     def _current_call_chain(self) -> tuple:
         return tuple((e[2], e[0] == "module") for e in reversed(self._call_stack))
@@ -3932,6 +3981,8 @@ class Evaluator:
             self._profile_child_time[-1] += elapsed
 
     def _eval_user_module(self, decl: ModuleDeclaration, call: ModularCall, ctx: EvalContext) -> list[ColoredBody]:
+        if self._coverage:
+            self._cov_hit(decl)
         # Bind parameters
         child_scope = getattr(decl, 'scope', None) or ctx.scope
         params = getattr(decl, 'parameters', None) or []
@@ -6843,10 +6894,18 @@ class Evaluator:
         return float(self._to_bitwise_int64(a) >> rhs)
 
     def _expr_and(self, node, ctx):
-        return bool(self._eval_expr(node.left, ctx)) and bool(self._eval_expr(node.right, ctx))
+        if not self._eval_expr(node.left, ctx):
+            return False
+        if self._coverage:
+            self._cov_hit(node.right)
+        return bool(self._eval_expr(node.right, ctx))
 
     def _expr_or(self, node, ctx):
-        return bool(self._eval_expr(node.left, ctx)) or bool(self._eval_expr(node.right, ctx))
+        if self._eval_expr(node.left, ctx):
+            return True
+        if self._coverage:
+            self._cov_hit(node.right)
+        return bool(self._eval_expr(node.right, ctx))
 
     def _expr_not(self, node, ctx):
         return not bool(self._eval_expr(node.expr, ctx))
@@ -6902,6 +6961,8 @@ class Evaluator:
             self._check_debug(node, ctx)
         cond = self._eval_expr(node.condition, ctx)
         branch = node.true_expr if cond else node.false_expr
+        if self._coverage:
+            self._cov_hit(branch)
         if self._debugging:
             self._check_debug(branch, ctx, expr_level=True)
         return self._eval_expr(branch, ctx)
@@ -7094,6 +7155,9 @@ class Evaluator:
         v = self._eval_expr(decl.expr, ctx)
         if self._is_global(ctx.scope, name, decl):
             globals_[key] = v
+            if self._coverage and self._root_scope_of(ctx.scope) is not self._root_ctx.scope:
+                # A used file's globals run here, never as statements (cpp #170).
+                self._cov_hit(decl)
         return v
 
     @staticmethod
@@ -7116,6 +7180,8 @@ class Evaluator:
                 if self._debugging:
                     self._check_debug(elem, ctx)
                 if self._eval_expr(elem.condition, ctx):
+                    if self._coverage:
+                        self._cov_hit(elem.true_expr)
                     self._expr_depth += 1
                     if self._debugging:
                         self._check_debug(elem.true_expr, ctx, expr_level=True)
@@ -7125,6 +7191,8 @@ class Evaluator:
                 if self._debugging:
                     self._check_debug(elem, ctx)
                 branch = elem.true_expr if self._eval_expr(elem.condition, ctx) else elem.false_expr
+                if self._coverage:
+                    self._cov_hit(branch)
                 self._expr_depth += 1
                 if self._debugging:
                     self._check_debug(branch, ctx, expr_level=True)
@@ -7190,6 +7258,8 @@ class Evaluator:
             if self._debugging:
                 self._check_debug(body, ctx)
             if self._eval_expr(body.condition, ctx):
+                if self._coverage:
+                    self._cov_hit(body.true_expr)
                 self._expr_depth += 1
                 if self._debugging:
                     self._check_debug(body.true_expr, ctx, expr_level=True)
@@ -7201,6 +7271,8 @@ class Evaluator:
             if self._debugging:
                 self._check_debug(body, ctx)
             branch = body.true_expr if self._eval_expr(body.condition, ctx) else body.false_expr
+            if self._coverage:
+                self._cov_hit(branch)
             self._expr_depth += 1
             if self._debugging:
                 self._check_debug(branch, ctx, expr_level=True)
@@ -7958,6 +8030,8 @@ class Evaluator:
         return any(k[0] == '$' for k in bound)
 
     def _eval_user_function(self, name: str, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node=None) -> Any:
+        if self._coverage:
+            self._cov_hit(decl)
         child_ctx = self._bind_user_function(decl, arguments, ctx, call_node)
         return self._run_function_body(name, decl.expr, decl.position, child_ctx, call_node)
 
@@ -8014,6 +8088,8 @@ class Evaluator:
                     if self._debugging:
                         self._check_debug(expr, ctx)
                     expr = expr.true_expr if self._eval_expr(expr.condition, ctx) else expr.false_expr
+                    if self._coverage:
+                        self._cov_hit(expr)  # the trampoline bypasses _expr_ternary
                     if self._debugging:
                         self._check_debug(expr, ctx, expr_level=True)
                 elif t is LetOp:
@@ -8043,6 +8119,9 @@ class Evaluator:
                     call = expr
                     if self._debugging:
                         self._check_debug(call, ctx, call_site=True)
+                    if self._coverage:
+                        # A hop is the only way into a tail-called body (cpp #175).
+                        self._cov_hit(target.fn if type(target) is Closure else target)
                     if type(target) is Closure:
                         ctx = self._bind_closure(target, call.arguments, ctx, call)
                         expr, decl_pos = target.fn.body, target.fn.position
@@ -8101,6 +8180,8 @@ class Evaluator:
             self.error(err, node, innermost_frame="assert")
 
     def _eval_function_literal(self, closure: Closure, arguments, ctx: EvalContext, call_node=None, name: str | None = None) -> Any:
+        if self._coverage:
+            self._cov_hit(closure.fn)
         child_ctx = self._bind_closure(closure, arguments, ctx, call_node)
         return self._run_function_body(name or "<function>", closure.fn.body, closure.fn.position, child_ctx, call_node)
 

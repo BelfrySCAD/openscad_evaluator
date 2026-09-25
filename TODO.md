@@ -29,8 +29,6 @@ Export
   SVG (#159), PDF with ruler/page options (#160); sliver stripping and mesh checks
 
 Tools and API
-- Coverage: statements, branch arms, bodies, used-file globals, tail-called bodies
-  (#169, #170, #175)
 - Per-path profiling tree (`ProfileResult.paths`), child-call kind, call columns
   (8e54284, 709da93)
 - Real text shaping (kerning, bidi) — optional, large (#96)
