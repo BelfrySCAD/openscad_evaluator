@@ -12,33 +12,13 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 ### Bug fixes
 
-Scoping and values
-- **silent** Escaping closures lose their captures: `function mk(x)=function(y) x+y; mk(10)(5)`
-  is undef, should be 15. `_eval_function_literal` must capture `ctx.let` (81c260a, 5ceafc6)
-- **silent** Globals re-evaluated on every read inside a function: `r=rands(0,1,1); function g()=r;
-  g()==g()` is false. Evaluate every file's globals once per run, used files included (#166)
-- **silent** A user function doesn't shadow a builtin: `function sin(x)=42; sin(0)` gives 0
-  (`_eval_function_call` checks builtins first) (#119)
-- **silent** Braced block isn't a scope: `if(true){x=2;}` / `translate(){a=99;}` leak into the
-  outer scope, `$fn` too, with a spurious "overwritten" warning (#132)
-- **silent** `let(a=1,b=a+1) echo(b)` statement form isn't sequential, gives undef (#134)
-- **silent** Multi-variable `for` evaluates every range before binding: `[for(i=[0:2],j=[0:i]) ..]`
-  warns "unknown variable 'i'" and yields 3 items not 6. Also list-comp for and
-  intersection_for (c7059f9)
-
 `$` variables
-- **silent** `children()` forwarding overwrites `$children`/`$parent_modules` with the wrapper's
-  own value, breaking BOSL2's `if($children>N) children(N)` (c7059f9)
+- `$parent_modules` inside forwarded children is 1 here and 0 in the C++ port; OpenSCAD
+  gives 2 for `module w(){children();} module o(){w() echo($parent_modules);} o(){cube();}`
 - A never-set `$var` and `is_undef(zzz)` should be undef with no warning (37539f9, #114)
 - `$preview` should be seeded `false`, not undef-with-warning (#100)
 
 CSG
-- **silent** One Manifold-invalid operand empties the whole union/difference/intersection;
-  filter operands whose `status()` isn't NoError (1d8f674)
-- **silent** Empty-operand rule: `intersection(){cube(2);*cube(1);}`,
-  `difference(){*cube(10);cube(2);}`, `intersection(){cube(2); if(false)..}` should all be the
-  cube. Only a statement that built a CSG node is an operand (#139)
-- **silent** `echo("hi") cube(10);` drops the cube (#141)
 - 2D shapes lose out-of-plane transforms: `rotate([55,0,25]) square(5)` stays flat (#141)
 - `union(){cube(2);square(3);}` crashes (`NoneType + CrossSection`); union, color and transforms
   must carry both dimensions (#145)
@@ -47,8 +27,6 @@ CSG
 - 2D `minkowski()` produces nothing (#89)
 
 Builtin arguments
-- **silent** `cylinder()` positionals are `(h, r1, r2, center)`, `d` overrides `r`, `r2`
-  defaults to 1; `cylinder(10,5,2)` currently gets top radius 5 (04797d0)
 - `resize(auto=)` ignored (04797d0)
 - `offset(2)` means r=2; bare `offset()` means r=1 (04797d0)
 - `children([0:1])` crashes (`int()` of an OscRange); expand vectors and ranges (#107)
@@ -60,8 +38,8 @@ Builtin arguments
 - `version()` is `[2025,1,1]`; `version_num([2019,5,0])` is undef (#98)
 
 Numbers and strings
-- **silent** String escapes never resolved: `len("a\nb")` is 4, `len("\x41")` is 4 (#86, #150,
-  #174). The parser keeps them verbatim on purpose; resolve here
+- Undefined escape sequences (`\q`, `\x80`) should warn "Undefined escape sequence";
+  backslash-newline inside a string waits on openscad_lalr_parser, which rejects it
 - `-7%3` should be -1, `7%0` nan, `0^-1` inf (#99)
 - Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
 - `[5:1:0]==[5:1:0]` is false (#146)
@@ -87,10 +65,6 @@ Meshes
 - Polyhedron vertices cast to float32 (#94)
 - Polyhedron always welds coincident vertices, fusing touching shells; keep the weld only if
   the result stays manifold (#105)
-
-Colour
-- **silent** 2D union of red and blue squares comes out all red (#161)
-- **silent** Colour set via a module's `children()` is lost in a union (#162)
 
 Cache
 - A `ManifoldCache` hit reuses the first call site's bodies/originalIDs and doesn't refresh

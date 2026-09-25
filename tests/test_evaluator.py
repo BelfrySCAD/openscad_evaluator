@@ -2089,9 +2089,9 @@ class TestAssert:
 
 class TestModuleDispatch:
     def test_echo_as_modular_call_with_children(self):
-        # echo() with children runs echo and returns no geometry
+        # echo() with children runs echo and still draws them, as OpenSCAD does
         bodies, lines = run('echo("hi") cube(1);')
-        assert bodies == []
+        assert len(bodies) == 1 and bodies[0].body.volume() == approx(1)
         assert "hi" in lines[0]
 
     def test_unknown_module_skipped(self):
@@ -2273,22 +2273,22 @@ class TestCSGEdgeCases:
 
     def test_intersection_empty_first_operand_gives_empty(self):
         # intersection(∅, B) = ∅. When the first child statement of intersection()
-        # produces no geometry (disabled with *), the clip body from the second
+        # produces no geometry (an empty loop), the clip body from the second
         # statement must NOT escape as the result.
-        src = "intersection() { *cube(10); cube(5); }"
+        src = "intersection() { for (i = [1:0]) cube(10); cube(5); }"
         bodies, _ = run(src)
         assert bodies == []
 
     def test_difference_empty_first_operand_gives_empty(self):
         # difference(∅, B) = ∅. If the positive operand of difference() is empty,
         # the subtractor must not become the result.
-        src = "difference() { *cube(10); cube(5); }"
+        src = "difference() { for (i = [1:0]) cube(10); cube(5); }"
         bodies, _ = run(src)
         assert bodies == []
 
     def test_intersection_empty_second_operand_gives_empty(self):
         # intersection(A, ∅) = ∅. If any operand is empty, result must be empty.
-        src = "intersection() { cube(5); *cube(10); }"
+        src = "intersection() { cube(5); for (i = [1:0]) cube(10); }"
         bodies, _ = run(src)
         assert bodies == []
 
@@ -4595,7 +4595,7 @@ class TestCSGTreeStep4Booleans:
         # intersection(A, ∅, B) = ∅ regardless of position — an empty
         # operand nullifies the whole result, even one already established
         # from prior non-empty statements.
-        bodies = run("intersection() { cube(3); *cube(10); cube(2); }")[0]
+        bodies = run("intersection() { cube(3); for (i = [1:0]) cube(10); cube(2); }")[0]
         assert bodies == []
 
     def test_difference_later_empty_operand_just_skipped_not_discarded(self):
@@ -4606,7 +4606,7 @@ class TestCSGTreeStep4Booleans:
         assert bodies[0].body.volume() == approx(27)
 
     def test_difference_first_empty_operand_discards_whole_result(self):
-        bodies = run("difference() { *cube(3); cube(2); }")[0]
+        bodies = run("difference() { for (i = [1:0]) cube(3); cube(2); }")[0]
         assert bodies == []
 
     def test_union_skips_disabled_middle_statement(self):
@@ -5286,11 +5286,11 @@ class TestCSGTreeStep6FinalCutover:
         # Final-cutover behavior change (intentional): since resolve can no
         # longer tell a statement's geometry will end up empty (that's only
         # knowable once real bodies exist, in generate_tree()), every
-        # statement is always resolved — so echo() after a *cube(10)
-        # (disabled, contributes no geometry) still fires, even inside an
+        # statement is always resolved — so echo() after an empty loop
+        # (an empty operand) still fires, even inside an
         # intersection() whose combined geometry result is discarded to ∅
         # by the first empty operand.
-        bodies, echo = run('intersection() { *cube(10); echo("fired"); cube(2); }')
+        bodies, echo = run('intersection() { for (i = [1:0]) cube(10); echo("fired"); cube(2); }')
         assert bodies == []
         assert echo == ['ECHO: "fired"']
 
@@ -5303,3 +5303,141 @@ class TestCSGTreeStep6FinalCutover:
         ]:
             bodies, _, ev = run_tree(src)
             assert flatten_csg_tree(ev.csg_tree) == bodies
+
+
+# ---------------------------------------------------------------------------
+# Silent-wrong-result bugs backported from openscad_cpp_evaluator. Every
+# expected value below is what OpenSCAD 2026.02.01 produces for the same source.
+# ---------------------------------------------------------------------------
+
+def _vol(bodies):
+    return sum(b.body.volume() for b in bodies if b.body is not None)
+
+
+class TestBackportedSilentBugs:
+    def test_escaping_closure_keeps_its_captures(self):
+        _, lines = run("function mk(x) = function(y) x + y; echo(mk(10)(5));")
+        assert lines == ["ECHO: 15"]
+
+    def test_closures_in_c_style_for_capture_each_iteration(self):
+        _, lines = run("fs = [for (i = 0; i < 3; i = i + 1) function() i]; echo([for (f = fs) f()]);")
+        assert lines == ["ECHO: [0, 1, 2]"]
+
+    def test_let_bound_recursive_literal_still_works(self):
+        _, lines = run("echo(let(f = function(n) n <= 0 ? 0 : n + f(n - 1)) f(5));")
+        assert lines == ["ECHO: 15"]
+
+    def test_global_evaluated_once_not_per_read(self):
+        _, lines = run("r = rands(0, 1, 1)[0]; function g() = r; echo(g() == g(), g() == r);")
+        assert lines == ["ECHO: true, true"]
+
+    def test_user_function_shadows_builtin(self):
+        _, lines = run("function sin(x) = 42; echo(sin(0));")
+        assert lines == ["ECHO: 42"]
+
+    def test_braced_block_is_its_own_scope(self):
+        _, lines = run("q = 1; if (true) { q = 5; b = 2; $fn = 7; echo(q); } "
+                       "translate([0, 0, 0]) { t = 9; } "
+                       "echo(q, is_undef(b), is_undef(t), $fn);")
+        assert lines[0] == "ECHO: 5"
+        assert lines[-1] == "ECHO: 1, true, true, 0"
+        assert not any("overwritten" in l for l in lines)
+
+    def test_let_statement_is_sequential(self):
+        _, lines = run("let(a = 1, b = a + 1) echo(b);")
+        assert lines == ["ECHO: 2"]
+
+    def test_later_for_range_sees_earlier_variable(self):
+        _, lines = run("echo([for (i = [0:2], j = [0:i]) [i, j]]); for (i = [0:1], j = [0:i]) echo(i, j);")
+        assert lines == ["ECHO: [[0, 0], [1, 0], [1, 1], [2, 0], [2, 1], [2, 2]]",
+                         "ECHO: 0, 0", "ECHO: 1, 0", "ECHO: 1, 1"]
+
+    def test_intersection_for_range_sees_earlier_variable(self):
+        # i=1: j in [0:1] -> cubes at x=0 and x=0.5, intersected -> 0.5 wide
+        bodies, _ = run("intersection_for (i = [1:1], j = [0:i]) translate([j / 2, 0, 0]) cube(1);")
+        assert _vol(bodies) == approx(0.5)
+
+    def test_forwarded_children_keep_callers_children_count(self):
+        _, lines = run("module w() { children(); } module w0() { children(0); } "
+                       "module o() { w() echo($children); w0() echo($children); } "
+                       "o() { cube(1); cube(1); cube(1); }")
+        assert lines == ["ECHO: 3", "ECHO: 3"]
+
+    def test_invalid_operand_does_not_empty_union(self):
+        # the open polyhedron (a missing face) is Manifold-invalid
+        bodies, _ = run("union() { cube(1); translate([5, 0, 0]) polyhedron("
+                        "[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], [[0,1,2],[0,3,1],[0,2,3]]); }")
+        assert _vol(bodies) == approx(1)
+
+    @pytest.mark.parametrize("src, vol", [
+        ("intersection() { cube(2); *cube(1); }", 8),
+        ("intersection() { *cube(10); cube(2); }", 8),
+        ("difference() { *cube(10); cube(2); }", 8),
+        ("intersection() { cube(2); if (false) cube(1); }", 8),
+        ("intersection() { cube(2); echo(\"x\"); }", 8),
+        ("intersection() { cube(2); assert(true); }", 8),
+        ("intersection() { cube(2); a = 1; }", 8),
+        ("intersection() { cube(2); if (true) {} }", 0),
+        ("intersection() { cube(2); if (false) cube(1); else {} }", 0),
+        ("intersection() { cube(2); for (i = [1:0]) cube(1); }", 0),
+        ("intersection() { cube(2); union() {} }", 0),
+        ("module e() {} intersection() { cube(2); e(); }", 0),
+    ])
+    def test_empty_operand_rule(self, src, vol):
+        # A statement is an operand only if it built a node: an empty loop,
+        # module call or taken `if` annihilates; `*`, echo(), assert() and an
+        # untaken `if` are skipped.
+        bodies, _ = run(src)
+        assert _vol(bodies) == approx(vol)
+
+    def test_echo_with_child_draws_it(self):
+        bodies, lines = run('echo("hi") cube(10);')
+        assert lines == ['ECHO: "hi"'] and _vol(bodies) == approx(1000)
+
+    @pytest.mark.parametrize("src, r1, r2, zmin", [
+        ("cylinder(10, 5, 2);", 5, 2, 0),        # positionals are (h, r1, r2, center)
+        ("cylinder(10, 5, 2, true);", 5, 2, -5),
+        ("cylinder(h=10, d=4, r=9);", 2, 2, 0),  # d beats r
+        ("cylinder(10);", 1, 1, 0),
+        ("cylinder(h=10, r1=5);", 5, 1, 0),      # r2 defaults to 1, not to r1
+        ("cylinder(30, r=5, true);", 5, 5, 0),   # a non-number in a radius slot is ignored
+    ])
+    def test_cylinder_arguments(self, src, r1, r2, zmin):
+        _, _, ev = run_tree(src)
+        p = ev.csg_tree[0].params
+        assert (p["r1"], p["r2"]) == (approx(r1), approx(r2))
+        assert p["center"] == (zmin != 0)
+
+    @pytest.mark.parametrize("lit, expected", [
+        (r'"a\nb"', "a\nb"),
+        (r'"\x41"', "A"),
+        (r'"\x80"', "x80"),          # \x is ASCII only
+        (r'"☺"', "☺"),
+        (r'"\U01F600"', "\U0001F600"),
+        (r'"\U01F60"', "U01F60"),    # too few digits: the letter stands for itself
+        (r'"\u0000"', " "),          # NUL becomes a space
+        (r'"t\tx"', "t\tx"),
+        (r'"q\"q"', 'q"q'),
+        (r'"b\\s"', "b\\s"),
+        (r'"\q"', "q"),              # an unknown escape keeps its character
+        ('"x\ny"', "xy"),            # a raw line ending contributes nothing
+    ])
+    def test_string_escapes(self, lit, expected):
+        _, _, ev = run_tree(f"s = {lit};")
+        assert ev._root_ctx.let["s"] == expected
+
+    def test_2d_union_keeps_each_childs_colour(self):
+        bodies, _ = run('union() { color("red") square(5); color("blue") translate([3, 0]) square(5); }')
+        colours = {b.color[:3]: b.section.area() for b in bodies}
+        # later children paint over earlier ones where they overlap
+        assert colours == {(1.0, 0.0, 0.0): approx(15), (0.0, 0.0, 1.0): approx(25)}
+
+    def test_2d_union_of_one_colour_stays_one_shape(self):
+        bodies, _ = run("union() { square(5); translate([3, 0]) square(5); }")
+        assert len(bodies) == 1 and bodies[0].section.area() == approx(40)
+
+    def test_colour_of_forwarded_children_survives_union(self):
+        bodies, _ = run('module setcolor(c) { color(c) children(); } '
+                        'union() { setcolor("red") cube(5); color("blue") translate([10, 0, 0]) cube(5); }')
+        colours = {tuple(round(float(v), 2) for v in c[:3]) for c in bodies[0].tri_colors}
+        assert colours == {(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)}
