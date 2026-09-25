@@ -2080,7 +2080,8 @@ class ManifoldCache:
             self._entries.clear()
 
 
-_DEFAULT_DOLLAR = {"$fn": 0, "$fa": 12.0, "$fs": 2.0, "$t": 0.0, "$parent_modules": 0}
+_DEFAULT_DOLLAR = {"$fn": 0, "$fa": 12.0, "$fs": 2.0, "$t": 0.0, "$parent_modules": 0,
+                   "$preview": False}  # a render; a previewing caller seeds true via viewport_params
 
 
 class EvalContext:
@@ -3121,7 +3122,8 @@ class Evaluator:
         name = call.name.name
         call_pos = getattr(call, 'position', None)
         decl_pos = getattr(decl, 'position', None)
-        child_ctx.dyn["$parent_modules"] = sum(1 for e in self._call_stack if e[0] == "module")
+        # Counting this module too: 1 in a module called from top level, as in OpenSCAD.
+        child_ctx.dyn["$parent_modules"] = 1 + sum(1 for e in self._call_stack if e[0] == "module")
         prof = self._profile_enter("module", name, call_pos, decl_pos) if self._profiling else None
         self._call_stack.append(("module", name, call_pos, decl_pos))
         self._frame_ctxs.append(child_ctx)
@@ -5689,7 +5691,7 @@ class Evaluator:
         if decl is None:
             if warn_if_undef:
                 pos = getattr(node, 'position', None)
-                self._echo_fn(f"WARNING: Ignoring unknown variable '{name}'{self._loc(pos)}")
+                self._echo_fn(f'WARNING: Ignoring unknown variable "{name}"{self._loc(pos)}')
             return None
         if type(decl) is ParameterDeclaration:
             return None
@@ -5954,6 +5956,11 @@ class Evaluator:
                     self._check_debug(node, ctx)
                 return self._eval_user_function(name, decl, node.arguments, ctx, node)
             if name in self._BUILTIN_FN_NAMES:
+                if name == "is_undef" and len(node.arguments) == 1 \
+                        and type(node.arguments[0]) is PositionalArgument \
+                        and type(node.arguments[0].expr) is Identifier:
+                    # Asking whether a name is defined must not warn that it isn't.
+                    return self._eval_identifier(node.arguments[0].expr, ctx, warn_if_undef=False) is None
                 args = self._resolve_args(node.arguments, ctx)
                 if name in ("textmetrics", "fontmetrics"):
                     self._warn_unexpected_args(self._BUILTIN_PARAMS[name], node.arguments, node, builtin=True)

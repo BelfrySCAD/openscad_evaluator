@@ -12,11 +12,6 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 ### Bug fixes
 
-`$` variables
-- `$parent_modules` inside forwarded children is 1 here and 0 in the C++ port; OpenSCAD
-  gives 2 for `module w(){children();} module o(){w() echo($parent_modules);} o(){cube();}`
-- A never-set `$var` and `is_undef(zzz)` should be undef with no warning (37539f9, #114)
-- `$preview` should be seeded `false`, not undef-with-warning (#100)
 
 Builtin arguments
 - `resize(auto=)` ignored (04797d0)
