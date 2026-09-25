@@ -4269,6 +4269,29 @@ class TestProfilePaths:
             assert n["cumulative_time"] >= sum(paths[c]["cumulative_time"] for c in n["children"]) - 1e-12
 
 
+class TestMissingImport:
+    """A missing import() file warns and carries on, in OpenSCAD's words
+    (2026.02.01); it aborted the render."""
+
+    def _run(self, tmp_path, src):
+        from openscad_lalr_parser import getASTfromFile
+        (tmp_path / "t.scad").write_text(src)
+        lines = []
+        nodes = getASTfromFile(str(tmp_path / "t.scad"))
+        bodies, _ = Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes))
+        return bodies, [l.replace(str(tmp_path) + "/", "") for l in lines]
+
+    def test_module_form(self, tmp_path):
+        bodies, lines = self._run(tmp_path, 'import("nope.stl");\nimport("nope.dxf");\necho(1);\ncube(1);\n')
+        assert len(bodies) == 1
+        assert lines == ["ECHO: 1", "WARNING: Can't open import file 'nope.stl', import() at line 1",
+                         "WARNING: Can't open DXF file 'nope.dxf'."]
+
+    def test_expression_form(self, tmp_path):
+        _, lines = self._run(tmp_path, 'x = import("nope.json");\necho(x);\n')
+        assert lines == ["WARNING: Could not read file 'nope.json' in file t.scad, line 1", "ECHO: undef"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
@@ -5609,9 +5632,11 @@ class TestCSGTreeStep5Extrusion:
         with pytest.raises(EvalError, match="ezdxf"):
             run(f'import("{dxf}");')
 
-    def test_import_unsupported_extension_raises(self):
+    def test_import_unsupported_extension_raises(self, tmp_path):
+        f = tmp_path / "model.xyz"
+        f.write_text("x")
         with pytest.raises(EvalError):
-            run('import("nonexistent.xyz");')
+            run(f'import("{f.as_posix()}");')
 
     def test_import_json_as_geometry_statement_raises(self, tmp_path):
         # import() as a geometry statement (ModularCall) dispatches by
