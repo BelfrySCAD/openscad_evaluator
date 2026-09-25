@@ -2782,6 +2782,10 @@ class Evaluator:
         self._frame_ctxs: list = []
         self._debug_hook = debug_hook
         self._debugging = debug_hook is not None
+        # The statement checkpoint in progress at each call depth, for
+        # _check_debug's call-site collapse. Per depth: `a = [f(1), f(2)];`
+        # runs f's own checkpoints in between, one level down.
+        self._last_stmt_by_depth: dict[int, tuple] = {}
         self._error_break_fn = error_break_fn
         self._return_hook = return_hook
         self._last_locals: dict = {}
@@ -2891,7 +2895,7 @@ class Evaluator:
         return self._last_locals, all_frame_locals
 
     @staticmethod
-    def _child_statement_positions(node: ASTNode) -> Optional[list[tuple[Optional[str], int]]]:
+    def _child_statement_positions(node: ASTNode, ctx: EvalContext) -> Optional[list[tuple[Optional[str], int]]]:
         """(origin, line) for each top-level, non-declaration child of
         `node` (a ModularCall's `.children` — the `{ ... }` block passed to
         a module call), if any. Used by the debugger's "Step to Child"
@@ -2899,8 +2903,16 @@ class Evaluator:
         forward control to — stashed on self._last_children_positions
         rather than threaded through the debug_hook callback itself, so
         adding it doesn't change that protocol's signature (every
-        hand-rolled test hook would otherwise need updating)."""
-        node_children = getattr(node, 'children', None)
+        hand-rolled test hook would otherwise need updating).
+
+        A `children()` call has no children of its own: it forwards the
+        enclosing invocation's, which live on the context. Every forwarded
+        child is a target even when an index runs only some -- a position
+        never reached is never stopped at."""
+        if type(node) is ModularCall and node.name.name == "children":
+            node_children = ctx.children_nodes
+        else:
+            node_children = getattr(node, 'children', None)
         if not node_children:
             return None
         positions = []
@@ -2913,7 +2925,13 @@ class Evaluator:
                 positions.append((getattr(cpos, 'origin', None), int(cline)))
         return positions or None
 
-    def _check_debug(self, node: ASTNode, ctx: EvalContext, forced: bool = False, expr_level: bool = False):
+    def _check_debug(self, node: ASTNode, ctx: EvalContext, forced: bool = False, expr_level: bool = False,
+                     call_site: bool = False):
+        """`call_site`: the stop just before descending into a user function.
+        It is steppable, but not a second execution of its line: when it
+        lands on the line and depth of the statement checkpoint already in
+        progress (`x = f(y);`) it is dropped, so a breakpoint there fires
+        once, not twice. A call on its own line still stops."""
         if self._debug_hook is None:
             return
         pos = getattr(node, 'position', None)
@@ -2921,7 +2939,12 @@ class Evaluator:
         if line is None:
             return
         origin = getattr(pos, 'origin', None)
-        self._last_children_positions = self._child_statement_positions(node)
+        depth = len(self._call_stack)
+        if call_site and not forced and self._last_stmt_by_depth.get(depth) == (line, origin):
+            return
+        if not expr_level and not call_site:
+            self._last_stmt_by_depth[depth] = (line, origin)
+        self._last_children_positions = self._child_statement_positions(node, ctx)
 
         cmd, mods = self._debug_hook(
             int(line), len(self._call_stack),
@@ -6538,7 +6561,7 @@ class Evaluator:
                 decl = ctx.scope.lookup_function(name)
             if decl is not None:
                 if self._debugging:
-                    self._check_debug(node, ctx)
+                    self._check_debug(node, ctx, call_site=True)
                 return self._eval_user_function(name, decl, node.arguments, ctx, node)
             if name in self._BUILTIN_FN_NAMES:
                 if name == "is_undef" and len(node.arguments) == 1 \
@@ -6580,7 +6603,7 @@ class Evaluator:
             func_node = self._eval_expr(left, ctx)
         if type(func_node) is Closure:
             if self._debugging:
-                self._check_debug(node, ctx)
+                self._check_debug(node, ctx, call_site=True)
             return self._eval_function_literal(func_node, node.arguments, ctx, node, name=name)
 
         if name and func_node is None:

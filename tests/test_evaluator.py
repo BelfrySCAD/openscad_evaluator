@@ -6123,3 +6123,37 @@ class TestManifoldCacheProvenance:
         cache = ManifoldCache()
         self._render("cube(1);", cache)
         assert self._render("cube(1);", cache)[1] == []
+
+
+class TestDebugStops:
+    """cpp #82 and #83."""
+
+    @staticmethod
+    def _stops(src):
+        seen = []
+
+        def hook(line, depth, forced=False, expr_level=False, expr_depth=0, origin=None, get_frames=None):
+            if not expr_level:
+                seen.append((line, depth, ev._last_children_positions))
+            return "continue", {}
+        nodes = getASTfromString(src, include_comments=False)
+        ev = Evaluator(echo_fn=lambda m: None, debug_hook=hook)
+        ev.evaluate(nodes, build_scopes(nodes))
+        return [(line, depth) for line, depth, _ in seen], seen
+
+    def test_call_on_its_statements_line_stops_once(self):
+        stops, _ = self._stops("function f(y) = y*2;\nx = f(3);\necho(x);")
+        assert stops == [(2, 0), (1, 1), (3, 0)]
+
+    def test_several_calls_on_one_line_stop_once(self):
+        stops, _ = self._stops("function f(y) = y*2;\na = [f(1), f(2), f(3)];")
+        assert stops == [(2, 0), (1, 1), (1, 1), (1, 1)]
+
+    def test_call_on_its_own_line_still_stops(self):
+        stops, _ = self._stops("function f(y) = y*2;\nb = [for (i=[0:0])\n  f(i)];")
+        assert (3, 0) in stops
+
+    def test_children_call_targets_the_forwarded_children(self):
+        _, seen = self._stops("module framed(gap) {\n    children();\n}\nframed(20)\n    leaf();\n"
+                              "module leaf() { cube(1); }")
+        assert [t for line, depth, t in seen if line == 2] == [[("<string>", 5)]]
