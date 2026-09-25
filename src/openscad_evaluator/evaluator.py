@@ -5370,6 +5370,10 @@ class Evaluator:
             return {"color": color}
         path = self._resolve_import_path(file_arg, node)
         ext  = _os.path.splitext(path)[1].lower()
+        if not _os.path.exists(path):
+            # A missing file warns and imports nothing, as in OpenSCAD; it
+            # aborted the whole render. Warned at generate, where OpenSCAD does.
+            return {"kind": "missing", "path": path, "ext": ext, "color": color}
         try:
             if ext in (".stl", ".obj", ".off", ".3mf"):
                 loader = {".stl": self._load_stl, ".obj": self._load_obj,
@@ -5409,6 +5413,13 @@ class Evaluator:
     def _generate_import(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
         kind = params.get("kind")
         color = params["color"]
+        if kind == "missing":
+            # OpenSCAD's own wording, which names a line but not the file.
+            pos = getattr(node, "position", None)
+            where = f", import() at line {pos.line}" if pos else ""
+            self._echo_fn(f"WARNING: Can't open DXF file '{params['path']}'." if params["ext"] == ".dxf"
+                          else f"WARNING: Can't open import file '{params['path']}'{where}")
+            return []
         if kind == "mesh":
             return self._import_mesh(params, node, color)
         if kind == "dxf":
@@ -5442,6 +5453,9 @@ class Evaluator:
             return None
         path = self._resolve_import_path(file_arg, node)
         ext  = _os.path.splitext(path)[1].lower()
+        if not _os.path.exists(path):
+            self._echo_fn(f"WARNING: Could not read file '{path}'{self._loc(getattr(node, 'position', None))}")
+            return None
         try:
             if ext == ".json":
                 import json as _json
