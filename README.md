@@ -65,6 +65,26 @@ for body in bodies:
     print(body.body.num_tri(), "triangles")
 ```
 
+A body carries a 3D `body` (Manifold), a 2D `section` (CrossSection), or -- for an open mesh
+that doesn't close a solid, which OpenSCAD still draws -- neither, with the triangles in
+`raw_mesh`. A renderer or exporter should draw those too; `export.py`'s writers do.
+
+### Language extensions
+
+Shared with [openscad_cpp_evaluator](https://github.com/BelfrySCAD/openscad_cpp_evaluator), and
+not part of upstream OpenSCAD:
+
+```openscad
+obj = render() { difference() { cube(10, center=true); sphere(4); } };
+echo(obj.volume, obj.area, obj.genus, obj.boundingbox);   // measured; nothing is drawn
+polyhedron(obj);                                          // and straight back in
+polyhedron(spheroid(d=30));                               // any BOSL2 VNF, too
+```
+
+`render()` in expression position builds its children's geometry, measures it and discards it.
+`render` is therefore a reserved word (openscad_lalr_parser >= 1.2.0), and the braced form is
+required. See [`docs/evaluator.md`](docs/evaluator.md) for the object's keys.
+
 ## Command Line
 
 Installing the package also installs an `openscad-evaluator` script that evaluates a `.scad` file
