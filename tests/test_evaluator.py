@@ -1368,7 +1368,7 @@ class TestDefaultParamScoping:
 
     def test_default_cannot_see_sibling_param(self):
         _, lines = run("function f(a, b=a*2) = a + b; echo(f(3));")
-        assert lines[0] == "WARNING: Ignoring unknown variable 'a' in file <string>, line 1"
+        assert lines[0] == "WARNING: Ignoring unknown variable \"a\" in file <string>, line 1"
         assert lines[1] == "ECHO: undef"
 
     def test_function_body_already_ignores_caller_let(self):
@@ -2786,7 +2786,7 @@ class TestNewBuiltins:
         # so a bare reference to `function f(x) = ...` is an unknown variable
         # (-> undef, with a warning), not a callable value.
         _, lines = run("function f(x) = x*2; echo(is_function(f));")
-        assert lines == ["WARNING: Ignoring unknown variable 'f' in file <string>, line 1",
+        assert lines == ["WARNING: Ignoring unknown variable \"f\" in file <string>, line 1",
                           "ECHO: false"]
 
     def test_is_function_false_on_num(self):
@@ -2810,7 +2810,7 @@ class TestNewBuiltins:
 
     def test_unknown_variable_warns_and_returns_undef(self):
         _, lines = run("echo(totally_undefined_var);")
-        assert lines == ["WARNING: Ignoring unknown variable 'totally_undefined_var' in file <string>, line 1",
+        assert lines == ["WARNING: Ignoring unknown variable \"totally_undefined_var\" in file <string>, line 1",
                           "ECHO: undef"]
 
     def test_search_string_single_char(self):
@@ -5876,3 +5876,27 @@ class TestArgumentWarnings:
         _, lines = run("module m(size, anchor, spin=0) { cube(size); } "
                        "m(2, anchor=[0,0,1], spin=90, $fn=8);")
         assert lines == []
+
+
+class TestDollarVariables:
+    """Checked against OpenSCAD 2026.02.01."""
+
+    def test_is_undef_of_a_name_is_silent(self):
+        _, lines = run("echo(is_undef(zzz), is_undef($never), is_undef(zzz) ? 1 : 2);")
+        assert lines == ["ECHO: true, true, 1"]
+
+    def test_reading_an_unknown_name_still_warns(self):
+        # OpenSCAD warns for an unset $var as for any name -- only is_undef() asks
+        _, lines = run("echo($never_set);")
+        assert lines == ['WARNING: Ignoring unknown variable "$never_set" in file <string>, line 1',
+                         "ECHO: undef"]
+
+    def test_preview_is_false_in_a_render(self):
+        _, lines = run("echo($preview);")
+        assert lines == ["ECHO: false"]
+
+    def test_parent_modules_counts_the_current_module(self):
+        _, lines = run("module lvl() { echo($parent_modules); } module outer() { lvl(); } "
+                       "lvl(); outer(); "
+                       "module w() { children(); } module o() { w() echo($parent_modules); } o() cube(1);")
+        assert lines == ["ECHO: 1", "ECHO: 2", "ECHO: 2"]
