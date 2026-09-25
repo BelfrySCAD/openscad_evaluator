@@ -5828,3 +5828,51 @@ class TestNumberFormat:
     def test_smallest_subnormal_does_not_crash(self):
         from openscad_evaluator.evaluator import _format_number
         assert _format_number(5e-324) == "4.94066e-324"  # ZeroDivisionError before
+
+
+class TestArgumentWarnings:
+    """Arguments a callee doesn't declare were silently dropped; OpenSCAD
+    warns. Expected output is OpenSCAD 2026.02.01's."""
+
+    @staticmethod
+    def _w(msg, line=1):
+        return f"WARNING: {msg} in file <string>, line {line}"
+
+    @pytest.mark.parametrize("src, warnings, echo", [
+        ("function f(a) = a; echo(f(1, 2));", ["Too many unnamed arguments supplied"], "1"),
+        ("function f(a) = a; echo(f(1, b=2));", ['variable "b" not specified as parameter'], "1"),
+        ("function f(a, b) = a; echo(f(1, a=2));", ['argument "a" overrides positional argument'], "2"),
+        ("function f(a) = a; echo(f(a=1, a=2));", ['argument "a" supplied more than once'], "2"),
+        ("function f(a) = a; echo(f(a=1, $fn=3));", [], "1"),                 # $-names are fine
+        ("function f(a) = a; echo(f(1, $children=2));",
+         ['variable "$children" not specified as parameter'], "1"),          # ...but not $children
+        ("g = function(x) x; echo(g(1, y=2));", ['variable "y" not specified as parameter'], "1"),
+        ("function f(a, b) = a; echo(f(b=1, 2));", [], "2"),
+    ])
+    def test_user_functions(self, src, warnings, echo):
+        _, lines = run(src)
+        assert lines == [self._w(w) for w in warnings] + [f"ECHO: {echo}"]
+
+    def test_user_module(self):
+        _, lines = run("module m(a) { echo(a=a); } m(1, 2); m(1, b=2);")
+        assert lines == [self._w("Too many unnamed arguments supplied"), "ECHO: a = 1",
+                         self._w('variable "b" not specified as parameter'), "ECHO: a = 1"]
+
+    @pytest.mark.parametrize("src, warning", [
+        ("cube(1, bogus=2);", 'variable "bogus" not specified as parameter'),
+        ("cube(1, true, 3);", "Too many unnamed arguments supplied"),
+        ("translate([1,0,0], 5) cube(1);", "Too many unnamed arguments supplied"),
+        ('echo(textmetrics("x", bogus=1).size);', 'variable "bogus" not specified as parameter'),
+    ])
+    def test_builtin_modules(self, src, warning):
+        _, lines = run(src)
+        assert lines[0] == self._w(warning)
+
+    def test_builtin_functions_never_warn(self):
+        _, lines = run("echo(sin(bogus=30));")  # read positionally, as in OpenSCAD
+        assert lines == ["ECHO: 0.5"]
+
+    def test_bosl2_style_calls_are_silent(self):
+        _, lines = run("module m(size, anchor, spin=0) { cube(size); } "
+                       "m(2, anchor=[0,0,1], spin=90, $fn=8);")
+        assert lines == []
