@@ -131,3 +131,26 @@ class TestExportBodiesDispatch:
         out = tmp_path / "out.mesh"
         export_bodies(str(out), bodies, fmt="obj")
         assert out.read_text().startswith("v ")
+
+
+_OPEN_TETRA = "polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], [[0,1,2],[0,3,1],[0,2,3]]);"
+
+
+class TestOpenMesh:
+    """An open polyhedron is exported as the surface it is, as OpenSCAD does."""
+
+    def test_off_has_the_open_surface(self, tmp_path):
+        out = tmp_path / "open.off"
+        write_off(str(out), _evaluate(_OPEN_TETRA))
+        assert out.read_text().splitlines()[1] == "4 3 0"
+
+    def test_open_surface_appended_after_solids(self, tmp_path):
+        out = tmp_path / "both.off"
+        write_off(str(out), _evaluate("cube(1); translate([5,0,0]) " + _OPEN_TETRA))
+        assert out.read_text().splitlines()[1] == "12 15 0"  # cube 8/12 + surface 4/3
+
+    @pytest.mark.parametrize("writer", [write_stl, write_obj, write_3mf])
+    def test_every_format_writes_it(self, tmp_path, writer):
+        out = tmp_path / "open.out"
+        writer(str(out), _evaluate(_OPEN_TETRA))
+        assert out.stat().st_size > 0

@@ -52,6 +52,22 @@ _MANIFOLD_OK = m3d.Error.NoError
 _HEX = frozenset("0123456789abcdefABCDEF")
 
 
+def _rot_deg(deg: float, axis: int) -> np.ndarray:
+    """Rotation matrix about x/y/z (0/1/2) by `deg` degrees, exact at
+    multiples of 90 so a quarter turn leaves no 6e-17 residue."""
+    q, r = divmod(deg, 90)
+    if r == 0:
+        c, s = ((1, 0), (0, 1), (-1, 0), (0, -1))[int(q) % 4]
+    else:
+        c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    i, j = [k for k in range(3) if k != axis]
+    m = np.eye(3)
+    m[i, i], m[i, j], m[j, i], m[j, j] = c, -s, s, c
+    if axis == 1:  # y: z-x plane, so the sine terms swap sign
+        m[i, j], m[j, i] = s, -s
+    return m
+
+
 @functools.lru_cache(maxsize=4096)
 def _unescape_string(raw: str) -> str:
     r"""A string literal's value from its source text, which the parser
@@ -1687,6 +1703,12 @@ class ColoredBody:
     # sphere. None (the common case: a single-colored body) means `color`
     # alone is authoritative, same as before this field existed.
     tri_colors: Optional[np.ndarray] = None
+    # An open mesh (polyhedron()/import() whose faces don't close a solid),
+    # which Manifold can't represent: (verts float64 (N, 3), tris int (M, 3),
+    # Manifold's CCW winding). Set only with body and section both None, so
+    # everything that combines solids skips it; it is drawn and exported as
+    # a surface on its own, transforms move it, and hull() uses its points.
+    raw_mesh: Optional[tuple[np.ndarray, np.ndarray]] = None
 
 
 @dataclass
@@ -1783,7 +1805,8 @@ def to_renderable_bodies(bodies: list[ColoredBody]) -> list[ColoredBody]:
     """Convert top-level 2D-only results (`body is None`, `section` set —
     e.g. `circle();`) into thin-extruded Manifolds, so the renderer/exporter
     (which only handle Manifold meshes) can display them. 3D bodies pass
-    through unchanged."""
+    through unchanged, and so do open-mesh bodies (`raw_mesh` set), which a
+    renderer or exporter draws from their raw triangles."""
     return [
         ColoredBody(body=m3d.Manifold.extrude(cb.section, _TOP_LEVEL_2D_HEIGHT),
                     color=cb.color, flat_preview=True, role=cb.role)
@@ -2141,6 +2164,7 @@ class Evaluator:
                  manifold_cache: "ManifoldCache | None" = None, profile: bool = False):
         self.id_to_node: dict[int, ASTNode] = {}
         self.id_to_color: dict[int, Optional[tuple]] = {}
+        self._hull_depth = 0  # hull() nodes enclosing the one being generated
         self._if_taken = False  # whether the last `if` ran a branch; see _is_operand_when_empty
         self._builtin_shadow: dict[tuple, Any] = {}  # (id(scope), builtin name) -> user decl or None
         self._global_values: dict[int, Any] = {}  # id(root-scope Assignment) -> value; see _eval_identifier
@@ -2744,7 +2768,12 @@ class Evaluator:
             if cached is not None:
                 node.bodies = cached
             else:
-                children_bodies = self.generate_tree(node.children)
+                in_hull = node.kind == "hull" and node.is_builtin
+                self._hull_depth += in_hull
+                try:
+                    children_bodies = self.generate_tree(node.children)
+                finally:
+                    self._hull_depth -= in_hull
                 generate_fn = self._GENERATE_DISPATCH.get(node.kind) if node.is_builtin else None
                 node.bodies = generate_fn(node.params, node.children, node.node) if generate_fn is not None else children_bodies
                 if key is not None:
@@ -3289,9 +3318,47 @@ class Evaluator:
                 result.append(replace(b, section=self._apply_transform_2d(name, args, b.section)))
             elif b.body is not None:
                 result.append(replace(b, body=self._apply_transform_3d(name, args, b.body)))
+            elif b.raw_mesh is not None:
+                result.append(replace(b, raw_mesh=self._transform_raw_mesh(name, args, b.raw_mesh)))
             else:
                 result.append(b)
         return result
+
+    def _transform_raw_mesh(self, name: str, args: dict, raw):
+        """_apply_transform_3d for a raw_mesh, which has no Manifold to call:
+        the same transform as a matrix, flipping the winding when it mirrors."""
+        verts, tris = raw
+        m = np.eye(4)
+        if name == "translate":
+            m[:3, 3] = self._to_vec3(self._get_arg(args, 0, "v", [0, 0, 0]))
+        elif name == "rotate":
+            a = self._get_arg(args, 0, "a", 0)
+            v = self._get_arg(args, 1, "v", None)
+            if isinstance(a, (list, tuple)):
+                ax, ay, az = (self._to_vec3(a) + [0.0])[:3]
+                m[:3, :3] = _rot_deg(az, 2) @ _rot_deg(ay, 1) @ _rot_deg(ax, 0)
+            else:
+                m[:3, :] = np.array(self._axis_angle_matrix(self._to_vec3(v if v is not None else [0, 0, 1]),
+                                                            math.radians(float(a))))
+        elif name == "scale":
+            v = self._get_arg(args, 0, "v", [1, 1, 1])
+            m[:3, :3] = np.diag([float(v)] * 3 if isinstance(v, (int, float)) else [float(x) for x in v][:3])
+        elif name == "mirror":
+            n = np.array(self._to_vec3(self._get_arg(args, 0, "v", [1, 0, 0])))
+            if n @ n:
+                m[:3, :3] -= 2 * np.outer(n, n) / (n @ n)
+        elif name == "resize":
+            newsize = [float(x) for x in self._get_arg(args, 0, "newsize", [0, 0, 0])]
+            span = verts.max(axis=0) - verts.min(axis=0) if len(verts) else np.zeros(3)
+            m[:3, :3] = np.diag([ns / sp if ns and sp else 1 for ns, sp in zip(newsize, span)])
+        elif name == "multmatrix":
+            mat = self._get_arg(args, 0, "m", None)
+            if mat is not None:
+                m[:3, :] = np.array(self._to_matrix4x3(mat), dtype=np.float64)
+        verts = verts @ m[:3, :3].T + m[:3, 3]
+        if np.linalg.det(m[:3, :3]) < 0:
+            tris = tris[:, [0, 2, 1]]
+        return verts, tris
 
     def _apply_transform_2d(self, name: str, args: dict, cs: "m3d.CrossSection") -> "m3d.CrossSection":
         if name == "translate":
@@ -3670,7 +3737,14 @@ class Evaluator:
         hull_result: Optional[ColoredBody] = None
         if fg:
             bodies_3d = [c.body for c in fg if c.body is not None]
-            if bodies_3d:
+            raw_pts = [c.raw_mesh[0] for c in fg if c.raw_mesh is not None]
+            if raw_pts:
+                # A hull needs only points, so an open mesh takes part too --
+                # BOSL2's hull_points() feeds hull() a polyhedron of arbitrary faces.
+                pts = np.vstack(raw_pts + [np.asarray(b.to_mesh().vert_properties[:, :3], dtype=np.float64)
+                                           for b in bodies_3d])
+                hull_result = ColoredBody(body=m3d.Manifold.hull_points(pts), color=fg[0].color)
+            elif bodies_3d:
                 hull_result = ColoredBody(body=m3d.Manifold.batch_hull(bodies_3d), color=fg[0].color)
             else:
                 sections = [c.section for c in fg if c.section is not None]
@@ -3717,9 +3791,50 @@ class Evaluator:
         try:
             mesh = m3d.Mesh(vert_properties=params["verts"], tri_verts=params["tri_arr"])
             body = m3d.Manifold(mesh)
-            return [self._tag_generated(body, node, params["color"])]
         except Exception as e:
             self.error(f"polyhedron: {e}", node)
+        return [self._mesh_body(body, params["verts"], params["tri_arr"], node, params["color"], "polyhedron")]
+
+    def _mesh_body(self, body: m3d.Manifold, verts, tris, node, color, what: str) -> ColoredBody:
+        """The body for a mesh built from user data. Closed: the Manifold.
+        Open: the triangles themselves as a display-only raw_mesh, since
+        Manifold gives back an empty body for them -- the object vanished
+        without a word before. Any other failure (NaN coordinates, say)
+        keeps the empty body, drawing nothing, but now says so."""
+        status = body.status()
+        if status == _MANIFOLD_OK:
+            return self._tag_generated(body, node, color)
+        pos = getattr(node, "position", None)
+        if status != m3d.Error.NotManifold:
+            self._echo_fn(f"WARNING: {what}: mesh could not be built ({status.name}); "
+                          f"nothing is drawn{self._loc(pos)}")
+            return self._tag_generated(body, node, color)
+        verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+        tris = np.asarray(tris, dtype=np.int64).reshape(-1, 3)
+        if not self._hull_depth:  # hull() only needs the points, and OpenSCAD is silent there
+            count, first = self._boundary_edges(tris)
+            where = ""
+            if first is not None:
+                a, b = (self._fmt_val([float(c) for c in verts[i]]) for i in first)
+                where = f", first at {a} - {b}"
+            self._echo_fn(
+                f"WARNING: {what}: mesh is not closed -- {count} boundary edge(s){where}; "
+                "drawing the object as an open surface rather than a solid -- nothing is "
+                "patched. hull() can still use its points, but it cannot take part in "
+                f"union/difference/intersection{self._loc(pos)}")
+        return ColoredBody(color=color, raw_mesh=(verts, tris))
+
+    @staticmethod
+    def _boundary_edges(tris: np.ndarray) -> tuple[int, Optional[tuple[int, int]]]:
+        """How many edges a closed mesh would need another face on (used an
+        odd number of times), and the lowest-numbered one -- deterministic,
+        so the warning names the same edge every render."""
+        if len(tris) == 0:
+            return 0, None
+        edges = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+        uniq, counts = np.unique(edges, axis=0, return_counts=True)
+        odd = uniq[counts % 2 == 1]
+        return len(odd), (tuple(int(i) for i in odd[0]) if len(odd) else None)
 
     def _resolve_surface(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
@@ -4041,10 +4156,7 @@ class Evaluator:
         except Exception as e:
             self.error(f"import: mesh construction failed: {e}", node)
             return None
-        if body.status() != m3d.Error.NoError:
-            pos = getattr(node, "position", None)
-            self._echo_fn(f"WARNING: import: mesh is not manifold ({body.status()}){self._loc(pos)}")
-        return self._tag_generated(body, node, color)
+        return self._mesh_body(body, verts_arr, tri_arr, node, color, "import")
 
     def _load_stl(self, path: str):
         """Return (verts, tris) from binary or ASCII STL."""
