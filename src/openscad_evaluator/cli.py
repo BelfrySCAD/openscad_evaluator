@@ -24,6 +24,8 @@ import os
 import signal
 import sys
 
+import numpy as np
+
 from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile
 
 from openscad_evaluator._debug_repl import DebugRepl, DeclInfo
@@ -257,6 +259,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
         bodies = to_renderable_bodies(bodies)
+        # Warn, don't refuse: a deliberately open surface is a legitimate
+        # thing to export, and blocking the save would be worse than saying so.
+        from openscad_evaluator.mesh_check import check_mesh
+        for n, b in enumerate(bodies, 1):
+            if b.body is not None and not b.body.is_empty():
+                mesh = b.body.to_mesh64()
+                d = check_mesh(np.array(mesh.vert_properties)[:, :3], np.array(mesh.tri_verts))
+                if not d.ok():
+                    print(f"WARNING: export: part {n} is not a closed manifold solid -- {d.summary()}",
+                          file=sys.stderr)
         try:
             export_bodies(args.output, bodies, fmt=fmt)
         except (ValueError, ImportError) as e:
