@@ -4,12 +4,13 @@ especially the pure-Python 3MF writer (no lib3mf dependency; see CLAUDE.md)."""
 import zipfile
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pytest
 from openscad_lalr_parser import build_scopes, getASTfromString
 
 from openscad_evaluator.evaluator import Evaluator
 from openscad_evaluator.export import (
-    export_bodies, format_for_path, write_3mf, write_obj, write_off, write_stl,
+    export_bodies, export_model, format_for_path, write_3mf, write_obj, write_off, write_stl,
 )
 
 _CORE_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
@@ -93,8 +94,14 @@ class TestWrite3mf:
         assert len(colors) == 1
         assert colors[0].get("color") == "#CCCCCCFF"
 
-    def test_multiple_bodies_get_distinct_resource_ids(self, tmp_path):
+    def test_same_colour_bodies_weld_into_one_object(self, tmp_path):
         bodies = _evaluate("cube(1); translate([5, 0, 0]) sphere(r=1);")
+        out = tmp_path / "one.3mf"
+        write_3mf(str(out), bodies)
+        assert len(self._read_model(str(out)).findall(f".//{{{_CORE_NS}}}object")) == 1
+
+    def test_multiple_bodies_get_distinct_resource_ids(self, tmp_path):
+        bodies = _evaluate('color("red") cube(1); translate([5, 0, 0]) sphere(r=1);')
         out = tmp_path / "multi.3mf"
         write_3mf(str(out), bodies)
         root = self._read_model(str(out))
@@ -130,7 +137,7 @@ class TestExportBodiesDispatch:
         bodies = _evaluate("cube(1);")
         out = tmp_path / "out.mesh"
         export_bodies(str(out), bodies, fmt="obj")
-        assert out.read_text().startswith("v ")
+        assert out.read_text().startswith("mtllib out.mtl\n")
 
 
 _OPEN_TETRA = "polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], [[0,1,2],[0,3,1],[0,2,3]]);"
@@ -154,3 +161,52 @@ class TestOpenMesh:
         out = tmp_path / "open.out"
         writer(str(out), _evaluate(_OPEN_TETRA))
         assert out.stat().st_size > 0
+
+
+class TestExportModel:
+    """export_model's object split and checks. Every structure below matches
+    openscad_cpp_evaluator's export_model on the same script: object count,
+    triangles, volume and colours per object, and the warnings."""
+
+    SCRIPT = ('color("red") cube(10); color("blue") translate([5,5,5]) cube(10);'
+              'union() { color("green") translate([30,0,0]) cube(8); color("yellow") translate([34,0,0]) cube(8); }'
+              'translate([60,0,0]) cube(4); translate([70,0,0]) cube(4); %translate([0,40,0]) cube(5);')
+
+    def _objects(self, tmp_path, script=SCRIPT, **kw):
+        out = tmp_path / "m.3mf"
+        warnings = export_model(str(out), _evaluate(script), **kw)
+        root = ET.fromstring(zipfile.ZipFile(out).read("3D/3dmodel.model"))
+        groups = {g.get("id"): [c.get("color") for c in g] for g in root.iter(f"{{{_MATERIAL_NS}}}colorgroup")}
+        objs = []
+        for o in root.iter(f"{{{_CORE_NS}}}object"):
+            v = np.array([[float(x.get(a)) for a in "xyz"] for x in o.iter(f"{{{_CORE_NS}}}vertex")])
+            t = np.array([[int(x.get(a)) for a in ("v1", "v2", "v3")] for x in o.iter(f"{{{_CORE_NS}}}triangle")])
+            vol = np.einsum("ij,ij->i", v[t[:, 0]], np.cross(v[t[:, 1]], v[t[:, 2]])).sum() / 6
+            objs.append((round(float(vol), 2), groups[o.get("pid")]))
+        return sorted(objs), warnings
+
+    def test_one_object_per_colour_later_colour_wins(self, tmp_path):
+        objs, warnings = self._objects(tmp_path)
+        assert objs == [(128.0, ["#CCCCCCFF"]), (768.0, ["#008000FF", "#FFFF00FF"]),
+                        (875.0, ["#FF0000FF"]), (1000.0, ["#0000FFFF"])]
+        assert warnings == []
+
+    def test_split_components_and_single_material(self, tmp_path):
+        objs, _ = self._objects(tmp_path, split_components=True)
+        assert [o[0] for o in objs] == [64.0, 64.0, 768.0, 875.0, 1000.0]
+        objs, _ = self._objects(tmp_path, split_colors=False)
+        assert objs == [(2771.0, ["#FF0000FF"])]
+
+    def test_open_shell_is_written_and_reported(self, tmp_path):
+        warnings = export_model(str(tmp_path / "m.stl"), _evaluate("cube(1); translate([5,0,0]) " + _OPEN_TETRA))
+        assert warnings == ["part 2 is not a closed solid; its surface is written as-is, and most slicers "
+                            "will reject it.", "exported mesh 3 boundary edges"]
+
+    def test_touching_bodies_are_unioned_not_concatenated(self, tmp_path):
+        out = tmp_path / "m.off"
+        assert export_model(str(out), _evaluate("cube(1); translate([1,0,0]) cube(1);")) == []
+        assert out.read_text().splitlines()[1] == "12 20 0"  # one welded 2x1x1 box
+
+    def test_obj_writes_its_materials(self, tmp_path):
+        export_model(str(tmp_path / "m.obj"), _evaluate("color([1,0,0,0.5]) cube(1);"))
+        assert (tmp_path / "m.mtl").read_text() == "newmtl color_1\nKd 1 0 0\nd 0.5\n\n"
