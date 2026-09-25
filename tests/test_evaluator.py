@@ -5650,3 +5650,10 @@ class TestPolyhedronFromObject:
     def test_polygon_object_without_paths_is_one_contour(self):
         bodies, _ = run("polygon(object(vertices=[[0,0],[4,0],[0,3]]));")
         assert bodies[0].section.area() == approx(6)
+
+
+def test_top_level_block_is_drawn():
+    # openscad_lalr_parser < 1.2.1 left a top-level `{ ... }` in the AST as a
+    # bare list, and build_scopes() crashed on it; OpenSCAD draws the contents.
+    bodies, _ = run("x = 1; { cube(2); }")
+    assert len(bodies) == 1 and bodies[0].body.volume() == approx(8)
