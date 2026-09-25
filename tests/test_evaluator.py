@@ -3693,11 +3693,11 @@ class TestObject:
     def test_nested_object(self):
         src = "o = object(a=1, nested=object(x=10, y=20)); echo(o.nested.x); echo(o.nested);"
         _, echoes = run(src)
-        assert echoes == ["ECHO: 10", "ECHO: object(x = 10, y = 20)"]
+        assert echoes == ["ECHO: 10", "ECHO: { x = 10; y = 20; }"]
 
     def test_empty_object_echo(self):
         _, echoes = run("echo(object());")
-        assert echoes == ["ECHO: object()"]
+        assert echoes == ["ECHO: { }"]
 
     def test_missing_key_is_undef(self):
         src = 'o = object(a=1); echo(o.nope); echo(o["nope"]); echo(o[0]);'
@@ -3742,7 +3742,7 @@ class TestObject:
     def test_str_formatting(self):
         src = 'echo(str(object(a=1, nested=object(x=10, y=20))));'
         _, echoes = run(src)
-        assert echoes == ['ECHO: "object(a = 1, nested = object(x = 10, y = 20))"']
+        assert echoes == ['ECHO: "{ a = 1; nested = { x = 10; y = 20; }; }"']
 
     def test_for_iterates_over_keys(self):
         src = "for (k = object(z=1, a=2, m=3)) echo(k);"
@@ -3762,13 +3762,13 @@ class TestObject:
         )
         _, echoes = run(src)
         assert echoes == [
-            "ECHO: object(a = 1, b = 2, c = 3)",
-            "ECHO: object(a = 1, b = 99, c = 3)",
+            "ECHO: { a = 1; b = 2; c = 3; }",
+            "ECHO: { a = 1; b = 99; c = 3; }",
         ]
 
     def test_merge_via_positional_list_of_pairs(self):
         _, echoes = run('echo(object([["x",10],["y",20]]));')
-        assert echoes == ["ECHO: object(x = 10, y = 20)"]
+        assert echoes == ["ECHO: { x = 10; y = 20; }"]
 
     def test_invalid_positional_arg_warns_and_is_undef(self):
         _, echoes = run("echo(object(1,2));")
@@ -3790,29 +3790,29 @@ class TestTextMetrics:
     def test_basic_left_baseline(self):
         _, echoes = run('echo(textmetrics(text="Hello", size=10));')
         assert echoes == [
-            "ECHO: object(position = [1.13932, -0.135634], size = [29.9276, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [0, 0], advance = [31.6501, 0])"
+            "ECHO: { position = [1.13932, -0.135634]; size = [29.9276, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [0, 0]; advance = [31.6501, 0]; }"
         ]
 
     def test_size_scales_linearly(self):
         _, echoes = run('echo(textmetrics(text="Hello", size=20));')
         assert echoes == [
-            "ECHO: object(position = [2.27865, -0.271267], size = [59.8551, 20.3993], "
-            "ascent = 20.128, descent = -0.271267, offset = [0, 0], advance = [63.3002, 0])"
+            "ECHO: { position = [2.27865, -0.271267]; size = [59.8551, 20.3993]; ascent = 20.128; "
+            "descent = -0.271267; offset = [0, 0]; advance = [63.3002, 0]; }"
         ]
 
     def test_single_char_no_descender(self):
         _, echoes = run('echo(textmetrics(text="A", size=10));')
         assert echoes == [
-            "ECHO: object(position = [0.0271267, 0], size = [9.20953, 9.55539], "
-            "ascent = 9.55539, descent = 0, offset = [0, 0], advance = [9.26378, 0])"
+            "ECHO: { position = [0.0271267, 0]; size = [9.20953, 9.55539]; ascent = 9.55539; "
+            "descent = 0; offset = [0, 0]; advance = [9.26378, 0]; }"
         ]
 
     def test_empty_text_is_all_zero(self):
         _, echoes = run('echo(textmetrics(text="", size=10));')
         assert echoes == [
-            "ECHO: object(position = [0, 0], size = [0, 0], ascent = 0, descent = 0, "
-            "offset = [0, 0], advance = [0, 0])"
+            "ECHO: { position = [0, 0]; size = [0, 0]; ascent = 0; descent = 0; offset = [0, 0]; "
+            "advance = [0, 0]; }"
         ]
 
     def test_halign_center_valign_center(self):
@@ -3820,8 +3820,8 @@ class TestTextMetrics:
             'echo(textmetrics(text="Hello", size=10, halign="center", valign="center"));'
         )
         assert echoes == [
-            "ECHO: object(position = [-14.6857, -5.09983], size = [29.9276, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [-15.8251, -4.96419], advance = [31.6501, 0])"
+            "ECHO: { position = [-14.6857, -5.09983]; size = [29.9276, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [-15.8251, -4.96419]; advance = [31.6501, 0]; }"
         ]
 
     def test_halign_right_valign_top(self):
@@ -3829,8 +3829,8 @@ class TestTextMetrics:
             'echo(textmetrics(text="Hello", size=10, halign="right", valign="top"));'
         )
         assert echoes == [
-            "ECHO: object(position = [-30.5108, -10.1997], size = [29.9276, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [-31.6501, -10.064], advance = [31.6501, 0])"
+            "ECHO: { position = [-30.5108, -10.1997]; size = [29.9276, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [-31.6501, -10.064]; advance = [31.6501, 0]; }"
         ]
 
     def test_halign_left_valign_bottom(self):
@@ -3838,21 +3838,21 @@ class TestTextMetrics:
             'echo(textmetrics(text="Hello", size=10, halign="left", valign="bottom"));'
         )
         assert echoes == [
-            "ECHO: object(position = [1.13932, 0], size = [29.9276, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [0, 0.135634], advance = [31.6501, 0])"
+            "ECHO: { position = [1.13932, 0]; size = [29.9276, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [0, 0.135634]; advance = [31.6501, 0]; }"
         ]
 
     def test_spacing_scales_advance_and_size(self):
         _, echoes = run('echo(textmetrics(text="Hello", size=10, spacing=1.5));')
         assert echoes == [
-            "ECHO: object(position = [1.13932, -0.135634], size = [41.8905, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [0, 0], advance = [47.4752, 0])"
+            "ECHO: { position = [1.13932, -0.135634]; size = [41.8905, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [0, 0]; advance = [47.4752, 0]; }"
         ]
 
         _, echoes = run('echo(textmetrics(text="Hello", size=10, spacing=2));')
         assert echoes == [
-            "ECHO: object(position = [1.13932, -0.135634], size = [53.8534, 10.1997], "
-            "ascent = 10.064, descent = -0.135634, offset = [0, 0], advance = [63.3002, 0])"
+            "ECHO: { position = [1.13932, -0.135634]; size = [53.8534, 10.1997]; ascent = 10.064; "
+            "descent = -0.135634; offset = [0, 0]; advance = [63.3002, 0]; }"
         ]
 
     def test_is_object_and_member_access(self):
@@ -3865,9 +3865,9 @@ class TestTextMetrics:
     def test_fontmetrics_structure(self):
         _, echoes = run("echo(fontmetrics(size=10));")
         assert echoes == [
-            "ECHO: object(nominal = object(ascent = 12.5732, descent = -2.94325), "
-            "max = object(ascent = 13.6108, descent = -4.21143), interline = 15.9709, "
-            'font = object(family = "Liberation Sans", style = "Regular"))'
+            "ECHO: { nominal = { ascent = 12.5732; descent = -2.94325; }; max = { ascent = 13.6108; "
+            'descent = -4.21143; }; interline = 15.9709; font = { family = "Liberation Sans"; '
+            'style = "Regular"; }; }'
         ]
 
     def test_fontmetrics_resolves_requested_font(self):
@@ -3880,15 +3880,15 @@ class TestTextMetrics:
         skip_unless_font_installed("Arial", "Arial")
         _, echoes = run('echo(fontmetrics(size=10, font="Arial"));')
         assert echoes == [
-            "ECHO: object(nominal = object(ascent = 12.5732, descent = -2.94325), "
-            "max = object(ascent = 13.9703, descent = -4.50982), interline = 15.9709, "
-            'font = object(family = "Arial", style = "Regular"))'
+            "ECHO: { nominal = { ascent = 12.5732; descent = -2.94325; }; max = { ascent = 13.9703; "
+            'descent = -4.50982; }; interline = 15.9709; font = { family = "Arial"; '
+            'style = "Regular"; }; }'
         ]
 
     def test_fontmetrics_reports_resolved_style(self):
         skip_unless_font_installed("Times New Roman:style=Bold", "Times New Roman")
         _, echoes = run('echo(fontmetrics(size=10, font="Times New Roman:style=Bold").font);')
-        assert echoes == ['ECHO: object(family = "Times New Roman", style = "Bold")']
+        assert echoes == ['ECHO: { family = "Times New Roman"; style = "Bold"; }']
 
     def test_textmetrics_resolves_requested_font(self):
         # Times New Roman's serif proportions measure differently from the
@@ -5157,7 +5157,7 @@ class TestCSGTreeStep5Extrusion:
             'echo(o.name, o.count, o.size, o.active, o.note, o.tags, o.nested.x, o.nested);'
         )
         _, echoes = run(src)
-        assert echoes == ['ECHO: "widget", 3, 2.5, true, undef, ["a", "b"], 1, object(x = 1, y = 2)']
+        assert echoes == ['ECHO: "widget", 3, 2.5, true, undef, ["a", "b"], 1, { x = 1; y = 2; }']
 
     def test_migrated_transform_wraps_migrated_rotate_extrude(self):
         bodies = run("translate([1,0,0]) rotate_extrude($fn=16) translate([5,0]) circle(1);")[0]
@@ -5565,13 +5565,13 @@ class TestRenderExpression:
 
     def test_2d(self):
         _, lines = run("echo(render() { square([2, 3]); });")
-        assert lines == ["ECHO: object(vertices = [[0, 0], [2, 0], [2, 3], [0, 3]], paths = [[0, 1, 2, 3]], "
-                         "area = 6, perimeter = 10, boundingbox = [[0, 0], [2, 3]], dim = 2)"]
+        assert lines == ["ECHO: { vertices = [[0, 0], [2, 0], [2, 3], [0, 3]]; paths = [[0, 1, 2, 3]]; "
+                         "area = 6; perimeter = 10; boundingbox = [[0, 0], [2, 3]]; dim = 2; }"]
 
     def test_empty(self):
         _, lines = run("echo(render() {});")
-        assert lines == ["ECHO: object(vertices = [], faces = [], volume = 0, area = 0, genus = 0, "
-                         "boundingbox = undef, dim = 0, vnf = [[], []])"]
+        assert lines == ["ECHO: { vertices = []; faces = []; volume = 0; area = 0; genus = 0; "
+                         "boundingbox = undef; dim = 0; vnf = [[], []]; }"]
 
     def test_cavity_genus_and_function_use(self):
         _, lines = run("function v(w) = render() { cube(w); }.volume; echo(v(3)); "

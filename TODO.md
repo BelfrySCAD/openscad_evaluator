@@ -44,8 +44,6 @@ Numbers and strings
 - Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
 - `[5:1:0]==[5:1:0]` is false (#146)
 - `[each "12"]` should split to characters; `[each [0:2]]` should expand the range (#146)
-- `object()` values echo as `object(a = 1, b = 2)`; OpenSCAD prints `{ a = 1; b = 2; }` and
-  `{ }` when empty (checked against 2026.02.01 with --enable=object-function)
 - `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
 
 Diagnostics
