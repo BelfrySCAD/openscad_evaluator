@@ -35,15 +35,14 @@ Numbers and strings
 - `-7%3` should be -1, `7%0` nan, `0^-1` inf (#99)
 - Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
 - `[5:1:0]==[5:1:0]` is false (#146)
-- `[each "12"]` should split to characters; `[each [0:2]]` should expand the range (#146)
+- Numbers of 7+ digits echo in full (`1212201`); OpenSCAD uses 6 significant digits
+  (`1.2122e+6`) -- `_format_number`
 - `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
 
 Diagnostics
 - Undeclared / extra arguments are silently dropped in `_bind_args` (#92)
 - Numeric builtins don't warn on a non-number ("cos() parameter could not be converted")
   (04797d0); argument/operand warnings in general, `abs(undef)`, `1+"a"` (#99)
-- Range of ≥1,000,000 elements: warn "Bad range parameter in for statement: too many elements"
-  and iterate zero times (f614e0d); `[for(i=[0:1:1/0]) i]` hangs instead (#147)
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)
 

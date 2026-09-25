@@ -103,6 +103,22 @@ def _minkowski_2d(a: m3d.CrossSection, b: m3d.CrossSection) -> m3d.CrossSection:
     return m3d.CrossSection.batch_boolean(sums, m3d.OpType.Add)
 
 
+def _range_count(r: "OscRange") -> float:
+    """How many elements a range has, without walking it: 0 when it is empty
+    (a NaN anywhere, or a step pointing away from the end), inf when it never
+    ends (a zero step toward a larger end, or an infinite end), as OpenSCAD
+    counts them."""
+    start, step, end = r.start, r.step, r.end
+    if math.isnan(start) or math.isnan(step) or math.isnan(end):
+        return 0
+    if step == 0:
+        return math.inf if start < end else 0
+    n = (end - start) / step
+    if n < -1e-10:
+        return 0
+    return math.inf if math.isinf(n) else math.floor(n + 1e-10) + 1
+
+
 def _cos_sin_deg(deg: float) -> tuple[float, float]:
     """cos and sin of `deg` degrees, exact at multiples of 90, so a quarter
     turn leaves no 6e-17 residue (a 2D shape turned edge-on would keep a
@@ -5026,7 +5042,7 @@ class Evaluator:
                 result.extend(self._eval_children(node.body, parent_ctx))
                 return
             assign_node, name = _av_pairs[depth]
-            for val in self._loop_values(self._eval_expr(assign_node.expr, parent_ctx)):
+            for val in self._loop_values(self._eval_expr(assign_node.expr, parent_ctx), assign_node):
                 child = parent_ctx.child_ctx(children_nodes=ctx.children_nodes,
                                              children_caller_ctx=ctx.children_caller_ctx)
                 child.let[name] = val
@@ -5037,17 +5053,30 @@ class Evaluator:
         _nested(0, ctx)
         return result
 
-    @staticmethod
-    def _loop_values(values) -> list:
+    _MAX_RANGE_ELEMENTS = 1_000_000
+
+    def _loop_values(self, values, at=None) -> list:
         """What a `for` iterates over: a range's elements, an object's keys,
         a string's characters, a list as is, undef as nothing, and any other
-        single value once."""
+        single value once.
+
+        A range of a million elements or more is refused, with a warning and
+        no iterations, as OpenSCAD does -- `[0:1:1/0]` iterated forever. The
+        limit is per range (two 1100-element ranges make 1.2M iterations
+        fine); `at` is the node the warning names."""
         if values is None:
             return []
         t = type(values)
         if t is list:
             return values
-        if t is OscRange or t is OscObject or t is str:
+        if t is OscRange:
+            n = _range_count(values)
+            if n >= self._MAX_RANGE_ELEMENTS:
+                self._echo_fn(f"WARNING: Bad range parameter in for statement: too many elements "
+                              f"({min(n, 4294967295)}){self._loc(getattr(at, 'position', None))}")
+                return []
+            return list(values) if n else []
+        if t is OscObject or t is str:
             return list(values)
         return [values]
 
@@ -5074,7 +5103,7 @@ class Evaluator:
                 group_sizes.append(len(self._tree_stack[-1]) - before)
                 return
             assign = assigns[depth]
-            for val in self._loop_values(self._eval_expr(assign.expr, parent_ctx)):
+            for val in self._loop_values(self._eval_expr(assign.expr, parent_ctx), assign):
                 loop_ctx = parent_ctx.child_ctx(children_nodes=ctx.children_nodes,
                                                 children_caller_ctx=ctx.children_caller_ctx)
                 loop_ctx.let[assign.name.name] = val
@@ -5668,6 +5697,8 @@ class Evaluator:
                     v = self._eval_expr(inner, ctx)
                     if type(v) is list:
                         result.extend(v)
+                    elif type(v) is OscRange or type(v) is str:
+                        result.extend(self._loop_values(v, elem))  # elements / characters
                     elif v is not None:
                         result.append(v)
                 self._expr_depth -= 1
@@ -5737,6 +5768,8 @@ class Evaluator:
             self._expr_depth -= 1
             if type(v) is list:
                 return v
+            if type(v) is OscRange or type(v) is str:
+                return self._loop_values(v, body)  # `each` expands a range, splits a string
             return [v] if v is not None else []
         if self._debugging:
             self._check_debug(body, ctx, expr_level=True)
@@ -5746,7 +5779,7 @@ class Evaluator:
     def _eval_listcomp_for(self, node: ListCompFor, ctx: EvalContext) -> list:
         # Ranges are evaluated inside the loops before them -- see _eval_for.
         _av_pairs = [(assign, assign.name.name) for assign in node.assignments]
-        _loop_values = self._loop_values
+        _loop_values = self._loop_values  # bound: it warns
 
         result = []
         _debugging = self._debugging
@@ -5764,7 +5797,7 @@ class Evaluator:
             assign_node, name = _av_pairs[depth]
             values = self._eval_expr(assign_node.expr, parent_ctx)
             if type(values) is not list:
-                values = _loop_values(values)
+                values = _loop_values(values, assign_node)
             for val in values:
                 child = parent_ctx.let_child_ctx()
                 child.let[name] = val

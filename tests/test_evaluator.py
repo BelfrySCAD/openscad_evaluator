@@ -2523,9 +2523,11 @@ class TestRangeEdgeCases:
         assert lines == ["ECHO: [1 : 0 : 5]"]
 
     def test_range_zero_step_iteration(self):
-        # iterating a zero-step range produces no values
+        # iterating a zero-step range produces no values -- and, toward a
+        # larger end, never ends, which OpenSCAD reports as too many elements
         _, lines = run("echo([for (i=[1:0:5]) i]);")
-        assert lines == ["ECHO: []"]
+        assert lines == ["WARNING: Bad range parameter in for statement: too many elements "
+                         "(4294967295) in file <string>, line 1", "ECHO: []"]
 
     def test_range_indexing(self):
         # Indexing a range yields its [start, step, end] components, not its
@@ -5735,3 +5737,64 @@ class TestCSGBackports:
         bodies, _ = run(src)  # produced nothing
         assert bodies[0].section.area() == approx(area, rel=1e-5)  # OpenSCAD's, via float32 OFF
         assert bodies[0].section.bounds() == pytest.approx(bounds, abs=1e-6)
+
+
+
+class TestHugeRanges:
+    """A range of a million elements or more is refused with a warning and no
+    iterations, as OpenSCAD does; `[0:1:1/0]` iterated forever. Expected
+    output is OpenSCAD 2026.02.01's."""
+
+    @staticmethod
+    def _warning(n, line=1):
+        return (f"WARNING: Bad range parameter in for statement: too many elements ({n}) "
+                f"in file <string>, line {line}")
+
+    def test_just_under_the_limit_iterates(self):
+        _, lines = run("echo(len([for (i=[0:999998]) i]));")
+        assert lines == ["ECHO: 999999"]
+
+    @pytest.mark.parametrize("rng, n", [
+        ("[0:999999]", 1000000),
+        ("[0:0.5:499999.5]", 1000000),
+        ("[999999:-1:0]", 1000000),
+        ("[0:1:1/0]", 4294967295),       # hung
+        ("[0:-1:-1/0]", 4294967295),
+        ("[0:0:5]", 4294967295),
+    ])
+    def test_refused(self, rng, n):
+        _, lines = run(f"echo(len([for (i={rng}) i]));")
+        assert lines == [self._warning(n), "ECHO: 0"]
+
+    @pytest.mark.parametrize("rng", ["[0/0:1:-1]", "[0:1:0/0]", "[0:0/0:5]", "[5:0:0]", "[0:0:0]"])
+    def test_empty_and_silent(self, rng):
+        _, lines = run(f"echo([for (i={rng}) i]);")
+        assert lines == ["ECHO: []"]
+
+    def test_limit_is_per_range(self):
+        _, lines = run("echo(len([for (i=[0:1100], j=[0:1100]) 1]));")
+        assert lines == ["ECHO: 1212201"]
+
+    def test_statement_for(self):
+        bodies, lines = run("for (i=[0:2000000]) cube(1);")
+        assert bodies == [] and lines == [self._warning(2000001)]
+
+    def test_each(self):
+        _, lines = run("x = [each [0:2000000]]; echo(len(x));")
+        assert lines == [self._warning(2000001), "ECHO: 0"]
+
+
+class TestEach:
+    """`each` expands a range and splits a string, as OpenSCAD does."""
+
+    @pytest.mark.parametrize("src, out", [
+        ('[each "12"]', '["1", "2"]'),
+        ("[each [0:2]]", "[0, 1, 2]"),
+        ("[each 5]", "[5]"),
+        ("[each undef]", "[]"),
+        ("[1, each [2,3], 4]", "[1, 2, 3, 4]"),
+        ('[for (s=["ab"]) each s]', '["a", "b"]'),
+    ])
+    def test_each(self, src, out):
+        _, lines = run(f"echo({src});")
+        assert lines == [f"ECHO: {out}"]
