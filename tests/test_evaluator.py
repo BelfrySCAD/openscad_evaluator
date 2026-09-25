@@ -5500,6 +5500,33 @@ class TestFlatPreview:
         assert boxes == [[0, 0, -1, 35, 35, 0], [-5, -5, 0, 5, 5, 1]]
 
 
+class TestLinearSolve:
+    """Output identical to openscad_cpp_evaluator's (#120, #122, #125)."""
+
+    def test_square_least_squares_min_norm(self):
+        _, lines = run("echo(linear_solve([[2,1],[1,3]], [5,10]));"
+                       "echo(linear_solve([[1,1],[1,2],[1,3]], [1,2,2]));"
+                       "echo(linear_solve([[1,2,3],[4,5,6]], [1,2]));")
+        assert lines == ["ECHO: { x = [1, 3]; det = 5; singular = false; }",
+                         "ECHO: { x = [0.666667, 0.5]; det = undef; singular = false; }",
+                         "ECHO: { x = [-0.0555556, 0.111111, 0.277778]; det = undef; singular = false; }"]
+
+    def test_singular_and_relative_tolerance(self):
+        _, lines = run("echo(linear_solve([[1,2],[2,4]], [1,2])); echo(linear_solve([[2,0],[0,2]]*1e-10, [1,1]).x);")
+        assert lines == ["ECHO: { x = undef; det = 0; singular = true; }", "ECHO: [5e+9, 5e+9]"]
+
+    def test_undef_b_is_absent_and_matrix_b(self):
+        _, lines = run("echo(linear_solve([[4,3],[6,3]], undef)); echo(linear_solve([[1,2],[3,4]], [[1,0],[0,1]]).x);")
+        assert lines == ["ECHO: { x = undef; det = -6; singular = false; }", "ECHO: [[-2, 1], [1.5, -0.5]]"]
+
+    def test_bad_arguments_warn(self):
+        _, lines = run('echo(linear_solve(5)); echo(linear_solve([1,2])); echo(linear_solve([[1,2],[3,4]], [1]));')
+        assert [l.removesuffix(" in file <string>, line 1") for l in lines if l.startswith("WARNING")] == [
+            "WARNING: linear_solve() parameter could not be converted: argument 0: expected vector, found number (5)",
+            "WARNING: linear_solve() requires a matrix of numbers",
+            "WARNING: linear_solve() right-hand side must be a vector of 2 numbers, or a matrix with that many rows"]
+
+
 class TestOpenMeshes:
     """An open mesh -- faces that don't close a solid -- used to vanish without
     a word, since Manifold returns an empty body for it. OpenSCAD draws it; so
