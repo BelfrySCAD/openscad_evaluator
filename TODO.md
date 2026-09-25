@@ -12,10 +12,6 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 ### Bug fixes
 
-Builtin arguments
-- `font` style ignored in `text()`/`textmetrics()`/`fontmetrics()` (#163, #164); `:style=bold`
-  falls back to Regular when `fc-match` is missing, i.e. always on macOS (#171)
-
 Diagnostics
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)

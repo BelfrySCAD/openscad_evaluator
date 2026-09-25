@@ -1941,7 +1941,12 @@ def _fmt_fn(n) -> str:
     return str(n)
 
 
-_FONT_PATH = Path(__file__).parent / "resources" / "fonts" / "LiberationSans-Regular.ttf"
+_FONT_DIR = Path(__file__).parent / "resources" / "fonts"
+_FONT_PATH = _FONT_DIR / "LiberationSans-Regular.ttf"
+# The bundled family's faces by lower-cased style, so "Liberation Sans:style=Bold"
+# needs no fc-match (absent on macOS, and elsewhere it may know another font).
+_BUNDLED_STYLES = {"regular": "Regular", "bold": "Bold", "italic": "Italic", "oblique": "Italic",
+                   "bold italic": "BoldItalic", "bold oblique": "BoldItalic"}
 _font_table_cache: dict[tuple[str, int], dict] = {}  # (path, ttc_index) → font tables
 
 
@@ -1991,6 +1996,16 @@ def _resolve_font(font_spec: str) -> dict:
         return _load_default_font()
     if font_spec in _font_spec_cache:
         return _font_spec_cache[font_spec]
+    family, _, rest = font_spec.partition(":")
+    style = next((kv.partition("=")[2] for kv in rest.split(":") if kv.strip().lower().startswith("style=")), "")
+    # A style with no family (":style=Bold") names the default family, as
+    # fontconfig reads it and BOSL2's text3d() example expects.
+    if family.strip() in ("", "Liberation Sans"):
+        face = _BUNDLED_STYLES.get(style.strip().lower() or "regular")
+        if face is not None:
+            tables = _font_tables_from_path(str(_FONT_DIR / f"LiberationSans-{face}.ttf"), 0)
+            _font_spec_cache[font_spec] = tables
+            return tables
     try:
         import subprocess as _sp
         result = _sp.run(
@@ -5378,7 +5393,7 @@ class Evaluator:
         args, ctx = self._resolve_call_args(node, ctx)
         text = self._get_arg(args, 0, "text", "")
         size = self._get_arg(args, 1, "size", 10)
-        font_spec = self._get_arg(args, None, "font", "") or ""
+        font_spec = self._get_arg(args, 2, "font", "") or ""  # positional, but nothing after it is
         halign = self._get_arg(args, None, "halign", "left")
         valign = self._get_arg(args, None, "valign", "baseline")
         spacing = self._get_arg(args, None, "spacing", 1)
@@ -6909,11 +6924,12 @@ class Evaluator:
         `script` are accepted but unused; see docs/evaluator.md for known gaps.
         """
         text = self._get_arg(args, 0, "text", "")
+        # All nine positional, unlike text(), which takes only font that way.
         size = self._get_arg(args, 1, "size", 10)
-        halign = self._get_arg(args, None, "halign", "left")
-        valign = self._get_arg(args, None, "valign", "baseline")
-        spacing = self._get_arg(args, None, "spacing", 1)
-        font_spec = self._get_arg(args, None, "font", "") or ""
+        halign = self._get_arg(args, 6, "halign", "left")
+        valign = self._get_arg(args, 7, "valign", "baseline")
+        spacing = self._get_arg(args, 8, "spacing", 1)
+        font_spec = self._get_arg(args, 2, "font", "") or ""
 
         font = _resolve_font(str(font_spec))
         m = _measure_text(text, size, spacing, font)
@@ -6946,7 +6962,7 @@ class Evaluator:
         bundled Liberation Sans if `font=` is unset, `fc-match` is
         unavailable, or the font can't be found."""
         size = self._get_arg(args, 0, "size", 10)
-        font_spec = self._get_arg(args, None, "font", "") or ""
+        font_spec = self._get_arg(args, 1, "font", "") or ""
 
         font = _resolve_font(str(font_spec))
         head, hhea = font["head"], font["hhea"]
