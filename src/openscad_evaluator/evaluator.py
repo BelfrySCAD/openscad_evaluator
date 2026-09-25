@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 import math
 import re
+import sys
 import random
 import threading
 import time
@@ -2684,11 +2685,11 @@ class ManifoldCache:
 # for a future feature is safe. OpenSCAD silently ignores unknown arguments
 # (children(separate=true) renders the wrong shape there), so guarding on this
 # is how a script refuses. Names shared with openscad_cpp_evaluator (#113, #115);
-# levelset, mesh-repair and export-name are not implemented here.
+# mesh-repair and export-name are not implemented here.
 _FEATURE_LEVELS = {
     "render-expr": 1, "linear-solve": 1, "polyhedron-vnf": 1, "separate-children": 1,
     "minkowski-diff": 1, "sphere-styles": 1, "simplify-op": 1, "expr-import": 1,
-    "object-function": 1, "roof-op": 1, "svg-class": 1,
+    "object-function": 1, "roof-op": 1, "svg-class": 1, "levelset": 1,
 }
 
 
@@ -2939,6 +2940,7 @@ class Evaluator:
             "minkowski": self._resolve_minkowski,
             "minkowski_difference": self._resolve_minkowski,
             "simplify": self._resolve_simplify,
+            "levelset": self._resolve_levelset,
             "offset": self._resolve_offset,
             "projection": self._resolve_projection,
             "union": self._resolve_csg,
@@ -2978,6 +2980,7 @@ class Evaluator:
             "minkowski": self._generate_minkowski,
             "minkowski_difference": self._generate_minkowski_difference,
             "simplify": self._generate_simplify,
+            "levelset": self._generate_levelset,
             "offset": self._generate_offset,
             "projection": self._generate_projection,
             "union": self._generate_csg,
@@ -3511,6 +3514,8 @@ class Evaluator:
         # rands() was called anywhere while resolving it -- see CSGNode's
         # uncacheable docstring.
         uncacheable = (self._rands_call_count != rands_before) or any(c.uncacheable for c in children)
+        # A closure in the params can't be keyed by content, only identity (cpp #136).
+        uncacheable = uncacheable or (kind == "levelset" and type(params.get("field")) is Closure)
         tree_node = CSGNode(kind=kind, node=node, bodies=[],
                              is_builtin=is_builtin, children=children, params=params,
                              uncacheable=uncacheable,
@@ -4009,6 +4014,7 @@ class Evaluator:
         "color": ("c", "alpha"),
         "union": (), "difference": (), "intersection": (), "hull": (), "fill": (),
         "minkowski": ("convexity",), "minkowski_difference": (), "simplify": ("tolerance",),
+        "levelset": ("field", "bounds", "isovalue", "invert", "edge"),
         "children": ("index", "separate"), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
                    "filename", "layername", "center", "dpi", "id", "class"),
@@ -6075,6 +6081,116 @@ class Evaluator:
         args, ctx = self._resolve_call_args(node, ctx)
         self._eval_children(node.children, ctx)
         return {"tolerance": self._get_arg(args, 0, "tolerance")}
+
+    def _resolve_levelset(self, node: ModularCall, ctx: EvalContext) -> dict:
+        args, ctx = self._resolve_call_args(node, ctx)
+        self._eval_children(node.children, ctx)
+        return {"field": self._get_arg(args, 0, "field"), "bounds": self._get_arg(args, 1, "bounds"),
+                "isovalue": self._get_arg(args, 2, "isovalue"), "invert": self._get_arg(args, 3, "invert", False),
+                "edge": self._get_arg(args, 4, "edge"), "color": ctx.color}
+
+    def _generate_levelset(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        """levelset(field, bounds, isovalue, invert, edge): a solid, or a
+        section, from an implicit surface -- 2D or 3D decided by `bounds`,
+        `field` a grid (field[i][j] / [i][j][k]) or a function(x,y[,z]).
+        Not in OpenSCAD; see levelset.py and openscad_cpp_evaluator #124-#127.
+        The sign follows distance fields (smaller is inside); Manifold's is
+        the other way, so the band flips it and invert flips back."""
+        from . import levelset as ls
+        pos = getattr(node, "position", None)
+
+        def warn(msg):
+            self._echo_fn(f"WARNING: levelset(): {msg}{self._loc(pos)}")
+            return []
+
+        def nums(v):
+            return v if type(v) is list and all(type(x) in (int, float) and x == x for x in v) else None
+
+        field, fn = params["field"], None
+        if type(field) is Closure:
+            fn = field
+            if len(fn.fn.parameters or []) < 2:
+                return warn("the field function needs function(x,y) for 2D or function(x,y,z) for 3D")
+        b = params["bounds"]
+        lo, hi = (nums(b[0]), nums(b[1])) if type(b) is list and len(b) == 2 else (None, None)
+        if lo is None or hi is None or len(lo) != len(hi) or len(lo) not in (2, 3):
+            return warn("bounds must be [[x0,y0],[x1,y1]] or [[x0,y0,z0],[x1,y1,z1]]")
+        if not all(h > l for l, h in zip(lo, hi)):
+            return warn("bounds must be increasing along every axis")
+        iso, iso_lo, iso_hi = params["isovalue"], -math.inf, 0.0
+        if type(iso) in (int, float):
+            iso_hi = float(iso)
+        elif iso is not None:  # undef is absent (cpp #125): BOSL2's wrapper forwards it
+            pair = nums(iso)
+            if pair is None or len(pair) != 2:
+                return warn("isovalue must be a number or a [low, high] range")
+            iso_lo, iso_hi = pair
+            if not iso_hi > iso_lo:
+                return warn("isovalue range must be increasing")
+        invert = bool(params["invert"])
+
+        def band(v):
+            return ls.band_distance(v, iso_lo, iso_hi, invert)
+
+        edge = params["edge"]
+        if type(edge) in (int, float) and not edge > 0:
+            warn("edge must be positive")
+        edge = float(edge) if type(edge) in (int, float) and edge > 0 else 0.0
+        if fn is not None and edge <= 0:
+            return warn("a function field needs edge= (the sample spacing)")
+
+        call = None
+        if fn is not None:
+            # No live context at generate time: a root from the closure's own
+            # scope, so $-variables sit at their defaults inside it.
+            fctx = EvalContext(scope=fn.fn.scope or self._root_ctx.scope)
+            fctx.let = dict(fn.let)
+            names = [p.name.name for p in fn.fn.parameters]
+
+            def call(*xyz):
+                for n, x in zip(names, xyz):
+                    fctx.let[n] = x
+                v = self._eval_expr(fn.fn.body, fctx)
+                return band(float(v) if type(v) in (int, float) and math.isfinite(v) else sys.float_info.max)
+
+        color = params["color"]
+        if len(lo) == 2:
+            if fn is None:
+                grid = field if (type(field) is list and len(field) >= 2 and all(
+                    nums(r) is not None and len(r) == len(field[0]) >= 2 for r in field)) else None
+                if grid is None:
+                    if type(field) is list and field and type(field[0]) is list and field[0] and type(field[0][0]) is list:
+                        return warn("a 2D field must be field[i][j]; a 3D array was given")
+                    return warn("2D field must be a rectangular field[i][j] of numbers")
+                cs = ls.section_2d(lambda i, j: band(grid[i][j]), len(grid), len(grid[0]), lo, hi)
+            else:
+                nx = int(math.floor((hi[0] - lo[0]) / edge)) + 1
+                ny = int(math.floor((hi[1] - lo[1]) / edge)) + 1
+                if nx < 2 or ny < 2:
+                    return warn("edge is larger than the bounds")
+                sx, sy = (hi[0] - lo[0]) / (nx - 1), (hi[1] - lo[1]) / (ny - 1)
+                cs = ls.section_2d(lambda i, j: call(lo[0] + i * sx, lo[1] + j * sy), nx, ny, lo, hi)
+            return [ColoredBody(section=cs, color=color)] if cs is not None else []
+
+        if fn is None:
+            ok = (type(field) is list and field and all(type(r) is list and len(r) == len(field[0]) and r for r in field)
+                  and all(type(c) is list and len(c) == len(field[0][0]) and nums(c) is not None
+                          for r in field for c in r))
+            if not ok:
+                return warn("field must be a function(x,y,z) or a rectangular field[i][j][k] of numbers")
+            n = (len(field), len(field[0]), len(field[0][0]))
+            if min(n) < 2:
+                return warn("the field needs at least 2 samples along each axis")
+            spacing = [(hi[a] - lo[a]) / (n[a] - 1) for a in range(3)]
+            if edge <= 0:
+                edge = min(spacing)  # finer than the grid buys nothing
+            sample = ls.grid_sampler(field, lo, spacing, band, invert)
+        else:
+            if len(fn.fn.parameters) < 3:
+                return warn("a 3D field function needs three parameters, as in function(x,y,z) ...")
+            sample = call
+        body = ls.solid_3d(sample, lo, hi, edge)
+        return [self._tag_generated(body, node, color)] if body is not None else []
 
     _SIMPLIFY_FRACTION = 0.001  # of the bounding-box diagonal, when no tolerance is given
 
