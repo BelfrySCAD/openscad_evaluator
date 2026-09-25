@@ -20,10 +20,5 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
-Language extensions
-
-Export
-- Formats: AMF, PLY, VRML, X3D, ASCII STL, SVG (#159), PDF with ruler/page options (#160)
-
 Tools and API
 - Real text shaping (kerning, bidi) — optional, large (#96)
