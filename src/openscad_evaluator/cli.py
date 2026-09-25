@@ -25,7 +25,7 @@ import signal
 import sys
 
 
-from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile
+from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile, strict_commas
 
 from openscad_evaluator._debug_repl import DebugRepl, DeclInfo
 from openscad_evaluator.evaluator import (
@@ -160,6 +160,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--pdf-no-scale", action="store_true",
                         help="Leave the ruler and its caption off a .pdf, drawing the model alone")
     parser.add_argument("--pdf-grid", action="store_true", help="Draw a grid across a .pdf page")
+    parser.add_argument(
+        "--strict-commas", action="store_true",
+        help="Reject the trailing commas OpenSCAD 2021.01 rejected: in call arguments and "
+             "let/for assignments (cube(1,), let(x=1,)); list literals and parameter lists keep theirs",
+    )
     parser.add_argument("--debug", action="store_true", help="Run under an interactive, gdb-style debugger")
     parser.add_argument("--profile", metavar="FILENAME", help="Write a per-call-site profiling report to FILENAME")
     parser.add_argument(
@@ -183,7 +188,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    # The whole run, not just the first parse: use<>d and included files
+    # are parsed along the way, and strictness must reach them too.
+    with strict_commas(args.strict_commas):
+        return _run(args)
 
+
+def _run(args) -> int:
     try:
         fmt = args.format or format_for_path(args.output)
     except ValueError as e:
