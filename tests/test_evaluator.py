@@ -5489,6 +5489,17 @@ class TestBackportedSilentBugs:
 _OPEN_TETRA = "polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], [[0,1,2],[0,3,1],[0,2,3]])"
 
 
+class TestFlatPreview:
+    """cpp #138: a 1-unit slab, as OpenSCAD's 2D preview is, at the Z a
+    translate put it."""
+
+    def test_slab_is_one_unit_and_keeps_its_z(self):
+        from openscad_evaluator.evaluator import to_renderable_bodies
+        bodies, _ = run("translate([0,0,-1]) square(35); circle(5);")
+        boxes = [[round(v, 6) for v in b.body.bounding_box()] for b in to_renderable_bodies(bodies)]
+        assert boxes == [[0, 0, -1, 35, 35, 0], [-5, -5, 0, 5, 5, 1]]
+
+
 class TestOpenMeshes:
     """An open mesh -- faces that don't close a solid -- used to vanish without
     a word, since Manifold returns an empty body for it. OpenSCAD draws it; so
