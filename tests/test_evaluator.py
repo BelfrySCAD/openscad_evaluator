@@ -3828,6 +3828,36 @@ class TestOperandWarnings:
         ]
 
 
+class TestErosionAndSimplify:
+    """minkowski_difference() and simplify(), not in OpenSCAD (cpp #101,
+    #103). Erosion volumes match openscad_cpp_evaluator's exactly."""
+
+    def test_erosion_by_a_cube_is_exact(self):
+        bodies, _ = run("minkowski_difference() { cube(10, center=true); cube(2, center=true); }")
+        assert bodies[0].body.volume() == pytest.approx(512)
+        assert [round(v, 9) for v in bodies[0].body.bounding_box()] == [-4, -4, -4, 4, 4, 4]
+
+    def test_erosion_of_one_child_is_a_no_op(self):
+        bodies, _ = run("minkowski_difference() cube(5);")
+        assert bodies[0].body.volume() == pytest.approx(125)
+
+    def test_simplify_reduces_and_keeps_genus(self):
+        src = ("difference() { sphere(20, $fn=64); for (a=[0:60:300]) rotate([0,0,a]) "
+               "rotate([90,0,0]) cylinder(h=50, r=4, $fn=32); }")
+        (dense,), _ = run(src)
+        (simple,), _ = run(f"simplify() {src}")
+        assert simple.body.num_tri() < dense.body.num_tri()
+        assert simple.body.genus() == dense.body.genus()
+        assert simple.body.volume() == pytest.approx(dense.body.volume(), rel=1e-3)
+
+    def test_simplify_2d_and_bad_tolerances(self):
+        bodies, lines = run("simplify(0.5) circle(10, $fn=128); simplify(-1) cube(3); simplify(\"x\") cube(3);")
+        assert len(bodies[0].section.to_polygons()[0]) < 128
+        assert [l.removesuffix(" in file <string>, line 1") for l in lines] == [
+            "WARNING: simplify: tolerance must not be negative",
+            "WARNING: simplify: tolerance must be a number"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit

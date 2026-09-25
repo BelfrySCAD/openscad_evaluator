@@ -80,6 +80,8 @@ Empty statements follow OpenSCAD's rule, checked case by case against it: **a st
 
 **Topology**: `hull`, `minkowski`, `projection`
 
+**Extensions, not in OpenSCAD** (ported from openscad_cpp_evaluator): `minkowski_difference()` erodes its first child by each later one in turn (Manifold's `minkowski_difference`; 3D only, since 2D already has `offset(r=-N)`, and one child is a no-op like `minkowski()`'s). `simplify(tolerance)` decimates solids and sections within `tolerance`, defaulting to 0.1% of each body's own bounding-box diagonal -- `simplify(0)` falls back to Manifold's epsilon and changes nothing, and an absolute default right in millimetres is wrong in metres. Genus and originalID runs survive; `tri_colors` is dropped, since the triangle count changes.
+
 **Control / utility**: `for`, `intersection_for`, `let`, `if`/`else`, `echo`, `assert` (modular + expression forms), `render`, `children()`, `breakpoint()`
 
 **Modular modifiers** — OpenSCAD's prefix operators applied to module calls. Each modifier tags the resulting `ColoredBody` list via the `role` field and/or filters the output:
