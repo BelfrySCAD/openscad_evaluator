@@ -887,6 +887,58 @@ def _trace_face(adjacency: dict, u: tuple, v: tuple) -> Optional[list]:
     return None
 
 
+_SVG_UNIT = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(em|ex|px|in|cm|mm|pt|pc|%)?\s*$")
+
+
+def _svg_page_map(contours: list, root, dpi: float, center: bool) -> list:
+    """Place SVG user-unit contours as OpenSCAD's import_svg.cc does: the
+    page's width/height to millimetres (a unitless length at `dpi`, 72 by
+    default; px at 96), the viewBox scaled onto it under
+    preserveAspectRatio (default xMidYMid meet), and Y flipped about the
+    page height -- or, with center=true, about the drawing's own centre.
+    Without this a 100-unit drawing came in 2.8x too large and upside down
+    below the X axis."""
+    def length(attr, viewbox, valid):
+        m = _SVG_UNIT.match(root.get(attr) or "")
+        if m is None:  # absent: rely on the dpi, as older Illustrator files do
+            return 25.4 * viewbox / dpi if valid else 0.0
+        n, unit = float(m.group(1)), m.group(2)
+        return {None: 25.4 * n / dpi, "px": 25.4 * n / 96, "pt": 25.4 * n / 72, "pc": 25.4 * n / 6,
+                "in": 25.4 * n, "cm": 10 * n, "mm": n,
+                "%": 25.4 * n / 100 * viewbox / dpi if valid else 0.0}.get(unit, viewbox if valid else 0.0)
+
+    vb = [float(x) for x in re.split(r"[\s,]+", (root.get("viewBox") or "").strip()) if x]
+    valid = len(vb) == 4 and vb[2] >= 0 and vb[3] >= 0
+    width_mm = length("width", vb[2] if valid else 0.0, valid)
+    height_mm = length("height", vb[3] if valid else 0.0, valid)
+    sx = sy = 1.0
+    vbx = vby = ax = ay = 0.0
+    if valid:
+        wm, hm = _SVG_UNIT.match(root.get("width") or ""), _SVG_UNIT.match(root.get("height") or "")
+        vbx = vb[0] * (float(wm.group(1)) / 100 if wm and wm.group(2) == "%" else 1.0)
+        vby = vb[1] * (float(hm.group(1)) / 100 if hm and hm.group(2) == "%" else 1.0)
+        sx, sy = (width_mm / vb[2] if vb[2] else 0.0), (height_mm / vb[3] if vb[3] else 0.0)
+        par = (root.get("preserveAspectRatio") or "").split()
+        par = par[1:] if par[:1] == ["defer"] else par
+        align = par[0] if par else "xMidYMid"
+        if align != "none":
+            sx = sy = min(sx, sy) if (par[1:2] or ["meet"])[0] != "slice" else max(sx, sy)
+            where = {"Min": 0.0, "Mid": 0.5, "Max": 1.0}
+            if len(align) == 8 and align[1:4] in where and align[5:8] in where:
+                ax = where[align[1:4]] * (width_mm - sx * vb[2])
+                ay = where[align[5:8]] * (height_mm - sy * vb[3])
+            else:  # malformed: OpenSCAD keeps its xMidYMid default
+                ax, ay = 0.5 * (width_mm - sx * vb[2]), 0.5 * (height_mm - sy * vb[3])
+    if center:
+        pts = [(sx * x, sy * y) for c in contours for x, y in c]
+        cx = (min(p[0] for p in pts) + max(p[0] for p in pts)) / 2 if pts else 0.0
+        cy = (min(p[1] for p in pts) + max(p[1] for p in pts)) / 2 if pts else 0.0
+    else:
+        cx, cy = -ax, height_mm - ay
+    # -vby - y, not y - vby: OpenSCAD's own formula, kept for parity.
+    return [[(sx * (x - vbx) - cx, sy * (-vby - y) + cy) for x, y in c] for c in contours]
+
+
 _SPHERE_STYLES = ("orig", "aligned", "stagger", "octa", "icosa")
 
 
@@ -5395,7 +5447,9 @@ class Evaluator:
                 filtered = any(isinstance(self._get_arg(args, None, k), str) for k in ("id", "class"))
                 try:
                     contours = self._load_svg_contours(path, node, self._get_arg(args, None, "id"),
-                                                       self._get_arg(args, None, "class"))
+                                                       self._get_arg(args, None, "class"),
+                                                       self._get_arg(args, None, "dpi", 72.0),
+                                                       bool(self._get_arg(args, None, "center", False)))
                 except Exception as e:
                     self.error(f"import: {e}", node)
                     return {"color": color}
@@ -5465,7 +5519,9 @@ class Evaluator:
                 return self._import_as_vnf(path, ext, node)
             elif ext in (".dxf", ".svg"):
                 return self._import_as_region(path, ext, layer, node,
-                                              self._get_arg(args, None, "id"), self._get_arg(args, None, "class"))
+                                              self._get_arg(args, None, "id"), self._get_arg(args, None, "class"),
+                                              self._get_arg(args, None, "dpi", 72.0),
+                                              bool(self._get_arg(args, None, "center", False)))
             else:
                 self.error(f"import: unsupported file type '{ext}'", node)
                 return None
@@ -5503,13 +5559,14 @@ class Evaluator:
             faces_out.append(fi)
         return [verts_out, faces_out]
 
-    def _import_as_region(self, path: str, ext: str, layer: Any, node, id_=None, cls=None) -> Any:
+    def _import_as_region(self, path: str, ext: str, layer: Any, node, id_=None, cls=None,
+                          dpi=72.0, center: bool = False) -> Any:
         """Load a 2D file and return a Region: [[[x,y],...], ...]."""
         try:
             if ext == ".dxf":
                 contours = self._load_dxf_contours(path, layer, node)
             else:
-                contours = self._load_svg_contours(path, node, id_, cls)
+                contours = self._load_svg_contours(path, node, id_, cls, dpi, center)
         except Exception as e:
             self.error(f"import: {e}", node)
             return None
@@ -5746,7 +5803,8 @@ class Evaluator:
                     contours.append(pts)
         return contours
 
-    def _load_svg_contours(self, path: str, node=None, id_=None, cls=None) -> list[list[tuple[float, float]]]:
+    def _load_svg_contours(self, path: str, node=None, id_=None, cls=None, dpi=72.0,
+                           center: bool = False) -> list[list[tuple[float, float]]]:
         """The SVG's filled outlines. `id_` (upstream's) and `cls` (this
         port's, supported_feature("svg-class")) select elements: a match is
         taken whole, so id= on a <g> means that group, with the transforms
@@ -5788,7 +5846,7 @@ class Evaluator:
 
         def _apply(pt: tuple, mat: np.ndarray) -> tuple:
             v = mat @ np.array([pt[0], pt[1], 1.0])
-            return (float(v[0]), float(-v[1]))  # flip Y: SVG down→OpenSCAD up
+            return (float(v[0]), float(v[1]))  # SVG user units; _svg_page_map places them
 
         def _cubic(p0, p1, p2, p3):
             pts = []
@@ -5935,10 +5993,12 @@ class Evaluator:
             return out
 
         tree = _ET.parse(path)
+        root = tree.getroot()
+        dpi = float(dpi) if type(dpi) in (int, float) and dpi > 0 else 72.0
         id_ = id_ if isinstance(id_, str) else None
         cls = cls if isinstance(cls, str) else None
         if id_ is None and cls is None:
-            return _walk(tree.getroot(), np.eye(3, dtype=np.float64))
+            return _svg_page_map(_walk(root, np.eye(3, dtype=np.float64)), root, dpi, center)
         matched = False
 
         def _walk_filtered(el, mat: np.ndarray) -> list:
@@ -5957,7 +6017,7 @@ class Evaluator:
             what = ", ".join(f'{k} = "{v}"' for k, v in (("id", id_), ("class", cls)) if v is not None)
             self._echo_fn(f"WARNING: import() filter {what} did not match anything"
                           f"{self._loc(getattr(node, 'position', None))}")
-        return out
+        return _svg_page_map(out, root, dpi, center)
 
     def _resolve_offset(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)

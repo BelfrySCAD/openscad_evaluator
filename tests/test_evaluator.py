@@ -4292,6 +4292,46 @@ class TestMissingImport:
         assert lines == ["WARNING: Could not read file 'nope.json' in file t.scad, line 1", "ECHO: undef"]
 
 
+class TestSvgUnits:
+    """SVG placement as OpenSCAD 2026.02.01 does it: page units to mm,
+    viewBox under preserveAspectRatio, Y flipped about the page height.
+    Bounds identical to the reference for every case below."""
+
+    CASES = {
+        "u1": ('width="100" height="100" viewBox="0 0 100 100"',
+               '<rect x="0" y="0" width="10" height="10"/><rect x="20" y="50" width="30" height="5"/>'),
+        "u2": ('width="50mm" height="20mm" viewBox="10 5 200 40"',
+               '<rect x="10" y="5" width="20" height="10"/><circle cx="100" cy="25" r="8"/>'),
+        "u3": ('width="4in" height="2in" viewBox="0 0 100 100" preserveAspectRatio="xMaxYMin meet"',
+               '<rect x="0" y="0" width="100" height="100"/>'),
+        "u4": ('width="300px" height="150px"', '<rect x="10" y="10" width="30" height="20"/>'),
+        "u5": ('viewBox="0 0 200 100"', '<rect x="0" y="0" width="200" height="100"/>'),
+    }
+    EXPECT = {
+        ("u1", False): [0.0, 15.875, 17.639, 35.278], ("u1", True): [-8.819, -9.701, 8.819, 9.701],
+        ("u2", False): [0.0, 5.5, 24.5, 12.5], ("u2", True): [-14.75, -4.75, 9.75, 2.25],
+        ("u3", False): [50.8, 0.0, 101.6, 50.8], ("u3", True): [-25.4, -25.4, 25.4, 25.4],
+        ("u4", False): [10.0, 9.688, 40.0, 29.688], ("u4", True): [-15.0, -10.0, 15.0, 10.0],
+        ("u5", False): [0.0, 0.0, 70.556, 35.278], ("u5", True): [-35.278, -17.639, 35.278, 17.639],
+    }
+
+    @pytest.mark.parametrize("key", sorted(EXPECT))
+    def test_bounds(self, tmp_path, key):
+        name, center = key
+        attrs, body = self.CASES[name]
+        f = tmp_path / f"{name}.svg"
+        f.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" {attrs}>{body}</svg>')
+        bodies, _ = run(f'import("{f.as_posix()}", center={"true" if center else "false"});')
+        assert [round(v, 3) for v in bodies[0].section.bounds()] == pytest.approx(self.EXPECT[key], abs=1e-3)
+
+    def test_dpi(self, tmp_path):
+        attrs, body = self.CASES["u1"]
+        f = tmp_path / "u1.svg"
+        f.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" {attrs}>{body}</svg>')
+        bodies, _ = run(f'import("{f.as_posix()}", dpi=96);')
+        assert [round(v, 3) for v in bodies[0].section.bounds()] == pytest.approx([0.0, 11.906, 13.229, 26.458])
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
