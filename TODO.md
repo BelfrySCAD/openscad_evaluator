@@ -18,8 +18,6 @@ Builtin arguments
   falls back to Regular when `fc-match` is missing, i.e. always on macOS (#171)
 
 Diagnostics
-- Numeric builtins don't warn on a non-number ("cos() parameter could not be converted")
-  (04797d0); argument/operand warnings in general, `abs(undef)`, `1+"a"` (#99)
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)
 
