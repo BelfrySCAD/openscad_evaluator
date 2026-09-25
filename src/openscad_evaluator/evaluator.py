@@ -610,9 +610,9 @@ def _skeleton_roof(cs: m3d.CrossSection) -> Optional[m3d.Manifold]:
                 tris.append((a, b, c))
                 tris.append((a, c, d))
 
-        mesh = m3d.Mesh(
-            vert_properties=np.array(final_verts, dtype=np.float32),
-            tri_verts=np.array(tris, dtype=np.uint32),
+        mesh = m3d.Mesh64(
+            vert_properties=np.array(final_verts, dtype=np.float64),
+            tri_verts=np.array(tris, dtype=np.uint64),
         )
         body = m3d.Manifold(mesh)
         if body.status() != m3d.Error.NoError or body.is_empty():
@@ -1468,9 +1468,9 @@ def _build_roof_mesh(
 
         if not tris or not final_verts:
             return None
-        mesh = m3d.Mesh(
-            vert_properties=np.array(final_verts, dtype=np.float32),
-            tri_verts=np.array(tris, dtype=np.uint32),
+        mesh = m3d.Mesh64(
+            vert_properties=np.array(final_verts, dtype=np.float64),
+            tri_verts=np.array(tris, dtype=np.uint64),
         )
         body = m3d.Manifold(mesh)
         if body.status() != m3d.Error.NoError or body.is_empty():
@@ -2752,6 +2752,8 @@ class Evaluator:
             "hull": self._resolve_hull,
             "fill": self._resolve_hull,  # the same: children only
             "minkowski": self._resolve_minkowski,
+            "minkowski_difference": self._resolve_minkowski,
+            "simplify": self._resolve_simplify,
             "offset": self._resolve_offset,
             "projection": self._resolve_projection,
             "union": self._resolve_csg,
@@ -2789,6 +2791,8 @@ class Evaluator:
             "hull": self._generate_hull,
             "fill": self._generate_fill,
             "minkowski": self._generate_minkowski,
+            "minkowski_difference": self._generate_minkowski_difference,
+            "simplify": self._generate_simplify,
             "offset": self._generate_offset,
             "projection": self._generate_projection,
             "union": self._generate_csg,
@@ -3772,7 +3776,8 @@ class Evaluator:
         "multmatrix": ("m",), "resize": ("newsize", "auto", "convexity"),
         "color": ("c", "alpha"),
         "union": (), "difference": (), "intersection": (), "hull": (), "fill": (),
-        "minkowski": ("convexity",), "children": ("index", "separate"), "render": ("convexity",),
+        "minkowski": ("convexity",), "minkowski_difference": (), "simplify": ("tolerance",),
+        "children": ("index", "separate"), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
                    "filename", "layername", "center", "dpi", "id"),
         "linear_extrude": ("height", "v", "scale", "center", "twist", "slices", "segments", "convexity"),
@@ -4008,12 +4013,12 @@ class Evaluator:
         for i in range(1, n - 1):
             tris.append([top[0], top[i], top[i + 1]])
 
-        verts_arr = np.array(verts, dtype=np.float32)
-        tris_arr = np.array(tris, dtype=np.uint32)
+        verts_arr = np.array(verts, dtype=np.float64)
+        tris_arr = np.array(tris, dtype=np.uint64)
         return {"r": r, "segs": n, "verts": verts_arr, "tris": tris_arr, "color": ctx.color}
 
     def _generate_sphere(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
-        mesh = m3d.Mesh(vert_properties=params["verts"], tri_verts=params["tris"])
+        mesh = m3d.Mesh64(vert_properties=params["verts"], tri_verts=params["tris"])
         body = m3d.Manifold(mesh)
         return [self._tag_generated(body, node, params["color"])]
 
@@ -4779,9 +4784,9 @@ class Evaluator:
             tris.append([top(r, cols-1), bot(r, cols-1), bot(r+1, cols-1)])
 
         try:
-            verts_arr = np.array(verts, dtype=np.float32)
-            tris_arr = np.array(tris, dtype=np.uint32)
-            mesh = m3d.Mesh(vert_properties=verts_arr, tri_verts=tris_arr)
+            verts_arr = np.array(verts, dtype=np.float64)
+            tris_arr = np.array(tris, dtype=np.uint64)
+            mesh = m3d.Mesh64(vert_properties=verts_arr, tri_verts=tris_arr)
             body = m3d.Manifold(mesh)
             return [self._tag_generated(body, node, params["color"])]
         except Exception as e:
@@ -5654,6 +5659,62 @@ class Evaluator:
         except Exception as e:
             self.error(f"minkowski: {e}", node)
             return bg + hi + so
+
+    def _generate_minkowski_difference(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        """Erosion, which minkowski() has no inverse for: the first child
+        eroded by each later one in turn. Not in OpenSCAD (cpp #101). 3D
+        only -- 2D already has offset(r=-N), and Manifold no 2D erosion."""
+        bg, fg, hi, so = self._split_by_role(flatten_csg_tree(children))
+        solids = [c for c in fg if c.body is not None]
+        rest = bg + hi + so
+        if len(solids) < 2:
+            return solids[:1] + rest  # nothing to erode with, as minkowski() of one child
+        result = solids[0].body
+        for c in solids[1:]:
+            result = result.minkowski_difference(c.body)
+        if result.status() != _MANIFOLD_OK:
+            self._echo_fn(f"WARNING: minkowski_difference: result is not manifold"
+                          f"{self._loc(getattr(node, 'position', None))}")
+        # Per-triangle colour can't survive: the surface it indexed is gone.
+        return [ColoredBody(body=result, color=solids[0].color)] + rest
+
+    def _resolve_simplify(self, node: ModularCall, ctx: EvalContext) -> dict:
+        args, ctx = self._resolve_call_args(node, ctx)
+        self._eval_children(node.children, ctx)
+        return {"tolerance": self._get_arg(args, 0, "tolerance")}
+
+    _SIMPLIFY_FRACTION = 0.001  # of the bounding-box diagonal, when no tolerance is given
+
+    def _generate_simplify(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        """Decimate within a tolerance (Manifold/CrossSection simplify). Not
+        in OpenSCAD (cpp #103). The default is 0.1% of each body's own
+        diagonal: simplify(0) falls back to Manifold's epsilon and changes
+        nothing, and an absolute default right in mm is wrong in metres."""
+        bodies = flatten_csg_tree(children)
+        tol = params["tolerance"]
+        explicit = type(tol) in (int, float)
+        pos = getattr(node, "position", None)
+        if tol is not None and not explicit:
+            self._echo_fn(f"WARNING: simplify: tolerance must be a number{self._loc(pos)}")
+        if explicit and tol < 0:
+            self._echo_fn(f"WARNING: simplify: tolerance must not be negative{self._loc(pos)}")
+            return bodies
+        out = []
+        for b in bodies:
+            if b.role != "normal":
+                out.append(b)
+            elif b.body is not None:
+                lo, hi_ = np.array(b.body.bounding_box()).reshape(2, 3)
+                t = tol if explicit else self._SIMPLIFY_FRACTION * float(np.linalg.norm(hi_ - lo))
+                # tri_colors is indexed by triangle, and decimation changes the count.
+                out.append(replace(b, body=b.body.simplify(t), tri_colors=None) if t > 0 else b)
+            elif b.section is not None:
+                x0, y0, x1, y1 = b.section.bounds()
+                t = tol if explicit else self._SIMPLIFY_FRACTION * math.hypot(x1 - x0, y1 - y0)
+                out.append(replace(b, section=b.section.simplify(t)) if t > 0 else b)
+            else:
+                out.append(b)
+        return out
 
     @staticmethod
     def _copy_body(b: ColoredBody) -> ColoredBody:
