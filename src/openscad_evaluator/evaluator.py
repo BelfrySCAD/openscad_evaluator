@@ -67,8 +67,9 @@ def _vnf_from_mesh(verts: np.ndarray, tris: np.ndarray) -> tuple[list, list]:
     remap = remap.reshape(-1)
     if len(uniq) < len(verts):
         welded = remap[tris]
-        probe = m3d.Manifold(m3d.Mesh64(vert_properties=uniq, tri_verts=welded.astype(np.uint64)))
-        if probe.status() == _MANIFOLD_OK:
+        # Counted, not asked of Manifold: it builds a mesh with four-face
+        # edges without complaint, so its status let the fused shells through.
+        if _edges_closed(welded):
             verts, tris = uniq, welded
     return verts.tolist(), tris[:, [0, 2, 1]].tolist()
 
@@ -882,6 +883,116 @@ def _trace_face(adjacency: dict, u: tuple, v: tuple) -> Optional[list]:
         if (cur_u, cur_v) == start:
             return face[:-1]
     return None
+
+
+def _edges_closed(tris: np.ndarray) -> bool:
+    """Whether every edge has exactly two faces -- no boundary, no fin.
+    ponytail: skips the C++ checkMesh's pinched-vertex test; a raw mesh
+    only pinches if its author reused one index across two shells."""
+    if len(tris) == 0:
+        return False
+    edges = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    return bool((counts == 2).all())
+
+
+def _triangulate_face(verts: list, loop: list[int], out: list) -> None:
+    """Triangulate one polyhedron face into `out`, reversing winding
+    (OpenSCAD's faces are clockwise from outside, Manifold's counter-).
+
+    A fan is right only for a convex, planar face, and BOSL2's
+    vnf_polyhedron() hands over neither: a nurbs_sheet() end cap is a
+    concave 34-gon 3.5 units out of plane, and fanning it inflated the
+    solid by 5% of its volume (#88). Ear clipping in the face's Newell
+    best-fit plane instead, taking the fattest ear each time so a
+    non-planar face folds along its surface. Port of the C++
+    triangulateFace. Plain floats, not numpy: faces are a handful of
+    points, where numpy's per-call overhead doubled a 40k-quad VNF's time.
+    ponytail: O(n^2) per face."""
+    nv = len(verts)
+    loop = [i if 0 <= i < nv else 0 for i in loop]
+    n = len(loop)
+
+    def emit(a, b, c):
+        if a != b and b != c and a != c:
+            out.append((a, c, b))
+
+    def fan(ids):
+        for i in range(1, len(ids) - 1):
+            emit(ids[0], ids[i], ids[i + 1])
+
+    if n < 3:
+        return
+    if n == 3:
+        return emit(*loop)
+    pts = [verts[i] for i in loop]
+    nx = ny = nz = 0.0
+    for i in range(n):
+        (x0, y0, z0), (x1, y1, z1) = pts[i], pts[(i + 1) % n]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if not ln > 1e-12:
+        return fan(loop)
+    nx, ny, nz = nx / ln, ny / ln, nz / ln
+    ax, ay, az = abs(nx), abs(ny), abs(nz)
+    drop = (0 if ax > az else 2) if ax > ay else (1 if ay > az else 2)
+    axis = [0.0, 0.0, 0.0]
+    axis[(drop + 1) % 3] = 1.0
+    ux, uy, uz = axis[1] * nz - axis[2] * ny, axis[2] * nx - axis[0] * nz, axis[0] * ny - axis[1] * nx
+    ul = math.sqrt(ux * ux + uy * uy + uz * uz)
+    if not ul > 1e-12:
+        return fan(loop)
+    ux, uy, uz = ux / ul, uy / ul, uz / ul
+    wx, wy, wz = ny * uz - nz * uy, nz * ux - nx * uz, nx * uy - ny * ux
+    flat = [(x * ux + y * uy + z * uz, x * wx + y * wy + z * wz) for x, y, z in pts]
+
+    def cross2(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def inside(a, b, c, p):  # strictly, so a point on an edge doesn't veto an ear
+        return cross2(a, b, p) > 1e-12 and cross2(b, c, p) > 1e-12 and cross2(c, a, p) > 1e-12
+
+    def squareness(i, j, k):  # twice the area over the squared sides: 0 for a sliver
+        p, q, r = pts[i], pts[j], pts[k]
+        e1 = (q[0] - p[0], q[1] - p[1], q[2] - p[2])
+        e2 = (r[0] - p[0], r[1] - p[1], r[2] - p[2])
+        e3 = (r[0] - q[0], r[1] - q[1], r[2] - q[2])
+        cx, cy, cz = e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]
+        sides = sum(c * c for c in e1 + e2 + e3)
+        return math.sqrt(cx * cx + cy * cy + cz * cz) / sides if sides > 1e-18 else 0.0
+
+    twice_area = sum(flat[i][0] * flat[(i + 1) % n][1] - flat[(i + 1) % n][0] * flat[i][1]
+                     for i in range(n))
+    idx = list(range(n))
+    if twice_area < 0:
+        idx.reverse()  # work counter-clockwise
+    guard = 0
+    while len(idx) > 3 and guard < n * n:
+        guard += 1
+        best_at, best = None, -1.0
+        m = len(idx)
+        # Only a reflex vertex can lie inside an ear of a simple polygon, so
+        # only those are tested: a 200-gon cap is otherwise O(n^3). ponytail:
+        # a self-intersecting face may clip differently from the C++ port.
+        reflex = [idx[i] for i in range(m)
+                  if cross2(flat[idx[i - 1]], flat[idx[i]], flat[idx[(i + 1) % m]]) <= 1e-12]
+        for i in range(m):
+            pi, ci, ni = idx[i - 1], idx[i], idx[(i + 1) % m]
+            a, b, c = flat[pi], flat[ci], flat[ni]
+            if cross2(a, b, c) <= 1e-12:
+                continue  # reflex, not an ear
+            if any(o != pi and o != ni and inside(a, b, c, flat[o]) for o in reflex):
+                continue
+            score = squareness(pi, ci, ni)
+            if score > best:
+                best, best_at = score, i
+        if best_at is None:
+            break  # self-intersecting or otherwise unclippable
+        emit(loop[idx[best_at - 1]], loop[idx[best_at]], loop[idx[(best_at + 1) % m]])
+        del idx[best_at]
+    fan([loop[i] for i in idx])
 
 
 def _triangulate_planar_face(face_pts3d: np.ndarray) -> Optional[list[tuple[int, int, int]]]:
@@ -4326,30 +4437,31 @@ class Evaluator:
             if not isinstance(p, list) or len(p) != 3 or any(c is None for c in p):
                 self.error(f"polyhedron: point[{i}] is not a valid [x,y,z] coordinate", node)
         try:
+            # float64 throughout: float32 moved every vertex by up to half an
+            # ulp, enough to open seams in a large model (#94).
             verts = np.array([[float(c) for c in p] for p in points], dtype=np.float64)
-            # Deduplicate vertices — VNF meshes (e.g. from BOSL2) often have
-            # coincident vertices at seams/poles that must be merged for Manifold.
-            rounded = np.round(verts, decimals=6)
-            _, unique_idx, remap = np.unique(rounded, axis=0, return_index=True, return_inverse=True)
-            verts = verts[unique_idx].astype(np.float32)
-            # Fan-triangulate faces, reversing winding to convert OpenSCAD's
-            # CW-from-outside convention to Manifold's CCW-from-outside convention.
             tris = []
+            vlist = verts.tolist()
             for face in faces:
-                face = [int(x) for x in face]
-                remapped = [int(remap[idx]) for idx in face]
-                for i in range(1, len(remapped) - 1):
-                    a, b, c = remapped[0], remapped[i + 1], remapped[i]
-                    if a != b and b != c and a != c:
-                        tris.append([a, b, c])
-            tri_arr = np.array(tris, dtype=np.uint32) if tris else np.zeros((0, 3), dtype=np.uint32)
+                _triangulate_face(vlist, [int(x) for x in face], tris)
+            tri_arr = np.array(tris, dtype=np.uint64) if tris else np.zeros((0, 3), dtype=np.uint64)
+            # Welding coincident vertices repairs BOSL2 VNFs, whose seams and
+            # poles repeat points. It only ever repairs: applied to a mesh
+            # that is already sound, it fuses two shells that merely touch
+            # into edges with four faces (#105). So weld only when needed.
+            _, unique_idx, remap = np.unique(np.round(verts, decimals=6), axis=0,
+                                             return_index=True, return_inverse=True)
+            if len(unique_idx) != len(verts) and not _edges_closed(tri_arr):
+                verts, tri_arr = verts[unique_idx], remap.reshape(-1)[tri_arr].astype(np.uint64)
+                tri_arr = tri_arr[(tri_arr[:, 0] != tri_arr[:, 1]) & (tri_arr[:, 1] != tri_arr[:, 2])
+                                  & (tri_arr[:, 0] != tri_arr[:, 2])]
         except Exception as e:
             self.error(f"polyhedron: {e}", node)
         return {"verts": verts, "tri_arr": tri_arr, "color": ctx.color}
 
     def _generate_polyhedron(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
         try:
-            mesh = m3d.Mesh(vert_properties=params["verts"], tri_verts=params["tri_arr"])
+            mesh = m3d.Mesh64(vert_properties=params["verts"], tri_verts=params["tri_arr"])
             body = m3d.Manifold(mesh)
         except Exception as e:
             self.error(f"polyhedron: {e}", node)

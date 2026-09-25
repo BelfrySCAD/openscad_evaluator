@@ -21,12 +21,6 @@ Diagnostics
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)
 
-Meshes
-- Polyhedron fan-triangulates faces; reuse `_triangulate_planar_face` (#88)
-- Polyhedron vertices cast to float32 (#94)
-- Polyhedron always welds coincident vertices, fusing touching shells; keep the weld only if
-  the result stays manifold (#105)
-
 Cache
 - A `ManifoldCache` hit reuses the first call site's bodies/originalIDs and doesn't refresh
   `id_to_node` (#84, #85)
