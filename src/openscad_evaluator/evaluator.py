@@ -2489,16 +2489,17 @@ class ManifoldCache:
     background QThreads and can genuinely overlap)."""
 
     def __init__(self):
-        self._entries: dict[tuple, list[ColoredBody]] = {}
+        # key -> (bodies, the warnings generating them printed, replayed on a hit)
+        self._entries: dict[tuple, tuple[list[ColoredBody], list[str]]] = {}
         self._lock = threading.Lock()
 
-    def get(self, key: tuple) -> list[ColoredBody] | None:
+    def get(self, key: tuple) -> tuple[list[ColoredBody], list[str]] | None:
         with self._lock:
             return self._entries.get(key)
 
-    def put(self, key: tuple, bodies: list[ColoredBody]) -> None:
+    def put(self, key: tuple, entry: tuple[list[ColoredBody], list[str]]) -> None:
         with self._lock:
-            self._entries[key] = bodies
+            self._entries[key] = entry
 
     def clear(self) -> None:
         with self._lock:
@@ -2675,6 +2676,8 @@ class Evaluator:
         # call site/test is unaffected) content-hash cache shared across
         # renders/debugger pauses -- see ManifoldCache and generate_tree().
         self._manifold_cache = manifold_cache
+        self._cache_producer: dict[tuple, ASTNode] = {}  # key -> node whose generate filled it
+        self._warn_captures: list[list[str]] = []  # one per cacheable subtree generating now
         # Incremented by _builtin_rands -- lets _eval_statement detect
         # whether rands() was called anywhere while resolving a given
         # CSGNode, to taint it (and its ancestors) as uncacheable. See
@@ -3287,20 +3290,98 @@ class Evaluator:
             key = None if (self._manifold_cache is None or node.uncacheable) else self._cache_key(node)
             cached = self._manifold_cache.get(key) if key is not None else None
             if cached is not None:
-                node.bodies = cached
+                bodies, warnings = cached
+                # A hit runs no generate_fn, which is where every generate-time
+                # warning is raised; replay them, or an unchanged re-render
+                # goes quiet about a defect that is still there (#186).
+                for msg in warnings:
+                    self._echo_fn(msg)
+                node.bodies = self._restamp_cached_ids(bodies, node.node, self._cache_producer.get(key))
             else:
+                if key is not None:
+                    self._warn_captures.append([])
+                    if len(self._warn_captures) == 1:
+                        real_echo = self._echo_fn
+
+                        def capturing_echo(msg, _real=real_echo):
+                            for c in self._warn_captures:
+                                c.append(msg)
+                            _real(msg)
+                        self._echo_fn = capturing_echo
                 in_hull = node.kind == "hull" and node.is_builtin
                 self._hull_depth += in_hull
                 try:
                     children_bodies = self.generate_tree(node.children)
+                    generate_fn = self._GENERATE_DISPATCH.get(node.kind) if node.is_builtin else None
+                    node.bodies = generate_fn(node.params, node.children, node.node) if generate_fn is not None else children_bodies
                 finally:
                     self._hull_depth -= in_hull
-                generate_fn = self._GENERATE_DISPATCH.get(node.kind) if node.is_builtin else None
-                node.bodies = generate_fn(node.params, node.children, node.node) if generate_fn is not None else children_bodies
+                    if key is not None:
+                        warnings = self._warn_captures.pop()
+                        if not self._warn_captures:
+                            self._echo_fn = real_echo
                 if key is not None:
-                    self._manifold_cache.put(key, node.bodies)
+                    self._manifold_cache.put(key, (node.bodies, warnings))
+                    self._cache_producer[key] = node.node
             result.extend(node.bodies)
         return result
+
+    def _restamp_cached_ids(self, bodies: list[ColoredBody], node, producer) -> list[ColoredBody]:
+        """Cached bodies with fresh originalIDs. A hit hands back the IDs of
+        whichever call site first made the shape, and IDs are provenance,
+        not content: two identical cylinders came back as one thing to
+        select (#84). One fresh ID per run, so a cached multi-part subtree
+        stays selectable part by part. An ID that stood for the reused node
+        itself (`producer`) now belongs to the node reusing it; one standing
+        for something deeper -- the cube inside a module called twice --
+        keeps its node, which is where that part is really spelled out.
+        IDs from an earlier render are unknown here and all go to `node`,
+        or a re-render of unchanged source had nothing pickable (#85).
+        ponytail: rebuilds each body from its mesh; 200 identical spheres
+        still render faster warm than cold in the C++ port."""
+        out = []
+        for cb in bodies:
+            if cb.body is None or cb.body.is_empty():
+                out.append(cb)
+                continue
+            mesh = cb.body.to_mesh64()
+            ids = np.asarray(mesh.run_original_id, dtype=np.uint32)
+            if not len(ids):
+                out.append(cb)
+                continue
+
+            def inherit(old, new):
+                was = self.id_to_node.get(old)
+                self.id_to_node[new] = was if was is not None and was is not producer else node
+                if old in self.id_to_color:
+                    self.id_to_color[new] = self.id_to_color[old]
+
+            if len(set(ids.tolist())) == 1:
+                # One run: as_original() relabels it without rebuilding the
+                # mesh, a tenth of the cost -- which a warm render of many
+                # identical parts otherwise spends entirely here.
+                body = cb.body.as_original()
+                inherit(int(ids[0]), body.original_id())
+                out.append(replace(cb, body=body))
+                continue
+            fresh = {}
+            for old in dict.fromkeys(int(i) for i in ids):
+                fresh[old] = int(m3d.Manifold.reserve_ids(1))
+                inherit(old, fresh[old])
+            def arr(name, dtype):
+                a = np.array(getattr(mesh, name), dtype=dtype)  # a copy: the binding rejects its own read-only arrays
+                return a if a.size else None  # the binding rejects an empty array
+
+            mesh = m3d.Mesh64(vert_properties=arr("vert_properties", np.float64),
+                              tri_verts=arr("tri_verts", np.uint64),
+                              merge_from_vert=arr("merge_from_vert", np.uint64),
+                              merge_to_vert=arr("merge_to_vert", np.uint64),
+                              run_index=arr("run_index", np.uint64),
+                              run_original_id=np.array([fresh[int(i)] for i in ids], dtype=np.uint32),
+                              run_transform=arr("run_transform", np.float64),
+                              face_id=arr("face_id", np.uint64))
+            out.append(replace(cb, body=m3d.Manifold(mesh)))
+        return out
 
     def _eval_statement_impl(self, node: ASTNode, ctx: EvalContext) -> list[ColoredBody]:
         self._last_ctx = ctx

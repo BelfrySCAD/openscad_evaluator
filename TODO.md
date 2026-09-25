@@ -12,7 +12,6 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 ### Bug fixes
 
-
 Builtin arguments
 - `font` style ignored in `text()`/`textmetrics()`/`fontmetrics()` (#163, #164); `:style=bold`
   falls back to Regular when `fc-match` is missing, i.e. always on macOS (#171)
@@ -20,11 +19,6 @@ Builtin arguments
 Diagnostics
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
   (3e11352)
-
-Cache
-- A `ManifoldCache` hit reuses the first call site's bodies/originalIDs and doesn't refresh
-  `id_to_node` (#84, #85)
-- A cache hit skips generation, so its warnings vanish on re-render (#186)
 
 Debugger / viewport
 - `x=f(y);` stops twice at statement level (#82)
