@@ -3858,6 +3858,25 @@ class TestErosionAndSimplify:
             "WARNING: simplify: tolerance must be a number"]
 
 
+class TestSphereStyles:
+    """sphere(style=), BOSL2 spheroid()'s tessellations (cpp #102).
+    Triangle counts and volumes match openscad_cpp_evaluator's."""
+
+    def test_styles(self):
+        bodies, _ = run("".join(f'translate([{i*30},0,0]) sphere(10, $fn=24, style="{st}");'
+                                for i, st in enumerate(["orig", "aligned", "stagger", "octa", "icosa"])))
+        assert [b.body.num_tri() for b in bodies] == [572, 528, 528, 288, 500]
+        # All outward: an inside-out VNF would show as a negative volume.
+        assert [round(b.body.volume(), 2) for b in bodies] == [4070.7, 4070.55, 4082.12, 4024.32, 4097.25]
+
+    def test_bad_style_warns_and_falls_back(self):
+        bodies, lines = run('sphere(5, style="nope"); sphere(5, style=3);')
+        assert [round(b.body.volume(), 3) for b in bodies] == [490.917, 490.917]
+        assert [l.removesuffix(" in file <string>, line 1") for l in lines] == [
+            'WARNING: sphere: unknown style "nope"; expected one of orig, aligned, stagger, octa, icosa',
+            "WARNING: sphere: style must be a string"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit

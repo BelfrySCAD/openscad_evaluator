@@ -886,6 +886,94 @@ def _trace_face(adjacency: dict, u: tuple, v: tuple) -> Optional[list]:
     return None
 
 
+_SPHERE_STYLES = ("orig", "aligned", "stagger", "octa", "icosa")
+
+
+def _spherical_to_xyz(r: float, theta: float, phi: float) -> list[float]:
+    """BOSL2's spherical_to_xyz: theta around Z from +X, phi down from +Z, degrees."""
+    th, ph = math.radians(theta), math.radians(phi)
+    return [r * math.sin(ph) * math.cos(th), r * math.sin(ph) * math.sin(th), r * math.cos(ph)]
+
+
+def _sphere_aligned(r: float, hsides: int, vsides: int, stagger: bool):
+    """sphere(style="aligned"/"stagger"): a vertex at each pole and rings on
+    the latitudes between (alternate rings turned half a face for stagger).
+    Vertex order and faces follow BOSL2's spheroid() triangle for triangle,
+    with each face's winding reversed -- BOSL2's VNF winding is Manifold's
+    inside out, which only a signed volume shows."""
+    verts = [_spherical_to_xyz(r, 0, 0)]
+    for i in range(1, vsides):
+        for j in range(hsides):
+            verts.append(_spherical_to_xyz(r, (j + (0.5 if stagger and i % 2 else 0.0)) * 360.0 / hsides,
+                                           i * 180.0 / vsides))
+    verts.append(_spherical_to_xyz(r, 0, 180))
+    lv = len(verts)
+    tris = []
+
+    def tri(a, b, c):
+        tris.append((a, c, b))
+
+    for i in range(hsides):
+        b2 = lv - 2 - hsides
+        tri(i + 1, 0, (i + 1) % hsides + 1)
+        tri(lv - 1, b2 + i + 1, b2 + (i + 1) % hsides + 1)
+    for i in range(vsides - 2):
+        base = 1 + hsides * i
+        for j in range(hsides):
+            if stagger and i % 2:
+                tri(base + j, base + hsides + j % hsides, base + hsides + (j + hsides - 1) % hsides)
+                tri(base + j, base + (j + 1) % hsides, base + hsides + j)
+            else:
+                tri(base + j, base + (j + 1) % hsides, base + hsides + (j + 1) % hsides)
+                tri(base + j, base + hsides + (j + 1) % hsides, base + hsides + j)
+    return verts, tris
+
+
+def _sphere_icosa(r: float, hsides: int):
+    """sphere(style="icosa"): each icosahedral face subdivided into a grid
+    and pushed out to the sphere, welded along shared edges. BOSL2 rotates
+    copies of one sampled face; sampling each face against its own corners
+    is the same points, since the sampling is affine in them."""
+    phi = (1 + math.sqrt(5)) / 2
+    ico = []
+    for i in (-1, 1):
+        for j in (-1, 1):
+            ico += [(0.0, float(i), j * phi), (float(i), j * phi, 0.0), (j * phi, 0.0, float(i))]
+    ico = np.array(ico)
+    faces = []
+    for a in range(12):  # hull faces by brute force: 220 triples
+        for b in range(a + 1, 12):
+            for c in range(b + 1, 12):
+                d = (ico - ico[a]) @ np.cross(ico[b] - ico[a], ico[c] - ico[a])
+                d[[a, b, c]] = 0
+                pos, neg = (d > 1e-9).any(), (d < -1e-9).any()
+                if pos and neg:
+                    continue
+                faces.append((a, c, b) if not neg else (a, b, c))  # outward
+    steps = max(1, round(max(5, hsides) / 5))
+    n = steps - 1
+    verts, weld, tris = [], {}, []
+
+    def add(p):
+        u = r * p / np.linalg.norm(p)
+        key = tuple(int(round(x * 1e9)) for x in u)
+        if key not in weld:
+            weld[key] = len(verts)
+            verts.append(u.tolist())
+        return weld[key]
+
+    for f in faces:
+        p0, p1, p2 = ico[list(f)]
+        grid = [[add(p0 + (p1 - p0) * (i / (n + 1)) + (p2 - p0) * (j / (n + 1))) for j in range(n + 2 - i)]
+                for i in range(n + 2)]
+        for i in range(n + 1):
+            for j in range(n + 1 - i):
+                tris.append((grid[i][j], grid[i + 1][j], grid[i][j + 1]))
+                if j < n - i:
+                    tris.append((grid[i + 1][j], grid[i + 1][j + 1], grid[i][j + 1]))
+    return verts, tris
+
+
 def _edges_closed(tris: np.ndarray) -> bool:
     """Whether every edge has exactly two faces -- no boundary, no fin.
     ponytail: skips the C++ checkMesh's pinched-vertex test; a raw mesh
@@ -3766,7 +3854,7 @@ class Evaluator:
     # positionally and never warn (`sin(bogus=30)` is sin(30)), except these two.
     _BUILTIN_PARAMS = {
         "cube": ("size", "center"),
-        "sphere": ("r", "d"),
+        "sphere": ("r", "d", "style"),
         "cylinder": ("h", "r1", "r2", "center", "r", "d", "d1", "d2"),
         "polyhedron": ("points", "faces", "convexity", "triangles"),
         "square": ("size", "center"),
@@ -3975,6 +4063,24 @@ class Evaluator:
         n = self._fn(ctx, r)  # longitude segments
         stacks = max(2, int(math.ceil(n / 2)))  # number of latitude rings (no single-point poles)
 
+        # style= names the tessellation, BOSL2 spheroid()'s five (cpp #102).
+        # Only "orig", the default, is what OpenSCAD builds.
+        style = self._get_arg(args, None, "style", None)
+        if isinstance(style, str) and style not in _SPHERE_STYLES:
+            self._echo_fn(f'WARNING: sphere: unknown style "{style}"; expected one of '
+                          f'orig, aligned, stagger, octa, icosa{self._loc(getattr(node, "position", None))}')
+        elif style is not None and not isinstance(style, str):
+            self._echo_fn(f"WARNING: sphere: style must be a string{self._loc(getattr(node, 'position', None))}")
+        if style in ("aligned", "stagger", "icosa", "octa"):
+            if style == "octa":  # Manifold's sphere IS a subdivided octahedron
+                verts, tris = np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint64)
+            elif style == "icosa":
+                verts, tris = _sphere_icosa(r, n)
+            else:
+                verts, tris = _sphere_aligned(r, n, stacks, style == "stagger")
+            return {"r": r, "segs": n, "style": style, "color": ctx.color,
+                    "verts": np.array(verts, dtype=np.float64), "tris": np.array(tris, dtype=np.uint64)}
+
         # OpenSCAD-compatible sphere: polygon caps at top/bottom (no triangulated poles),
         # quad belts between rings. Rings evenly spaced excluding the actual poles.
         step = math.pi / stacks  # latitude step in radians
@@ -4018,6 +4124,8 @@ class Evaluator:
         return {"r": r, "segs": n, "verts": verts_arr, "tris": tris_arr, "color": ctx.color}
 
     def _generate_sphere(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        if params.get("style") == "octa":
+            return [self._tag_generated(m3d.Manifold.sphere(params["r"], params["segs"]), node, params["color"])]
         mesh = m3d.Mesh64(vert_properties=params["verts"], tri_verts=params["tris"])
         body = m3d.Manifold(mesh)
         return [self._tag_generated(body, node, params["color"])]

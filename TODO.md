@@ -17,7 +17,6 @@ Needs openscad_lalr_parser changes first
 
 Language extensions
 - `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
-- `sphere(style=)` (#102)
 - `levelset()` from grid or function, 2D contours, clean box cut (#124, #126, #127). Bring #136
   with it: never cache a subtree whose params hold a closure (`_canon` keys by identity), and
   #125's explicit-undef `isovalue` counting as absent
