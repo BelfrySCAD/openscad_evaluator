@@ -19,9 +19,9 @@ Language extensions
 - `children(separate=true)` (#110, #111, #112)
 - `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
 - `minkowski_difference()` (#101), `sphere(style=)` (#102), `simplify()` (#103)
-- `linear_solve()`; explicit undef argument counts as absent (#120, #122, #125)
 - `levelset()` from grid or function, 2D contours, clean box cut (#124, #126, #127). Bring #136
-  with it: never cache a subtree whose params hold a closure (`_canon` keys by identity)
+  with it: never cache a subtree whose params hold a closure (`_canon` keys by identity), and
+  #125's explicit-undef `isovalue` counting as absent
 - Strict mesh check, `repair()`, `import(repair=true)`, export-time check (72ca136);
   `mesh_repair()` (#191)
 - `dxf_dim()` / `dxf_cross()` (#100), `list_fonts()` (#163)

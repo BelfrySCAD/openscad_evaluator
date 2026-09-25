@@ -2868,7 +2868,7 @@ class Evaluator:
             "version_num": _version_num,
             "parent_module": self._builtin_parent_module,
         }
-        self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics"}
+        self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics", "linear_solve"}
         # Functions that require an actual number (or a vector of numbers)
         # and must reject a bool argument as a type error (-> undef),
         # confirmed against real OpenSCAD 2022.08.22 -- e.g. abs(true),
@@ -3781,6 +3781,7 @@ class Evaluator:
         "breakpoint": ("condition",),  # this package's debugger extension
         "textmetrics": ("text", "size", "font", "direction", "language", "script", "halign", "valign", "spacing"),
         "fontmetrics": ("size", "font"),
+        "linear_solve": ("A", "b"),
     }
 
     def _warn_unexpected_args(self, declared: tuple, arguments, call, builtin: bool = False) -> None:
@@ -6649,6 +6650,13 @@ class Evaluator:
                     return self._builtin_textmetrics(args, node)
                 if name == "fontmetrics":
                     return self._builtin_fontmetrics(args, node)
+                if name == "linear_solve":
+                    self._warn_unexpected_args(self._BUILTIN_PARAMS[name], node.arguments, node, builtin=True)
+                    # An explicit undef b is absent, not bad: BOSL2's fixed-signature
+                    # wrapper `function _linear_solve(A, b) = linear_solve(A, b);`
+                    # always forwards it.
+                    return self._builtin_linear_solve(self._get_arg(args, 0, "A"), self._get_arg(args, 1, "b"),
+                                                      node, nargs=len(args))
                 fn = self._math_fns.get(name)
                 if fn is not None:
                     positional = [args[i] for i in range(len(args)) if i in args]
@@ -6999,6 +7007,94 @@ class Evaluator:
             "offset": [offset_x, offset_y],
             "advance": [advance_x, 0.0],
         })
+
+    def _builtin_linear_solve(self, a, b, node, nargs: int = 2) -> Optional[OscObject]:
+        """`linear_solve(A, b)` -> object(x, det, singular). Port of the C++
+        builtin: pivoted LU for a square A (the determinant falls out of the
+        same pass; BOSL2's determinant() is a cofactor expansion, O(n!)),
+        least squares via QR for a tall A, minimum norm via QR of A^T for a
+        wide one, where det is undef. Singularity is RELATIVE to the largest
+        entry -- BOSL2's fixed 1e-9 calls a well-conditioned A*1e-10
+        singular. Without column pivoting a rank test cannot tell rank
+        deficiency from severe ill-conditioning; it is a heuristic."""
+        loc = self._loc(getattr(node, "position", None))
+
+        def warn(msg):
+            self._echo_fn(f"WARNING: linear_solve() {msg}{loc}")
+
+        def matrix(v):
+            if type(v) is not list or not v or any(type(r) is not list or not r for r in v):
+                return None
+            if len({len(r) for r in v}) != 1 or not all(type(x) in (int, float) for r in v for x in r):
+                return None
+            return np.array(v, dtype=np.float64)
+
+        if not nargs:
+            warn("number of parameters does not match: expected 1 or 2, found 0")
+            return None
+        if type(a) is not list:
+            self._echo_fn(f"WARNING: linear_solve() parameter could not be converted: argument 0: "
+                          f"expected vector, found {_osc_type_name(a)} ({self._fmt_val(a)}){loc}")
+            return None
+        A = matrix(a)
+        if A is None:
+            warn("requires a matrix of numbers")
+            return None
+        if not np.isfinite(A).all():
+            warn("matrix contains a non-finite value")
+            return None
+        m, n = A.shape
+        B, vector = None, False
+        if b is not None:
+            if type(b) is list and len(b) == m and all(type(x) in (int, float) for x in b):
+                B, vector = np.array(b, dtype=np.float64).reshape(m, 1), True
+            elif (B := matrix(b)) is None or B.shape[0] != m:
+                warn(f"right-hand side must be a vector of {m} numbers, or a matrix with that many rows")
+                return None
+            if not np.isfinite(B).all():
+                warn("right-hand side contains a non-finite value")
+                return None
+        tol = np.finfo(np.float64).eps * max(m, n) * max(float(np.abs(A).max()), 1.0)
+
+        def shaped(x):
+            return x.reshape(-1).tolist() if vector else x.tolist()
+
+        if m != n:
+            # Householder QR (LAPACK's, as the C++ port hand-rolls); |R_jj| is
+            # the column norm the C++ tests against tol.
+            tall = A if m > n else A.T
+            q, r = np.linalg.qr(tall)
+            if (np.abs(np.diag(r)) <= tol).any():
+                return OscObject({"x": None, "det": None, "singular": True})
+            if B is None:
+                return OscObject({"x": None, "det": None, "singular": False})
+            if m > n:
+                x = np.linalg.solve(r, q.T @ B)
+            else:
+                x = q @ np.linalg.solve(r.T, B)  # minimum norm: Q [y; 0]
+            return OscObject({"x": shaped(x), "det": None, "singular": False})
+
+        lu = A.copy()
+        rhs = B.copy() if B is not None else np.zeros((n, 0))
+        det = 1.0
+        for col in range(n):
+            pivot = col + int(np.argmax(np.abs(lu[col:, col])))
+            if abs(lu[pivot, col]) <= tol:
+                return OscObject({"x": None, "det": 0.0, "singular": True})
+            if pivot != col:
+                lu[[col, pivot]] = lu[[pivot, col]]
+                rhs[[col, pivot]] = rhs[[pivot, col]]
+                det = -det
+            p = lu[col, col]
+            det *= p
+            f = lu[col + 1:, col] / p
+            lu[col + 1:, col:] -= np.outer(f, lu[col, col:])
+            rhs[col + 1:] -= np.outer(f, rhs[col])
+        if B is None:
+            return OscObject({"x": None, "det": float(det), "singular": False})
+        for col in range(n - 1, -1, -1):
+            rhs[col] = (rhs[col] - lu[col, col + 1:] @ rhs[col + 1:]) / lu[col, col]
+        return OscObject({"x": shaped(rhs), "det": float(det), "singular": False})
 
     def _builtin_fontmetrics(self, args: dict, node) -> OscObject:
         """`fontmetrics(size=.., font=..)` — global metrics of the font
