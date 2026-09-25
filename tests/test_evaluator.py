@@ -3882,7 +3882,7 @@ class TestFeatureDetection:
 
     def test_levels(self):
         _, lines = run('echo($_SUPPORTED_FEATURE, supported_feature("separate-children"), '
-                       'supported_feature("levelset"), supported_feature("nope"), supported_feature(3), '
+                       'supported_feature("mesh-repair"), supported_feature("nope"), supported_feature(3), '
                        'supported_feature(feature="roof-op"));')
         assert lines == ["ECHO: true, 1, 0, 0, 0, 1"]
 
@@ -4081,6 +4081,42 @@ class TestTailCalls:
     def test_runaway_tail_recursion_is_an_error(self):
         with pytest.raises(EvalError, match="Recursion detected calling function 'f'"):
             run("function f(n) = f(n + 1); echo(f(0));")
+
+
+class TestLevelSet:
+    """levelset() (cpp #124-#127, #136, #125). Volumes and areas match
+    openscad_cpp_evaluator's to three decimals."""
+
+    GRID = ("grid = [for (i=[0:20]) [for (j=[0:20]) [for (k=[0:20]) "
+            "norm([-10+i, -10+j, -10+k]) - 8]]]; B = [[-10,-10,-10],[10,10,10]];")
+
+    def _vols(self, src):
+        bodies, lines = run(self.GRID + src)
+        return [round(b.body.volume() if b.body else b.section.area(), 3) for b in bodies], lines
+
+    def test_grid_function_and_bands(self):
+        vols, _ = self._vols("levelset(grid, B); levelset(function(x,y,z) norm([x,y,z]) - 8, B, edge=1);"
+                             "levelset(grid, B, isovalue=[-3, 0]); levelset(grid, B, isovalue=undef);"
+                             "levelset(grid, B, isovalue=-100);")
+        assert vols == [2122.303, 2135.033, 1612.261, 2122.303]
+
+    def test_2d_and_the_clip_to_bounds(self):
+        vols, _ = self._vols("levelset(function(x,y) norm([x,y]) - 6, [[-10,-10],[10,10]], edge=0.5);"
+                             "levelset(function(x,y) x, [[-10,-10],[10,10]], edge=1);")
+        assert vols == [112.931, 200.0]  # the half-plane is exact: 10 x 20
+
+    def test_bad_arguments_warn(self):
+        _, lines = self._vols("levelset(grid, [[-10,-10],[10,10,10]]); levelset(function(x,y,z) x, B);")
+        assert [l.split(" in file ")[0] for l in lines] == [
+            "WARNING: levelset(): bounds must be [[x0,y0],[x1,y1]] or [[x0,y0,z0],[x1,y1,z1]]",
+            "WARNING: levelset(): a function field needs edge= (the sample spacing)"]
+
+    def test_a_closure_field_is_never_cached(self):
+        nodes = getASTfromString("levelset(function(x,y,z) norm([x,y,z]) - 3, [[-4,-4,-4],[4,4,4]], edge=1);",
+                                 include_comments=False)
+        ev = Evaluator(echo_fn=lambda m: None, manifold_cache=ManifoldCache())
+        ev.evaluate(nodes, build_scopes(nodes))
+        assert ev.csg_tree[0].uncacheable
 
 
 class TestTextMetrics:

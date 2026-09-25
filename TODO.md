@@ -21,9 +21,6 @@ Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
 Language extensions
-- `levelset()` from grid or function, 2D contours, clean box cut (#124, #126, #127). Bring #136
-  with it: never cache a subtree whose params hold a closure (`_canon` keys by identity), and
-  #125's explicit-undef `isovalue` counting as absent
 - Strict mesh check, `repair()`, `import(repair=true)`, export-time check (72ca136);
   `mesh_repair()` (#191)
 
