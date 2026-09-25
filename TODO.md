@@ -35,8 +35,6 @@ Numbers and strings
 - `-7%3` should be -1, `7%0` nan, `0^-1` inf (#99)
 - Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
 - `[5:1:0]==[5:1:0]` is false (#146)
-- Numbers of 7+ digits echo in full (`1212201`); OpenSCAD uses 6 significant digits
-  (`1.2122e+6`) -- `_format_number`
 - `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
 
 Diagnostics
