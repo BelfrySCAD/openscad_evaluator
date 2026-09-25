@@ -16,7 +16,6 @@ Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
 Language extensions
-- `children(separate=true)` (#110, #111, #112)
 - `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
 - `minkowski_difference()` (#101), `sphere(style=)` (#102), `simplify()` (#103)
 - `levelset()` from grid or function, 2D contours, clean box cut (#124, #126, #127). Bring #136

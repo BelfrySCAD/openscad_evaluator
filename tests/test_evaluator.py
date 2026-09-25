@@ -5527,6 +5527,46 @@ class TestLinearSolve:
             "WARNING: linear_solve() right-hand side must be a vector of 2 numbers, or a matrix with that many rows"]
 
 
+class TestSeparateChildren:
+    """children(separate=true): one statement per forwarded child (cpp
+    #110-#112). Volumes match openscad_cpp_evaluator's."""
+
+    @staticmethod
+    def _vols(src):
+        bodies, lines = run(src)
+        return [round(b.body.volume(), 2) for b in bodies], lines
+
+    def test_difference_subtracts_each_child(self):
+        vols, _ = self._vols("module frame() { difference() children(separate=true); }\n"
+                             "frame() { cube(20, center=true); translate([10,0,0]) cube(10, center=true); "
+                             "translate([-10,0,0]) cube(10, center=true); }")
+        assert vols == [8000 - 2 * 500]
+
+    def test_children_counts_and_indexes_the_spliced_statements(self):
+        _, lines = self._vols("module cnt() { echo($children); }\n"
+                              "module fwd() cnt() children(separate=true);\n"
+                              "fwd() { cube(1); sphere(2); cube(3); }\n"
+                              "cnt() { children(separate=true); }")
+        assert lines == ["ECHO: 3", "ECHO: 0"]
+
+    def test_a_loop_child_stays_one_operand(self):
+        vols, _ = self._vols("module lp() difference() children(separate=true);\n"
+                             "lp() { cube(40,center=true); for (i=[-1,1]) translate([i*10,0,0]) cube(8, center=true); }")
+        assert vols == [64000 - 2 * 512]
+
+    def test_does_not_leak_through_a_module_boundary(self):
+        vols, _ = self._vols("module pass() { children(separate=true); }\n"
+                             "difference() pass() { cube(10); translate([5,5,5]) cube(10); }")
+        assert vols == [2000 - 125]
+
+    def test_selection_and_empty_selection(self):
+        vols, _ = self._vols("module sel() difference() children([0,2], separate=true);\n"
+                             "sel() { cube(10); cube(9); translate([5,0,0]) cube(10); }\n"
+                             "module none() difference() { cube(10); children([], separate=true); }\n"
+                             "translate([50,0,0]) none() { sphere(3); }")
+        assert vols == [500, 1000]
+
+
 class TestOpenMeshes:
     """An open mesh -- faces that don't close a solid -- used to vanish without
     a word, since Manifold returns an empty body for it. OpenSCAD draws it; so
