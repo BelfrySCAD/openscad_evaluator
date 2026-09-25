@@ -21,8 +21,6 @@ Diagnostics
   (3e11352)
 
 Debugger / viewport
-- `x=f(y);` stops twice at statement level (#82)
-- Step-to-child from `children()` finds nothing; read the context's forwarded children (#83)
 - 2D preview slab is 1e-3 thick, reference is 1; translated 2D shape loses its Z (#138)
 
 ### Features
