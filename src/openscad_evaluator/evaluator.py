@@ -2387,6 +2387,10 @@ class CSGNode:
     # warning's ", from ..." clause: generation runs after the call stack has
     # unwound. Not part of the cache key, so two call sites share an entry.
     warn_entry: Optional[Any] = None
+    # The call chain that reached this node, innermost frame first, as
+    # (call position, is_module) pairs -- see Evaluator.id_to_call_chain.
+    # Also out of the cache key.
+    call_chain: tuple = ()
 
 
 @dataclass
@@ -2845,6 +2849,17 @@ class Evaluator:
     def __init__(self, echo_fn=None, debug_hook=None, error_break_fn=None, return_hook=None,
                  manifold_cache: "ManifoldCache | None" = None, profile: bool = False):
         self.id_to_node: dict[int, ASTNode] = {}
+        # originalID -> the call chain that reached it, innermost first, as
+        # (call position, is_module) pairs; () for top-level geometry.
+        # id_to_node names the node that PRODUCED a body, which for library
+        # geometry is inside the library -- BOSL2 overrides cube() itself --
+        # so a picker walks this instead, stopping at whichever frame its
+        # editor has open. Deliberately unfiltered: a cuboid() is 24 frames,
+        # most of them BOSL2's, and a library author wants to step into
+        # those. is_module tells a frame with geometry behind it (worth
+        # dragging) from a function frame (cpp #180).
+        self.id_to_call_chain: dict[int, tuple] = {}
+        self._generate_call_chain: tuple = ()
         self.id_to_color: dict[int, Optional[tuple]] = {}
         self._hull_depth = 0  # hull() nodes enclosing the one being generated
         self._if_taken = False  # whether the last `if` ran a branch; see _is_operand_when_empty
@@ -3469,6 +3484,7 @@ class Evaluator:
                     children=children, params={},
                     uncacheable=any(c.uncacheable for c in children),
                     warn_entry=self._call_stack[0][2] if self._call_stack else None,
+                    call_chain=self._current_call_chain(),
                 )
                 self._tree_stack[-1].append(union_node)
             else:
@@ -3482,7 +3498,8 @@ class Evaluator:
         tree_node = CSGNode(kind=kind, node=node, bodies=[],
                              is_builtin=is_builtin, children=children, params=params,
                              uncacheable=uncacheable,
-                             warn_entry=self._call_stack[0][2] if self._call_stack else None)
+                             warn_entry=self._call_stack[0][2] if self._call_stack else None,
+                             call_chain=self._current_call_chain())
         self._tree_stack[-1].append(tree_node)
         return []
 
@@ -3541,7 +3558,8 @@ class Evaluator:
                 # goes quiet about a defect that is still there (#186).
                 for msg in warnings:
                     self._sink(msg)  # already attributed when first printed
-                node.bodies = self._restamp_cached_ids(bodies, node.node, self._cache_producer.get(key))
+                node.bodies = self._restamp_cached_ids(bodies, node.node, self._cache_producer.get(key),
+                                                       node.call_chain)
             else:
                 if key is not None:
                     self._warn_captures.append([])
@@ -3559,12 +3577,13 @@ class Evaluator:
                     children_bodies = self.generate_tree(node.children)
                     generate_fn = self._GENERATE_DISPATCH.get(node.kind) if node.is_builtin else None
                     if generate_fn is not None:
-                        saved_entry, self._generate_warn_entry = self._generate_warn_entry, node.warn_entry
+                        saved = self._generate_warn_entry, self._generate_call_chain
+                        self._generate_warn_entry, self._generate_call_chain = node.warn_entry, node.call_chain
                         try:
                             node.bodies = generate_fn(node.params, node.children, node.node)
                         finally:
-                            self._generate_warn_entry = saved_entry
-                        node.bodies = self._tag_sections(node.bodies, node.node)
+                            self._generate_warn_entry, self._generate_call_chain = saved
+                        node.bodies = self._tag_sections(node.bodies, node.node, node.call_chain)
                     else:
                         node.bodies = children_bodies
                 finally:
@@ -3579,7 +3598,10 @@ class Evaluator:
             result.extend(node.bodies)
         return result
 
-    def _tag_sections(self, bodies: list[ColoredBody], node) -> list[ColoredBody]:
+    def _current_call_chain(self) -> tuple:
+        return tuple((e[2], e[0] == "module") for e in reversed(self._call_stack))
+
+    def _tag_sections(self, bodies: list[ColoredBody], node, chain: tuple = ()) -> list[ColoredBody]:
         """Give each new 2D section an originalID attributed to `node`; a
         transformed one keeps its own, since replace() carries it."""
         out = bodies
@@ -3587,13 +3609,14 @@ class Evaluator:
             if cb.section is not None and cb.body is None and cb.section_id is None:
                 sid = int(m3d.Manifold.reserve_ids(1))
                 self.id_to_node[sid] = node
+                self.id_to_call_chain[sid] = chain
                 self.id_to_color[sid] = cb.color
                 if out is bodies:
                     out = list(bodies)
                 out[i] = replace(cb, section_id=sid)
         return out
 
-    def _restamp_cached_ids(self, bodies: list[ColoredBody], node, producer) -> list[ColoredBody]:
+    def _restamp_cached_ids(self, bodies: list[ColoredBody], node, producer, chain: tuple = ()) -> list[ColoredBody]:
         """Cached bodies with fresh originalIDs. A hit hands back the IDs of
         whichever call site first made the shape, and IDs are provenance,
         not content: two identical cylinders came back as one thing to
@@ -3613,6 +3636,7 @@ class Evaluator:
                 new = int(m3d.Manifold.reserve_ids(1))
                 was = self.id_to_node.get(cb.section_id)
                 self.id_to_node[new] = was if was is not None and was is not producer else node
+                self.id_to_call_chain[new] = chain  # the site REUSING it: two calls are two sites
                 self.id_to_color[new] = cb.color
                 out.append(replace(cb, section_id=new))
                 continue
@@ -3628,6 +3652,7 @@ class Evaluator:
             def inherit(old, new):
                 was = self.id_to_node.get(old)
                 self.id_to_node[new] = was if was is not None and was is not producer else node
+                self.id_to_call_chain[new] = chain
                 if old in self.id_to_color:
                     self.id_to_color[new] = self.id_to_color[old]
 
@@ -4098,8 +4123,10 @@ class Evaluator:
     # --- primitives ---
 
     def _tag(self, body: m3d.Manifold, node: ASTNode, ctx: EvalContext) -> ColoredBody:
+        chain = self._current_call_chain()
         for orig_id in body.to_mesh().run_original_id:
             self.id_to_node[int(orig_id)] = node
+            self.id_to_call_chain[int(orig_id)] = chain
             self.id_to_color[int(orig_id)] = ctx.color
         return ColoredBody(body=body, color=ctx.color)
 
@@ -4109,6 +4136,7 @@ class Evaluator:
         been migrated to the resolve/generate split (Phase 2)."""
         for orig_id in body.to_mesh().run_original_id:
             self.id_to_node[int(orig_id)] = node
+            self.id_to_call_chain[int(orig_id)] = self._generate_call_chain
             self.id_to_color[int(orig_id)] = color
         return ColoredBody(body=body, color=color)
 

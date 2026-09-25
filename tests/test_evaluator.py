@@ -4008,6 +4008,34 @@ class TestSectionIdsAndGenerateFlag:
         assert lines[0] == "ECHO: 1" and lines[1].startswith("WARNING: undefined operation")
 
 
+class TestCallChains:
+    """id_to_call_chain (cpp #180); identical to openscad_cpp_evaluator's
+    call_sites on this probe, cold and warm."""
+
+    def test_chains(self, tmp_path):
+        from openscad_lalr_parser import getASTfromFile
+        (tmp_path / "lib.scad").write_text("module boxy(s) { cube(s); }\n"
+                                           "module outer() { translate([0,20,0]) boxy(8); }\n")
+        (tmp_path / "main.scad").write_text("use <lib.scad>\ncube(1);\ntranslate([20,0,0]) boxy(4);\n"
+                                            "outer();\nmodule inner() { boxy(3); }\ninner();\ninner();\n")
+        cache = ManifoldCache()
+        seen = []
+        for _ in range(2):
+            nodes = getASTfromFile(str(tmp_path / "main.scad"))
+            ev = Evaluator(echo_fn=lambda m: None, manifold_cache=cache)
+            bodies, _ = ev.evaluate(nodes, build_scopes(nodes))
+            seen.append([[(p.origin.rsplit("/", 1)[-1], p.line, m)
+                          for p, m in ev.id_to_call_chain[int(b.body.to_mesh().run_original_id[0])]]
+                         for b in bodies])
+        assert seen[0] == [[], [("main.scad", 3, True)], [("lib.scad", 2, True), ("main.scad", 4, True)],
+                           [("main.scad", 5, True), ("main.scad", 6, True)],
+                           [("main.scad", 5, True), ("main.scad", 7, True)]]
+        # A warm render attributes a whole-subtree hit to the node reusing it.
+        assert seen[1] == [[], [], [("main.scad", 4, True)],
+                           [("main.scad", 5, True), ("main.scad", 6, True)],
+                           [("main.scad", 5, True), ("main.scad", 7, True)]]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
