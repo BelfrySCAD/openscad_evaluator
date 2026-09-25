@@ -2209,6 +2209,12 @@ class ColoredBody:
     color: Optional[tuple[float, float, float, float]] = None  # RGBA 0-1
     section: Optional[m3d.CrossSection] = None  # set for 2D primitives
     flat_preview: bool = False  # thin extrusion standing in for a 2D shape (see to_renderable_bodies)
+    # Where a 2D `section` sits along Z, applied when it is extruded for
+    # display. A CrossSection has no Z, so `down(1) square(10)` lost the -1
+    # and z-fought whatever it was meant to sit under (BOSL2 contour()
+    # layers overlays that way). Only translation is carried; a 3D rotate
+    # of a 2D shape still loses it.
+    section_z: float = 0.0
     role: str = "normal"  # "normal" | "highlight" (#, real geom) | "highlight_ghost" (#, inside CSG) | "background" (%) | "show_only" (!)
     # Per-triangle RGBA override (shape (T, 4), aligned with body.to_mesh()'s
     # own tri_verts order), set only when a real boolean CSG merge (see
@@ -2305,10 +2311,12 @@ class ProfileResult:
     unattributed_time: float
 
 
-# Thin extrusion height used to display top-level 2D results (e.g. `circle();`)
+# Extrusion height used to display top-level 2D results (e.g. `circle();`)
 # in the 3D viewport — the renderer/exporter only know how to handle Manifold
-# meshes, and real OpenSCAD's flat 2D preview has no Manifold equivalent.
-_TOP_LEVEL_2D_HEIGHT = 1e-3
+# meshes. 1 unit, as OpenSCAD's own 2D preview is (measured at three camera
+# tilts); 1e-3 gave --viewall a different box, so 2D images came out at a
+# different scale from the reference's.
+_TOP_LEVEL_2D_HEIGHT = 1.0
 
 # Matches SceneRenderer._default_color (renderer.py) -- the color shown for
 # geometry with no explicit color() override. ColoredBody.color normally
@@ -2326,7 +2334,7 @@ def to_renderable_bodies(bodies: list[ColoredBody]) -> list[ColoredBody]:
     through unchanged, and so do open-mesh bodies (`raw_mesh` set), which a
     renderer or exporter draws from their raw triangles."""
     return [
-        ColoredBody(body=m3d.Manifold.extrude(cb.section, _TOP_LEVEL_2D_HEIGHT),
+        ColoredBody(body=m3d.Manifold.extrude(cb.section, _TOP_LEVEL_2D_HEIGHT).translate([0, 0, cb.section_z]),
                     color=cb.color, flat_preview=True, role=cb.role)
         if cb.body is None and cb.section is not None else cb
         for cb in bodies
@@ -4082,7 +4090,9 @@ class Evaluator:
         result = []
         for b in self._one_dimension(flatten_csg_tree(children), node):
             if b.section is not None:
-                result.append(replace(b, section=self._apply_transform_2d(name, args, b.section)))
+                z = b.section_z + (self._to_vec3(self._get_arg(args, 0, "v", [0, 0, 0]))[2]
+                                   if name == "translate" else 0.0)
+                result.append(replace(b, section=self._apply_transform_2d(name, args, b.section), section_z=z))
             elif b.body is not None:
                 result.append(replace(b, body=self._apply_transform_3d(name, args, b.body)))
             elif b.raw_mesh is not None:

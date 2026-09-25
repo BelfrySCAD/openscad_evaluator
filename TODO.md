@@ -10,11 +10,6 @@ Triaged 2026-09-24 against cpp 1dc0538..e7a6859 (1.27.0). Hashes are cpp commits
 PRs. Each item below was confirmed to still be wrong here, most by a probe script; items marked
 **silent** give wrong output with no warning.
 
-### Bug fixes
-
-Debugger / viewport
-- 2D preview slab is 1e-3 thick, reference is 1; translated 2D shape loses its Z (#138)
-
 ### Features
 
 Needs openscad_lalr_parser changes first
