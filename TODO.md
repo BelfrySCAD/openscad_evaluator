@@ -44,14 +44,14 @@ Numbers and strings
 - Degree trig not bit-exact: `sin(45)-cos(45)` is -1.1e-16; port `degree_trig.cc` (#133)
 - `[5:1:0]==[5:1:0]` is false (#146)
 - `[each "12"]` should split to characters; `[each [0:2]]` should expand the range (#146)
+- `object()` values echo as `object(a = 1, b = 2)`; OpenSCAD prints `{ a = 1; b = 2; }` and
+  `{ }` when empty (checked against 2026.02.01 with --enable=object-function)
 - `str(function(x) x+1)` should print `function(x) (x + 1)` like the reference (#146)
 
 Diagnostics
 - Undeclared / extra arguments are silently dropped in `_bind_args` (#92)
 - Numeric builtins don't warn on a non-number ("cos() parameter could not be converted")
   (04797d0); argument/operand warnings in general, `abs(undef)`, `1+"a"` (#99)
-- Backwards-range warning for `[5:0]` with an implicit step — needs the lalr parser's
-  step-written flag first (#108)
 - Range of ≥1,000,000 elements: warn "Bad range parameter in for statement: too many elements"
   and iterate zero times (f614e0d); `[for(i=[0:1:1/0]) i]` hangs instead (#147)
 - Warnings should name the user's call site and carry TRACE lines, generate-time ones too
@@ -76,11 +76,12 @@ Debugger / viewport
 ### Features
 
 Needs openscad_lalr_parser changes first
-- `render()` in expression position returning an object (#104)
 - Strict-commas mode (#158)
 
 Language extensions
-- `polyhedron(vnf)`: `[verts,faces]` or the render object (#106)
+- `polyhedron(vnf)`: `[verts,faces]` or the render object (#106); `polygon()` taking the 2D
+  render object. render() expressions are in; this is what makes the mesh round-trip in one call
+  (today it takes `polyhedron(o.vertices, o.faces)`)
 - `children(separate=true)` (#110, #111, #112)
 - `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
 - `minkowski_difference()` (#101), `sphere(style=)` (#102), `simplify()` (#103)
