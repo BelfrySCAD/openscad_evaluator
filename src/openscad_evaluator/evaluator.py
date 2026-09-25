@@ -2326,6 +2326,11 @@ class ColoredBody:
     # layers overlays that way). Only translation is carried; a 3D rotate
     # of a 2D shape still loses it.
     section_z: float = 0.0
+    # A 2D section's originalID -- a CrossSection has no run IDs, so without
+    # one a top-level 2D shape could not be picked back to source. Reserved
+    # when the section is first generated, attributed in id_to_node to the
+    # node that built it, and given to the preview slab (cpp #192).
+    section_id: Optional[int] = None
     role: str = "normal"  # "normal" | "highlight" (#, real geom) | "highlight_ghost" (#, inside CSG) | "background" (%) | "show_only" (!)
     # Per-triangle RGBA override (shape (T, 4), aligned with body.to_mesh()'s
     # own tri_verts order), set only when a real boolean CSG merge (see
@@ -2438,18 +2443,32 @@ _TOP_LEVEL_2D_HEIGHT = 1.0
 _DEFAULT_GEOMETRY_COLOR = (0.9, 0.85, 0.1, 1.0)
 
 
-def to_renderable_bodies(bodies: list[ColoredBody]) -> list[ColoredBody]:
+def to_renderable_bodies(bodies: list[ColoredBody], height: float = _TOP_LEVEL_2D_HEIGHT) -> list[ColoredBody]:
     """Convert top-level 2D-only results (`body is None`, `section` set —
-    e.g. `circle();`) into thin-extruded Manifolds, so the renderer/exporter
+    e.g. `circle();`) into extruded Manifolds, so the renderer/exporter
     (which only handle Manifold meshes) can display them. 3D bodies pass
     through unchanged, and so do open-mesh bodies (`raw_mesh` set), which a
-    renderer or exporter draws from their raw triangles."""
-    return [
-        ColoredBody(body=m3d.Manifold.extrude(cb.section, _TOP_LEVEL_2D_HEIGHT).translate([0, 0, cb.section_z]),
-                    color=cb.color, flat_preview=True, role=cb.role)
-        if cb.body is None and cb.section is not None else cb
-        for cb in bodies
-    ]
+    renderer or exporter draws from their raw triangles.
+
+    `height` lets a viewer thin the slab (cpp #193); keep the default, 1 as
+    OpenSCAD's own preview is, for anything that frames or exports it. The
+    slab carries the section's `section_id` as its one run, so a click on
+    it finds the node that built the shape."""
+    out = []
+    for cb in bodies:
+        if cb.body is not None or cb.section is None:
+            out.append(cb)
+            continue
+        body = m3d.Manifold.extrude(cb.section, height).translate([0, 0, cb.section_z])
+        if cb.section_id is not None and not body.is_empty():
+            mesh = body.to_mesh64()
+            tris = np.array(mesh.tri_verts, dtype=np.uint64)
+            body = m3d.Manifold(m3d.Mesh64(
+                vert_properties=np.array(mesh.vert_properties, dtype=np.float64), tri_verts=tris,
+                run_index=np.array([0, tris.size], dtype=np.uint64),
+                run_original_id=np.array([cb.section_id], dtype=np.uint32)))
+        out.append(ColoredBody(body=body, color=cb.color, flat_preview=True, role=cb.role))
+    return out
 
 
 def flatten_csg_tree(tree: list[CSGNode]) -> list[ColoredBody]:
@@ -3252,11 +3271,17 @@ class Evaluator:
                 if name not in root_scope.functions:
                     root_scope.define_function(name, decl)
 
-    def evaluate(self, nodes: list[ASTNode], root_scope, viewport_params: dict | None = None) -> tuple[list[ColoredBody], dict[int, ASTNode]]:
+    def evaluate(self, nodes: list[ASTNode], root_scope, viewport_params: dict | None = None,
+                 generate: bool = True) -> tuple[list[ColoredBody], dict[int, ASTNode]]:
         """Walk top-level AST nodes to build self.csg_tree (resolve pass,
         no Manifold calls), then generate_tree() it once (generate pass,
         the only place Manifold work happens) to produce the final
-        geometry. Returns (geometry, id_to_node mapping)."""
+        geometry. Returns (geometry, id_to_node mapping).
+
+        `generate=False` stops after the resolve pass: the script runs in
+        full, so every echo, warning and error is reported as usual, but no
+        geometry is built and the body list is empty -- "does this script
+        run?", as OpenSCAD's `-o out.term` asks (cpp #144)."""
         self._resolve_use_statements(nodes, root_scope)
         self._call_stack.clear()
         self._frame_ctxs.clear()
@@ -3286,7 +3311,7 @@ class Evaluator:
         for node in others:
             self._eval_statement(node, ctx)
         t_resolve_end = time.perf_counter() if self._profiling else 0.0
-        result = self.generate_tree(self._show_only_root())
+        result = self.generate_tree(self._show_only_root()) if generate else []
         t_generate_end = time.perf_counter() if self._profiling else 0.0
         if self._profiling:
             resolve_time = t_resolve_end - t_resolve_start
@@ -3539,6 +3564,7 @@ class Evaluator:
                             node.bodies = generate_fn(node.params, node.children, node.node)
                         finally:
                             self._generate_warn_entry = saved_entry
+                        node.bodies = self._tag_sections(node.bodies, node.node)
                     else:
                         node.bodies = children_bodies
                 finally:
@@ -3552,6 +3578,20 @@ class Evaluator:
                     self._cache_producer[key] = node.node
             result.extend(node.bodies)
         return result
+
+    def _tag_sections(self, bodies: list[ColoredBody], node) -> list[ColoredBody]:
+        """Give each new 2D section an originalID attributed to `node`; a
+        transformed one keeps its own, since replace() carries it."""
+        out = bodies
+        for i, cb in enumerate(bodies):
+            if cb.section is not None and cb.body is None and cb.section_id is None:
+                sid = int(m3d.Manifold.reserve_ids(1))
+                self.id_to_node[sid] = node
+                self.id_to_color[sid] = cb.color
+                if out is bodies:
+                    out = list(bodies)
+                out[i] = replace(cb, section_id=sid)
+        return out
 
     def _restamp_cached_ids(self, bodies: list[ColoredBody], node, producer) -> list[ColoredBody]:
         """Cached bodies with fresh originalIDs. A hit hands back the IDs of
@@ -3568,6 +3608,14 @@ class Evaluator:
         still render faster warm than cold in the C++ port."""
         out = []
         for cb in bodies:
+            if cb.section_id is not None:
+                # A 2D body's one ID, by the same rule as a solid's runs.
+                new = int(m3d.Manifold.reserve_ids(1))
+                was = self.id_to_node.get(cb.section_id)
+                self.id_to_node[new] = was if was is not None and was is not producer else node
+                self.id_to_color[new] = cb.color
+                out.append(replace(cb, section_id=new))
+                continue
             if cb.body is None or cb.body.is_empty():
                 out.append(cb)
                 continue
@@ -4478,6 +4526,8 @@ class Evaluator:
                 ids = (oid,) if oid >= 0 else b.body.to_mesh().run_original_id
                 for rid in ids:
                     self.id_to_color[int(rid)] = rgba
+            if b.section_id is not None:
+                self.id_to_color[b.section_id] = rgba
         return [replace(b, color=rgba, tri_colors=None) for b in bodies]
 
     def _css_color(self, name: str, alpha: float = 1.0) -> tuple:

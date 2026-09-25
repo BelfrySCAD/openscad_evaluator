@@ -3979,6 +3979,35 @@ class TestSvgImportFilter:
             [], ['WARNING: import() filter id = "nope" did not match anything'])
 
 
+class TestSectionIdsAndGenerateFlag:
+    """cpp #144, #192, #193."""
+
+    def test_2d_shapes_pick_back_to_their_line_across_cache_hits(self):
+        from openscad_evaluator.evaluator import to_renderable_bodies
+        src = "square(5);\ntranslate([10,0]) circle(3);\ncolor(\"red\") translate([20,0]) square(2);"
+        cache = ManifoldCache()
+        for _ in range(2):
+            nodes = getASTfromString(src, include_comments=False)
+            ev = Evaluator(echo_fn=lambda m: None, manifold_cache=cache)
+            bodies, id_to_node = ev.evaluate(nodes, build_scopes(nodes))
+            slabs = to_renderable_bodies(bodies)
+            ids = [int(b.body.to_mesh().run_original_id[0]) for b in slabs]
+            assert [id_to_node[i].position.line for i in ids] == [1, 2, 3]
+            assert ev.id_to_color[ids[2]] == (1.0, 0.0, 0.0, 1.0)
+
+    def test_preview_height(self):
+        from openscad_evaluator.evaluator import to_renderable_bodies
+        bodies, _ = run("square(5);")
+        assert to_renderable_bodies(bodies, height=0.1)[0].body.bounding_box()[5] == pytest.approx(0.1)
+
+    def test_generate_false_runs_the_script_but_builds_nothing(self):
+        lines = []
+        nodes = getASTfromString('echo(1); cube(1); echo(1+"a");', include_comments=False)
+        bodies, _ = Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes), generate=False)
+        assert bodies == []
+        assert lines[0] == "ECHO: 1" and lines[1].startswith("WARNING: undefined operation")
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
