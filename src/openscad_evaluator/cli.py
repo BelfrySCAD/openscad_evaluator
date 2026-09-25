@@ -24,7 +24,6 @@ import os
 import signal
 import sys
 
-import numpy as np
 
 from openscad_lalr_parser import FunctionDeclaration, ModuleDeclaration, getASTfromFile
 
@@ -32,7 +31,7 @@ from openscad_evaluator._debug_repl import DebugRepl, DeclInfo
 from openscad_evaluator.evaluator import (
     DEBUGGING_STOPPED_MESSAGE, EvalError, Evaluator, resolve_use_scopes, to_renderable_bodies,
 )
-from openscad_evaluator.export import export_bodies, format_for_path
+from openscad_evaluator.export import export_extensions, export_model, format_for_path
 
 
 def _collect_declarations(nodes: list, cls: type, main_path: str) -> list[DeclInfo]:
@@ -141,10 +140,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         description="Evaluate an OpenSCAD script and export a mesh.",
     )
     parser.add_argument("input", help="Path to the .scad file to evaluate")
-    parser.add_argument("-o", "--output", required=True, help="Output mesh file (.stl, .obj, .off, or .3mf)")
+    parser.add_argument("-o", "--output", required=True,
+                        help=f"Output file ({', '.join(export_extensions())})")
     parser.add_argument(
-        "--format", choices=["stl", "obj", "off", "3mf"],
+        "--format", choices=[e[1:] for e in export_extensions()],
         help="Explicit output format (default: inferred from --output's extension)",
+    )
+    parser.add_argument(
+        "--split-components", action="store_true",
+        help="Give every disconnected piece its own object in the multi-object formats. "
+             "Off by default, matching OpenSCAD",
     )
     parser.add_argument("--debug", action="store_true", help="Run under an interactive, gdb-style debugger")
     parser.add_argument("--profile", metavar="FILENAME", help="Write a per-call-site profiling report to FILENAME")
@@ -258,19 +263,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
 
-        bodies = to_renderable_bodies(bodies)
-        # Warn, don't refuse: a deliberately open surface is a legitimate
-        # thing to export, and blocking the save would be worse than saying so.
-        from openscad_evaluator.mesh_check import check_mesh
-        for n, b in enumerate(bodies, 1):
-            if b.body is not None and not b.body.is_empty():
-                mesh = b.body.to_mesh64()
-                d = check_mesh(np.array(mesh.vert_properties)[:, :3], np.array(mesh.tri_verts))
-                if not d.ok():
-                    print(f"WARNING: export: part {n} is not a closed manifold solid -- {d.summary()}",
-                          file=sys.stderr)
         try:
-            export_bodies(args.output, bodies, fmt=fmt)
+            # Warnings, not refusals: a deliberately open surface is a
+            # legitimate thing to export.
+            for w in export_model(args.output, bodies, fmt=fmt, split_components=args.split_components):
+                print(f"WARNING: export: {w}", file=sys.stderr)
         except (ValueError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1

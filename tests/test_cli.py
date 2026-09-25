@@ -73,7 +73,7 @@ class TestExportFormats:
         src = _write(tmp_path, "cube.scad", CUBE_SCRIPT)
         out = tmp_path / "cube.obj"
         assert cli.main([str(src), "-o", str(out)]) == 0
-        assert out.read_text().startswith("v ")
+        assert out.read_text().startswith("mtllib ")
 
     def test_off_export(self, tmp_path):
         src = _write(tmp_path, "cube.scad", CUBE_SCRIPT)

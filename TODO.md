@@ -23,10 +23,7 @@ Needs openscad_lalr_parser changes first
 Language extensions
 
 Export
-- Export the implicit top-level union split per colour then per component, with per-triangle
-  colour (#93, #80, #81, #157, #165, #177)
-- Formats: AMF with a single-sourced format list (#118), PLY, VRML, X3D, ASCII STL, OBJ+`.mtl`,
-  SVG (#159), PDF with ruler/page options (#160); sliver stripping and mesh checks
+- Formats: AMF, PLY, VRML, X3D, ASCII STL, SVG (#159), PDF with ruler/page options (#160)
 
 Tools and API
 - Per-path profiling tree (`ProfileResult.paths`), child-call kind, call columns
