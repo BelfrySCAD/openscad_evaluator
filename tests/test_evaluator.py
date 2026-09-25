@@ -5615,3 +5615,38 @@ class TestBackwardsRangeWarning:
     def test_silent(self, src):
         _, lines = run(src)
         assert lines == []
+
+
+class TestPolyhedronFromObject:
+    """polyhedron(obj), polyhedron(vnf) and polygon(obj): a render() result
+    goes straight back in, as in openscad_cpp_evaluator."""
+
+    _SOLID = "o = render() { difference() { cube(10, center=true); sphere(4, $fn=16); } };"
+
+    @pytest.mark.parametrize("call", ["polyhedron(o);", "polyhedron(o.vnf);", "polyhedron(o.vertices, o.faces);"])
+    def test_all_three_forms_rebuild_the_solid(self, call):
+        bodies, lines = run(self._SOLID + call + "echo(o.volume);")
+        assert bodies[0].body.volume() == approx(748.651, rel=1e-5)  # positive: winding survives
+        assert lines == ["ECHO: 748.651"]
+
+    def test_any_object_with_the_keys(self):
+        bodies, _ = run("polyhedron(object(points=[[0,0,0],[1,0,0],[0,1,0],[0,0,1]], "
+                        "faces=[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]));")
+        assert bodies[0].body.volume() == approx(1 / 6)
+
+    def test_object_without_faces_errors(self):
+        with pytest.raises(EvalError, match="object has no 'faces' key"):
+            run("polyhedron(object(vertices=[[0,0,0]]));")
+
+    def test_two_points_are_not_taken_for_a_vnf(self):
+        # a 2-point list has a POINT second, not a list of faces
+        with pytest.raises(EvalError, match="'points' and 'faces' are required"):
+            run("polyhedron([[0,0,0],[1,0,0]]);")
+
+    def test_polygon_from_object(self):
+        bodies, _ = run("s = render() { difference() { square(10); translate([2, 2]) square(3); } }; polygon(s);")
+        assert bodies[0].section.area() == approx(91)
+
+    def test_polygon_object_without_paths_is_one_contour(self):
+        bodies, _ = run("polygon(object(vertices=[[0,0],[4,0],[0,3]]));")
+        assert bodies[0].section.area() == approx(6)

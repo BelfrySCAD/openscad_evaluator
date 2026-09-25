@@ -3778,6 +3778,24 @@ class Evaluator:
         faces = self._get_arg(args, 1, "faces", None)
         if faces is None:
             faces = self._get_arg(args, 1, "triangles", None)  # legacy alias
+        if isinstance(points, OscObject):
+            # polyhedron(obj): any object with vertices (or points) and faces
+            # -- a render() result round-trips in one call.
+            verts = points.get("vertices")
+            if verts is None:
+                verts = points.get("points")
+            if verts is None:
+                self.error("polyhedron: object has no 'vertices' (or 'points') key", node)
+            if points.get("faces") is None:
+                self.error("polyhedron: object has no 'faces' key", node)
+            points, faces = verts, points.get("faces")
+        elif (faces is None and isinstance(points, list) and len(points) == 2
+              and all(isinstance(half, list) and half and isinstance(half[0], list) for half in points)):
+            # polyhedron(vnf): BOSL2's [vertices, faces] 2-list, told apart as
+            # BOSL2's is_vnf() does -- its second element is a list of LISTS,
+            # where a 2-point list would have a point there. Only when faces
+            # wasn't given separately, so the two-argument form always wins.
+            points, faces = points
         if points is None or faces is None:
             self.error("polyhedron: 'points' and 'faces' are required", node)
         if not isinstance(points, list) or not isinstance(faces, list):
@@ -4568,6 +4586,15 @@ class Evaluator:
             # polygon
             points = self._get_arg(args, 0, "points", None)
             paths = self._get_arg(args, 1, "paths", None)
+            if isinstance(points, OscObject):
+                # polygon(obj): the 2D counterpart of polyhedron(obj). A missing
+                # `paths` means one contour, as it does for the list form.
+                verts = points.get("vertices")
+                if verts is None:
+                    verts = points.get("points")
+                if verts is None:
+                    raise ValueError("object has no 'vertices' (or 'points') key")
+                points, paths = verts, points.get("paths")
             if points is None:
                 self.error("polygon: 'points' is required", node)
             pts = [[float(p[0]), float(p[1])] for p in points]

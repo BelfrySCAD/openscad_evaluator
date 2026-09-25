@@ -79,9 +79,6 @@ Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
 Language extensions
-- `polyhedron(vnf)`: `[verts,faces]` or the render object (#106); `polygon()` taking the 2D
-  render object. render() expressions are in; this is what makes the mesh round-trip in one call
-  (today it takes `polyhedron(o.vertices, o.faces)`)
 - `children(separate=true)` (#110, #111, #112)
 - `$_BELFRYSCAD`, `$_SUPPORTED_FEATURE`, `supported_feature()` (#113, #115)
 - `minkowski_difference()` (#101), `sphere(style=)` (#102), `simplify()` (#103)
