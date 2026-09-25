@@ -18,14 +18,6 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 - A never-set `$var` and `is_undef(zzz)` should be undef with no warning (37539f9, #114)
 - `$preview` should be seeded `false`, not undef-with-warning (#100)
 
-CSG
-- 2D shapes lose out-of-plane transforms: `rotate([55,0,25]) square(5)` stays flat (#141)
-- `union(){cube(2);square(3);}` crashes (`NoneType + CrossSection`); union, color and transforms
-  must carry both dimensions (#145)
-- `!` re-roots the tree instead of filtering roles: `translate([50,0,0]) !cube(5)` should land at
-  x=50 (#87)
-- 2D `minkowski()` produces nothing (#89)
-
 Builtin arguments
 - `resize(auto=)` ignored (04797d0)
 - `offset(2)` means r=2; bare `offset()` means r=1 (04797d0)
