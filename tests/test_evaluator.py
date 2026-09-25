@@ -5773,7 +5773,7 @@ class TestHugeRanges:
 
     def test_limit_is_per_range(self):
         _, lines = run("echo(len([for (i=[0:1100], j=[0:1100]) 1]));")
-        assert lines == ["ECHO: 1212201"]
+        assert lines == ["ECHO: 1.2122e+6"]  # 1212201, in OpenSCAD's 6 significant digits
 
     def test_statement_for(self):
         bodies, lines = run("for (i=[0:2000000]) cube(1);")
@@ -5798,3 +5798,33 @@ class TestEach:
     def test_each(self, src, out):
         _, lines = run(f"echo({src});")
         assert lines == [f"ECHO: {out}"]
+
+
+
+class TestNumberFormat:
+    """echo()/str() write numbers as OpenSCAD does: 6 significant digits,
+    fixed notation for exponents -5..5, `e+N` without a leading zero.
+    Expected strings are OpenSCAD 2026.02.01's own."""
+
+    @pytest.mark.parametrize("expr, out", [
+        ("999999", "999999"), ("1000000", "1e+6"), ("123456.7", "123457"),
+        ("1234567", "1.23457e+6"), ("0.0000123456", "0.0000123456"), ("1e-7", "1e-7"),
+        ("1.5e20", "1.5e+20"), ("-2500000", "-2.5e+6"), ("100000", "100000"),
+        ("1/3", "0.333333"), ("2/3*1e6", "666667"), ("-1e-10", "-1e-10"),
+        ("0.00001", "0.00001"), ("0.0001", "0.0001"), ("12.3456789", "12.3457"),
+        ("99999.95", "99999.9"),          # printed 100000: the mantissa was rounded after dividing
+        ("999999.5", "1e+6"),
+        ("1e-300/1e20", "9.99989e-321"),  # subnormal: printed 1.00198e-320
+    ])
+    def test_matches_openscad(self, expr, out):
+        _, lines = run(f"echo({expr});")
+        assert lines == [f"ECHO: {out}"]
+
+    def test_integer_results_too(self):
+        # len() returns an int, which used to print in full
+        _, lines = run("echo(len([for (i=[0:1100], j=[0:1100]) 1]), len(\"abc\"));")
+        assert lines == ["ECHO: 1.2122e+6, 3"]
+
+    def test_smallest_subnormal_does_not_crash(self):
+        from openscad_evaluator.evaluator import _format_number
+        assert _format_number(5e-324) == "4.94066e-324"  # ZeroDivisionError before

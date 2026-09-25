@@ -1406,19 +1406,19 @@ def _format_number(v: float) -> str:
 
     neg = v < 0
     av = abs(v)
-    exp = math.floor(math.log10(av))
-    mantissa = round(av / (10 ** exp), 5)
-    if mantissa >= 10:
-        mantissa /= 10
-        exp += 1
-
+    # The exponent AFTER rounding to 6 significant digits, from Python's own
+    # correctly rounded formatting. Dividing by 10**exp and rounding the
+    # mantissa got the edges wrong: 99999.95 printed as 100000 (it is
+    # 99999.949999... in binary; OpenSCAD prints 99999.9), a subnormal came
+    # out a digit off, and 5e-324 divided by zero.
+    mantissa, exp = f"{av:.5e}".split("e")
+    exp = int(exp)
     if -5 <= exp <= 5:
-        decimals = max(0, 5 - exp)
-        s = f"{av:.{decimals}f}"
+        s = f"{av:.{5 - exp}f}"
         if "." in s:
             s = s.rstrip("0").rstrip(".")
     else:
-        m = f"{mantissa:.5f}".rstrip("0").rstrip(".")
+        m = mantissa.rstrip("0").rstrip(".")
         s = f"{m}e{'+' if exp >= 0 else '-'}{abs(exp)}"
     return ("-" + s) if neg else s
 
@@ -2548,7 +2548,7 @@ class Evaluator:
             return "true" if v else "false"
         if isinstance(v, OscRange):
             return f"[{_format_number(v.start)} : {_format_number(v.step)} : {_format_number(v.end)}]"
-        if isinstance(v, float):
+        if isinstance(v, (int, float)):  # an int too: len() of 1212201 items echoes 1.2122e+6
             return _format_number(v)
         if isinstance(v, list):
             return "[" + ", ".join(self._fmt_val(x) for x in v) + "]"
