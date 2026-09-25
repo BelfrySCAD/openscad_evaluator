@@ -40,5 +40,4 @@ Tools and API
   (#169, #170, #175)
 - Per-path profiling tree (`ProfileResult.paths`), child-call kind, call columns
   (8e54284, 709da93)
-- Cut-face green for uncoloured subtrahends, `keep_minuend_color` (#173)
 - Real text shaping (kerning, bidi) — optional, large (#96)

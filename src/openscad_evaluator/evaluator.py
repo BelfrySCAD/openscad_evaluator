@@ -2331,6 +2331,12 @@ class ColoredBody:
     # when the section is first generated, attributed in id_to_node to the
     # node that built it, and given to the preview slab (cpp #192).
     section_id: Optional[int] = None
+    # The operands a union() merged into this body, unmerged, as they were
+    # when merged (transforms and color() map over them since). Set only
+    # under keep_minuend_color, where a difference() cuts each part on its
+    # own so its cut faces take that part's colour; any other op building a
+    # new body from this one drops it.
+    merged_from: Optional[tuple] = None
     role: str = "normal"  # "normal" | "highlight" (#, real geom) | "highlight_ghost" (#, inside CSG) | "background" (%) | "show_only" (!)
     # Per-triangle RGBA override (shape (T, 4), aligned with body.to_mesh()'s
     # own tri_verts order), set only when a real boolean CSG merge (see
@@ -2445,6 +2451,11 @@ _TOP_LEVEL_2D_HEIGHT = 1.0
 # Evaluator._attach_tri_colors) bakes colors in at generate time, so an
 # uncolored *part* of a multi-color CSG merge needs a concrete fallback here.
 _DEFAULT_GEOMETRY_COLOR = (0.9, 0.85, 0.1, 1.0)
+# The faces a difference() exposes where the subtrahend carried no colour
+# of its own: OpenSCAD's CGAL "back face" green (#9DCB51), which its preview
+# paints and its colour-preserving render and 3MF export keep -- so a cut
+# through an uncoloured part reads as a cut (cpp #173).
+_CUT_FACE_COLOR = (157 / 255, 203 / 255, 81 / 255, 1.0)
 
 
 def to_renderable_bodies(bodies: list[ColoredBody], height: float = _TOP_LEVEL_2D_HEIGHT) -> list[ColoredBody]:
@@ -2847,7 +2858,8 @@ def resolve_use_scopes(nodes, current_file, log_fn):
 
 class Evaluator:
     def __init__(self, echo_fn=None, debug_hook=None, error_break_fn=None, return_hook=None,
-                 manifold_cache: "ManifoldCache | None" = None, profile: bool = False):
+                 manifold_cache: "ManifoldCache | None" = None, profile: bool = False,
+                 keep_minuend_color: bool = False):
         self.id_to_node: dict[int, ASTNode] = {}
         # originalID -> the call chain that reached it, innermost first, as
         # (call position, is_module) pairs; () for top-level geometry.
@@ -2873,6 +2885,10 @@ class Evaluator:
         # call site/test is unaffected) content-hash cache shared across
         # renders/debugger pauses -- see ManifoldCache and generate_tree().
         self._manifold_cache = manifold_cache
+        # difference() paints its cut faces with the minuend's colour rather
+        # than the subtrahend's (or the cut green) -- what OpenCSG preview
+        # cannot offer (openscad/openscad#4798; cpp #173). Off by default.
+        self._keep_minuend_color = keep_minuend_color
         self._cache_producer: dict[tuple, ASTNode] = {}  # key -> node whose generate filled it
         self._warn_captures: list[list[str]] = []  # one per cacheable subtree generating now
         # Incremented by _builtin_rands -- lets _eval_statement detect
@@ -3550,6 +3566,8 @@ class Evaluator:
         result = []
         for node in tree:
             key = None if (self._manifold_cache is None or node.uncacheable) else self._cache_key(node)
+            if key is not None and self._keep_minuend_color:
+                key = ("keep_minuend_color", key)  # the two modes colour cut faces differently
             cached = self._manifold_cache.get(key) if key is not None else None
             if cached is not None:
                 bodies, warnings = cached
@@ -3662,26 +3680,30 @@ class Evaluator:
                 # identical parts otherwise spends entirely here.
                 body = cb.body.as_original()
                 inherit(int(ids[0]), body.original_id())
-                out.append(replace(cb, body=body))
+                out.append(replace(cb, body=body, merged_from=self._remap_parts(
+                    cb.merged_from, {int(ids[0]): body.original_id()})))
                 continue
             fresh = {}
             for old in dict.fromkeys(int(i) for i in ids):
                 fresh[old] = int(m3d.Manifold.reserve_ids(1))
                 inherit(old, fresh[old])
-            def arr(name, dtype):
-                a = np.array(getattr(mesh, name), dtype=dtype)  # a copy: the binding rejects its own read-only arrays
-                return a if a.size else None  # the binding rejects an empty array
-
-            mesh = m3d.Mesh64(vert_properties=arr("vert_properties", np.float64),
-                              tri_verts=arr("tri_verts", np.uint64),
-                              merge_from_vert=arr("merge_from_vert", np.uint64),
-                              merge_to_vert=arr("merge_to_vert", np.uint64),
-                              run_index=arr("run_index", np.uint64),
-                              run_original_id=np.array([fresh[int(i)] for i in ids], dtype=np.uint32),
-                              run_transform=arr("run_transform", np.float64),
-                              face_id=arr("face_id", np.uint64))
-            out.append(replace(cb, body=m3d.Manifold(mesh)))
+            out.append(replace(cb, body=self._with_run_ids(mesh, [fresh[int(i)] for i in ids]),
+                               merged_from=self._remap_parts(cb.merged_from, fresh)))
         return out
+
+    def _remap_parts(self, parts, remap: dict):
+        """A union's unmerged parts share its IDs, so a restamp relabels them
+        too -- a part left on the old IDs would look uncoloured beside it."""
+        if not parts:
+            return parts
+        out = []
+        for p in parts:
+            body = p.body
+            if body is not None and not body.is_empty():
+                mesh = body.to_mesh64()
+                body = self._with_run_ids(mesh, [remap.get(int(i), int(i)) for i in mesh.run_original_id])
+            out.append(replace(p, body=body, merged_from=self._remap_parts(p.merged_from, remap)))
+        return tuple(out)
 
     def _eval_statement_impl(self, node: ASTNode, ctx: EvalContext) -> list[ColoredBody]:
         self._last_ctx = ctx
@@ -4337,12 +4359,20 @@ class Evaluator:
                                    if name == "translate" else 0.0)
                 result.append(replace(b, section=self._apply_transform_2d(name, args, b.section), section_z=z))
             elif b.body is not None:
-                result.append(replace(b, body=self._apply_transform_3d(name, args, b.body)))
+                result.append(replace(b, body=self._apply_transform_3d(name, args, b.body),
+                                      merged_from=self._transform_parts(name, args, b.merged_from)))
             elif b.raw_mesh is not None:
                 result.append(replace(b, raw_mesh=self._transform_raw_mesh(name, args, b.raw_mesh)))
             else:
                 result.append(b)
         return result
+
+    def _transform_parts(self, name: str, args: dict, parts):
+        """A union's unmerged parts move with it (see ColoredBody.merged_from)."""
+        if not parts:
+            return parts
+        return tuple(replace(p, body=self._apply_transform_3d(name, args, p.body) if p.body is not None else None,
+                             merged_from=self._transform_parts(name, args, p.merged_from)) for p in parts)
 
     def _transform_raw_mesh(self, name: str, args: dict, raw):
         """_apply_transform_3d for a raw_mesh, which has no Manifold to call:
@@ -4556,7 +4586,16 @@ class Evaluator:
                     self.id_to_color[int(rid)] = rgba
             if b.section_id is not None:
                 self.id_to_color[b.section_id] = rgba
-        return [replace(b, color=rgba, tri_colors=None) for b in bodies]
+        return [replace(b, color=rgba, tri_colors=None, merged_from=self._recolor_parts(b.merged_from, rgba))
+                for b in bodies]
+
+    @classmethod
+    def _recolor_parts(cls, parts, rgba):
+        """color() over a union() colours every part it was merged from; the
+        parts' runs are the body's, already recorded."""
+        if not parts:
+            return parts
+        return tuple(replace(p, color=rgba, merged_from=cls._recolor_parts(p.merged_from, rgba)) for p in parts)
 
     def _css_color(self, name: str, alpha: float = 1.0) -> tuple:
         if name.startswith("#"):
@@ -4646,6 +4685,10 @@ class Evaluator:
         # dropped (and, dropped, is an empty operand -- intersection() with
         # one is empty, as in OpenSCAD).
         kept = {id(b) for b in self._one_dimension(flatten_csg_tree(children), node)}
+        keeping = op == "difference" and self._keep_minuend_color
+        remember = op == "union" and self._keep_minuend_color
+        keep_parts: list[list] = []  # [part, the run IDs it was born with]
+        union_parts: list[ColoredBody] = []
 
         for size in params["group_sizes"]:
             group_nodes = children[idx:idx + size]
@@ -4682,12 +4725,24 @@ class Evaluator:
                 grp = bodies_3d[0].body
                 for c in bodies_3d[1:]:
                     grp = grp + c.body
+                if op == "difference" and csg_result is not None:
+                    for c in bodies_3d:
+                        if c.color is None and c.tri_colors is None:
+                            self._record_run_colors(c.body, _CUT_FACE_COLOR)
                 if csg_result is None:
                     csg_result = ColoredBody(body=grp, color=bodies_3d[0].color)
+                    for leaf in (self._keep_parts(bodies_3d) if keeping else ()):
+                        keep_parts.append([leaf, set(self._run_ids(leaf.body))])
+                    if remember:
+                        union_parts += self._keep_parts(bodies_3d)
                 elif op == "union":
                     csg_result = replace(csg_result, body=csg_result.body + grp)
+                    if remember:
+                        union_parts += self._keep_parts(bodies_3d)
                 elif op == "difference":
                     csg_result = replace(csg_result, body=csg_result.body - grp)
+                    for part in keep_parts:
+                        part[0] = replace(part[0], body=part[0].body - grp)
                 elif op == "intersection":
                     csg_result = replace(csg_result, body=csg_result.body ^ grp)
             elif parts_2d is None or op == "union":
@@ -4702,6 +4757,11 @@ class Evaluator:
                             for p in parts_2d]
                 parts_2d = [p for p in parts_2d if not p.section.is_empty()]
 
+        if csg_result is not None and csg_result.body is not None:
+            if remember and len(union_parts) > 1:
+                csg_result = replace(csg_result, merged_from=tuple(union_parts))
+            if keep_parts:
+                csg_result = replace(csg_result, body=self._finish_keep_minuend(keep_parts))
         # Return: CSG result + background ghosts + highlight overlays + show_only bodies (all separate from CSG result)
         if csg_result is not None and csg_result.body is not None:
             csg_result = self._attach_tri_colors(csg_result)
@@ -4709,6 +4769,70 @@ class Evaluator:
         if parts_2d:
             result.extend(parts_2d)
         return result + all_bg + all_hi + all_so
+
+    @staticmethod
+    def _run_ids(body: m3d.Manifold) -> list[int]:
+        oid = body.original_id()
+        return [oid] if oid >= 0 else [int(r) for r in body.to_mesh().run_original_id]
+
+    @classmethod
+    def _keep_parts(cls, bodies) -> list[ColoredBody]:
+        """keep_minuend_color: the leaf parts of these operands -- each one,
+        or what a union() merged it from, recursively."""
+        out = []
+        for b in bodies:
+            if b.merged_from:
+                out += cls._keep_parts(b.merged_from)
+            elif b.body is not None:
+                out.append(b)
+        return out
+
+    def _finish_keep_minuend(self, parts: list[list]) -> m3d.Manifold:
+        """Union the per-part differences, first re-minting each part's cut
+        faces -- the subtrahend's runs, shared by every part's result --
+        under fresh IDs carrying that part's colour, so _attach_tri_colors
+        tells one part's cut faces from another's. Their node stays the
+        subtrahend's: clicking a cut face still finds the tool.
+        ponytail: a part that is itself a multi-colour merge gives its cut
+        faces its first child's colour, not the one the cut passed through."""
+        out = None
+        for part, own in parts:
+            if part.body.is_empty():
+                continue
+            mesh = part.body.to_mesh64()
+            ids = [int(r) for r in mesh.run_original_id]
+            fresh = {}
+            for old in dict.fromkeys(ids):
+                if old in own:
+                    continue
+                new = fresh[old] = int(m3d.Manifold.reserve_ids(1))
+                if old in self.id_to_node:
+                    self.id_to_node[new] = self.id_to_node[old]
+                if old in self.id_to_call_chain:
+                    self.id_to_call_chain[new] = self.id_to_call_chain[old]
+                self.id_to_color[new] = part.color
+            body = part.body if not fresh else self._with_run_ids(mesh, [fresh.get(i, i) for i in ids])
+            out = body if out is None else out + body
+        return out if out is not None else m3d.Manifold()
+
+    @staticmethod
+    def _with_run_ids(mesh, run_ids: list[int]) -> m3d.Manifold:
+        """A Manifold rebuilt from `mesh` (a to_mesh64()) with its runs relabelled."""
+        def arr(name, dtype):
+            a = np.array(getattr(mesh, name), dtype=dtype)  # a copy: the binding rejects its own read-only arrays
+            return a if a.size else None  # and an empty one
+        return m3d.Manifold(m3d.Mesh64(
+            vert_properties=arr("vert_properties", np.float64), tri_verts=arr("tri_verts", np.uint64),
+            merge_from_vert=arr("merge_from_vert", np.uint64), merge_to_vert=arr("merge_to_vert", np.uint64),
+            run_index=arr("run_index", np.uint64), run_original_id=np.array(run_ids, dtype=np.uint32),
+            run_transform=arr("run_transform", np.float64), face_id=arr("face_id", np.uint64)))
+
+    def _record_run_colors(self, body: m3d.Manifold, rgba) -> None:
+        """Colour `body`'s runs in id_to_color, which is all _attach_tri_colors
+        has to go on once a merge has thrown the bodies away."""
+        oid = body.original_id()
+        for rid in ((oid,) if oid >= 0 else body.to_mesh().run_original_id):
+            self.id_to_color[int(rid)] = rgba
 
     @staticmethod
     def _paint_2d(parts: list[ColoredBody], c: ColoredBody) -> None:

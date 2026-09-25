@@ -4036,6 +4036,32 @@ class TestCallChains:
                            [("main.scad", 5, True), ("main.scad", 7, True)]]
 
 
+class TestKeepMinuendColor:
+    """Evaluator(keep_minuend_color=True) (cpp #173); triangle colours
+    identical to openscad_cpp_evaluator's, cold and cached."""
+
+    @staticmethod
+    def _colors(src, cache=None):
+        from collections import Counter
+        nodes = getASTfromString(src, include_comments=False)
+        ev = Evaluator(echo_fn=lambda m: None, keep_minuend_color=True, manifold_cache=cache)
+        bodies, _ = ev.evaluate(nodes, build_scopes(nodes))
+        return [sorted(Counter(tuple(round(float(x), 3) for x in r) for r in b.tri_colors).items())
+                if b.tri_colors is not None else b.color for b in bodies]
+
+    def test_cut_faces_take_the_minuend_colour(self):
+        assert self._colors('difference() { color("red") cube(10); color("blue") translate([5,5,5]) cube(10); }') \
+            == [(1.0, 0.0, 0.0, 1.0)]
+
+    def test_each_merged_part_cuts_in_its_own_colour_through_transforms_and_the_cache(self):
+        src = ('difference() { translate([0,0,1]) union() { color("red") cube(10); '
+               'color("green") translate([10,0,0]) cube(10); } translate([5,5,5]) cube([20,10,10]); }')
+        cache = ManifoldCache()
+        expect = [[((0.0, 0.502, 0.0, 1.0), 16), ((1.0, 0.0, 0.0, 1.0), 20)]]
+        assert self._colors(src, cache) == expect
+        assert self._colors(src, cache) == expect
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
@@ -5013,11 +5039,11 @@ class TestMultiColorCSGMerge:
         assert any(row[3] == 1.0 and not np.allclose(row, (0.0, 1.0, 1.0, 0.5))
                    for row in distinct)  # lightgreen cube, opaque
 
-    def test_difference_cut_face_gets_default_color(self):
+    def test_difference_cut_face_gets_the_cut_green(self):
         # The cylinder tool has no explicit color() -- its newly-exposed cut
-        # face (a fresh run_original_id contributed by the subtraction tool)
-        # must fall back to the default geometry color, matching what real
-        # OpenSCAD shows for an uncolored modifier used only as a cutter.
+        # face takes OpenSCAD's cut green (#9DCB51), which its preview paints
+        # and its 3MF export keeps (checked on 2026.02.01), not the default
+        # geometry colour, so a cut reads as a cut (cpp #173).
         src = """
         difference() {
             union() {
@@ -5034,7 +5060,7 @@ class TestMultiColorCSGMerge:
         distinct = np.unique(tc, axis=0)
         assert len(distinct) == 3
         assert any(np.allclose(row, (0.0, 1.0, 1.0, 0.5)) for row in distinct)
-        assert any(np.allclose(row, _DEFAULT_GEOMETRY_COLOR) for row in distinct)
+        assert any(np.allclose(row, (157 / 255, 203 / 255, 81 / 255, 1.0)) for row in distinct)
 
     def test_union_same_explicit_color_leaves_tri_colors_none(self):
         # Cheap-path guarantee: if every contributing color resolves to the
