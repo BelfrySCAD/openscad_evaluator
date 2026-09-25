@@ -4233,6 +4233,42 @@ class TestGlobalOrder:
             "WARNING: undefined operation (undefined + number)", "ECHO: 2", "ECHO: undef"]
 
 
+class TestProfilePaths:
+    """ProfileResult.paths, call columns and the "child" kind (cpp 8e54284,
+    709da93); the tree's shape is identical to openscad_cpp_evaluator's."""
+
+    SRC = ("module bracket() { translate([1,0,0]) difference() { cuboid(); cube(1); } }\n"
+           "module cuboid() { cube(2); }\nmodule rail() { cuboid(); cuboid(); }\n"
+           "module rec(n) { if (n > 0) rec(n - 1); cube(1); }\nmodule wrap() { children(); }\n"
+           "bracket();\nrail();\nrec(5);\nwrap() cuboid();\n")
+
+    def _tree(self):
+        nodes = getASTfromString(self.SRC, include_comments=False)
+        ev = Evaluator(echo_fn=lambda m: None, profile=True)
+        ev.evaluate(nodes, build_scopes(nodes))
+        paths = ev.profile_result.paths
+
+        def walk(i):
+            n = paths[i]
+            return (n["kind"], n["name"], n["call_line"], n["call_column"], n["call_count"],
+                    [walk(c) for c in n["children"]])
+        return walk(0), paths
+
+    def test_shape(self):
+        tree, _ = self._tree()
+        assert tree == ("", "<toplevel>", 0, 0, 0, [
+            ("module", "bracket", 6, 1, 1, [("module", "cuboid", 1, 54, 1, [])]),
+            ("module", "rail", 7, 1, 1, [("module", "cuboid", 3, 17, 1, []), ("module", "cuboid", 3, 27, 1, [])]),
+            ("module", "rec", 8, 1, 1, [("module", "rec", 4, 28, 5, [])]),  # direct recursion folds
+            ("module", "wrap", 9, 1, 1, [("child", "cuboid", 9, 8, 1, [])]),
+        ])
+
+    def test_cumulative_contains_its_subtree(self):
+        _, paths = self._tree()
+        for n in paths:
+            assert n["cumulative_time"] >= sum(paths[c]["cumulative_time"] for c in n["children"]) - 1e-12
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit

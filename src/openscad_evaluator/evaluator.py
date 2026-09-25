@@ -2411,7 +2411,7 @@ class CallSiteProfile:
     invocations. See Evaluator's profile=True instrumentation and
     docs/evaluator.md's "Profiling" section for the self/cumulative-time
     accounting rules."""
-    kind: str            # "module" | "function"
+    kind: str            # "module" | "child" (forwarded through children()) | "function"
     name: str
     caller_name: str     # enclosing module/function's name, or "<toplevel>"
     call_origin: str     # call_pos.origin ('' for the main file)
@@ -2419,6 +2419,7 @@ class CallSiteProfile:
     decl_origin: str
     decl_line: int
     call_count: int = 0
+    call_column: int = 0  # tells two calls sharing one line apart
     self_time: float = 0.0        # seconds, own code only, never double-counted
     cumulative_time: float = 0.0  # seconds, includes children; recursion-guarded
 
@@ -2436,6 +2437,15 @@ class ProfileResult:
     generate_time: float
     total_time: float
     unattributed_time: float
+    # The calling-context tree (cpp 8e54284, 709da93): a flat list of dicts,
+    # paths[0] the <toplevel> root, linked by parent/children INDICES. Each
+    # node is one call site on ONE path, so `cuboid` from `bracket` and from
+    # `rail` are separate nodes with their own times, where call_sites sums
+    # a site over every path. Keys: parent, children, kind, name,
+    # call_origin, call_line, call_column, decl_origin, decl_line,
+    # call_count, self_time, cumulative_time. Only direct self-recursion
+    # folds onto one node; cumulative time is derived from the subtree.
+    paths: list = field(default_factory=list)
 
 
 # Extrusion height used to display top-level 2D results (e.g. `circle();`)
@@ -2914,6 +2924,9 @@ class Evaluator:
         # _eval_user_function/_eval_function_literal's instrumentation.
         self._profiling = profile
         self._profile_sites: dict[tuple, CallSiteProfile] = {}
+        self._profile_paths: list[dict] = []
+        self._profile_cur = 0
+        self._via_children = False
         self._profile_active: set[tuple] = set()    # site_keys live on _call_stack (recursion guard)
         self._profile_child_time: list[float] = []  # parallel aux stack to _call_stack
         self.profile_result: "ProfileResult | None" = None
@@ -3337,6 +3350,11 @@ class Evaluator:
         self._profile_sites = {}
         self._profile_active = set()
         self._profile_child_time = []
+        self._profile_paths = [{"parent": -1, "children": [], "kind": "", "name": "<toplevel>", "call_origin": "",
+                                "call_line": 0, "call_column": 0, "decl_origin": "", "decl_line": 0,
+                                "call_count": 0, "self_time": 0.0, "cumulative_time": 0.0}]
+        self._profile_cur = 0
+        self._via_children = False
         self.profile_result = None
         ctx = EvalContext(scope=root_scope)
         if viewport_params:
@@ -3364,12 +3382,18 @@ class Evaluator:
             resolve_time = t_resolve_end - t_resolve_start
             generate_time = t_generate_end - t_resolve_end
             self_sum = sum(s.self_time for s in self._profile_sites.values())
+            # Children always sit after their parent, so one reverse sweep
+            # derives every cumulative time without recursing.
+            for n in reversed(self._profile_paths):
+                n["cumulative_time"] = n["self_time"] + sum(self._profile_paths[c]["cumulative_time"]
+                                                            for c in n["children"])
             self.profile_result = ProfileResult(
                 call_sites=list(self._profile_sites.values()),
                 resolve_time=resolve_time,
                 generate_time=generate_time,
                 total_time=resolve_time + generate_time,
                 unattributed_time=max(0.0, resolve_time - self_sum),
+                paths=self._profile_paths,
             )
         return result, self.id_to_node
 
@@ -3957,7 +3981,8 @@ class Evaluator:
         back to _profile_exit on the matching pop."""
         call_origin = getattr(call_pos, 'origin', None) or ''
         call_line = getattr(call_pos, 'line', 0) if call_pos else 0
-        site_key = (kind, name, call_origin, call_line)
+        call_column = getattr(call_pos, 'column', 0) if call_pos else 0
+        site_key = (kind, name, call_origin, call_line, call_column)
         site = self._profile_sites.get(site_key)
         if site is None:
             # self._call_stack still has the caller on top -- _profile_enter
@@ -3969,7 +3994,7 @@ class Evaluator:
             caller_name = self._call_stack[-1][1] if self._call_stack else "<toplevel>"
             site = CallSiteProfile(
                 kind=kind, name=name, caller_name=caller_name,
-                call_origin=call_origin, call_line=call_line,
+                call_origin=call_origin, call_line=call_line, call_column=call_column,
                 decl_origin=getattr(decl_pos, 'origin', None) or '',
                 decl_line=getattr(decl_pos, 'line', 0) if decl_pos else 0,
             )
@@ -3979,9 +4004,43 @@ class Evaluator:
         if not recursive_reentry:
             self._profile_active.add(site_key)
         self._profile_child_time.append(0.0)
-        return site, site_key, recursive_reentry, time.perf_counter()
+        prev_path = self._profile_cur
+        node = self._profile_path_enter(kind, name, call_origin, call_line, call_column, decl_pos)
+        self._profile_paths[node]["call_count"] += 1
+        self._profile_cur = node
+        return site, site_key, recursive_reentry, time.perf_counter(), node, prev_path
 
-    def _profile_exit(self, site: "CallSiteProfile", site_key: tuple, recursive_reentry: bool, t_start: float):
+    _MAX_PROFILE_PATH_NODES = 200_000
+
+    def _profile_path_enter(self, kind, name, call_origin, call_line, call_column, decl_pos) -> int:
+        """This call's node under the current one. Only DIRECT self-recursion
+        folds onto its parent -- folding a re-entry onto any ancestor
+        credited the whole subtree to it and emptied every node between,
+        so the tree disagreed with call_sites (cpp 709da93). Past the node
+        cap the tree stops subdividing and folds onto the parent."""
+        paths = self._profile_paths
+        parent = self._profile_cur
+        ident = (kind, name, call_origin, call_line, call_column)
+
+        def same(n):
+            return (n["kind"], n["name"], n["call_origin"], n["call_line"], n["call_column"]) == ident
+        if parent > 0 and same(paths[parent]):
+            return parent
+        for c in paths[parent]["children"]:
+            if same(paths[c]):
+                return c
+        if len(paths) >= self._MAX_PROFILE_PATH_NODES:
+            return parent
+        paths.append({"parent": parent, "children": [], "kind": kind, "name": name, "call_origin": call_origin,
+                      "call_line": call_line, "call_column": call_column,
+                      "decl_origin": getattr(decl_pos, "origin", None) or "",
+                      "decl_line": getattr(decl_pos, "line", 0) if decl_pos else 0,
+                      "call_count": 0, "self_time": 0.0, "cumulative_time": 0.0})
+        paths[parent]["children"].append(len(paths) - 1)
+        return len(paths) - 1
+
+    def _profile_exit(self, site: "CallSiteProfile", site_key: tuple, recursive_reentry: bool, t_start: float,
+                      node: int = -1, prev_path: int = 0):
         """Pop profiling state on the matching call-stack pop -- see
         _profile_enter. Self time is unconditional (disjoint wall-clock
         slices, never overlapping, so nothing to guard). Cumulative time
@@ -3995,6 +4054,11 @@ class Evaluator:
         if not recursive_reentry:
             site.cumulative_time += elapsed
             self._profile_active.discard(site_key)
+        if node >= 0:
+            # Self time only; cumulative is derived from the subtree at the
+            # end, since at a fold only the outermost entry may add elapsed.
+            self._profile_paths[node]["self_time"] += elapsed - child_time
+            self._profile_cur = prev_path
         if self._profile_child_time:
             self._profile_child_time[-1] += elapsed
 
@@ -4036,7 +4100,12 @@ class Evaluator:
         decl_pos = getattr(decl, 'position', None)
         # Counting this module too: 1 in a module called from top level, as in OpenSCAD.
         child_ctx.dyn["$parent_modules"] = 1 + sum(1 for e in self._call_stack if e[0] == "module")
-        prof = self._profile_enter("module", name, call_pos, decl_pos) if self._profiling else None
+        # A module handed in through children() profiles as "child": both
+        # `module foo() foo();` and `foo() foo();` make a foo->foo edge, and
+        # only the first is recursion. Inside the body it is off again.
+        via_children, self._via_children = self._via_children, False
+        prof = self._profile_enter("child" if via_children else "module", name, call_pos, decl_pos) \
+            if self._profiling else None
         self._call_stack.append(("module", name, call_pos, decl_pos))
         self._frame_ctxs.append(child_ctx)
         try:
@@ -4045,6 +4114,7 @@ class Evaluator:
         finally:
             self._call_stack.pop()
             self._frame_ctxs.pop()
+            self._via_children = via_children
             if prof is not None:
                 self._profile_exit(*prof)
 
@@ -6397,7 +6467,11 @@ class Evaluator:
         for k, v in ctx.let.items():
             if k.startswith('$'):
                 eval_ctx.let[k] = v
-        return self._eval_children(ctx.children_nodes, eval_ctx)
+        via, self._via_children = self._via_children, True
+        try:
+            return self._eval_children(ctx.children_nodes, eval_ctx)
+        finally:
+            self._via_children = via
 
     @staticmethod
     def _is_separating_children_call(stmt) -> bool:
@@ -6507,8 +6581,12 @@ class Evaluator:
             if k.startswith('$'):
                 eval_ctx.let[k] = v
         result = []
-        for child in picked:
-            result.extend(self._eval_children([child], eval_ctx))
+        via, self._via_children = self._via_children, True
+        try:
+            for child in picked:
+                result.extend(self._eval_children([child], eval_ctx))
+        finally:
+            self._via_children = via
         return result
 
     def _builtin_breakpoint(self, args: dict, node, ctx: EvalContext):

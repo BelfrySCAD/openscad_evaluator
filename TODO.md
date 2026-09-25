@@ -26,6 +26,4 @@ Export
 - Formats: AMF, PLY, VRML, X3D, ASCII STL, SVG (#159), PDF with ruler/page options (#160)
 
 Tools and API
-- Per-path profiling tree (`ProfileResult.paths`), child-call kind, call columns
-  (8e54284, 709da93)
 - Real text shaping (kerning, bidi) — optional, large (#96)
