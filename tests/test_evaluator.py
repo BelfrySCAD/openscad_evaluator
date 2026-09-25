@@ -6073,3 +6073,53 @@ class TestPolyhedronMeshes:
             echo(o.volume == rt.volume, len(o.vertices) == len(rt.vertices));
             echo(len(c.vertices));""")
         assert lines == ["ECHO: 8979.67, -1, 104", "ECHO: true, true", "ECHO: 8"]
+
+
+class TestManifoldCacheProvenance:
+    """A cache hit must look like a fresh generate to anything reading
+    originalIDs or warnings (cpp #84, #85, #186)."""
+
+    @staticmethod
+    def _render(src, cache):
+        lines = []
+        nodes = getASTfromString(src, include_comments=False)
+        ev = Evaluator(echo_fn=lines.append, manifold_cache=cache)
+        bodies, id_to_node = ev.evaluate(nodes, build_scopes(nodes))
+        picked = []
+        for b in bodies:
+            ids = sorted({int(i) for i in b.body.to_mesh().run_original_id}) if b.body else []
+            picked.append((tuple(ids), [id_to_node[i].position.line if i in id_to_node else None for i in ids]))
+        return picked, lines
+
+    def test_identical_parts_get_their_own_ids_and_lines(self):
+        picked, _ = self._render("translate([0,0,0]) cylinder(5,2);\ntranslate([9,0,0]) cylinder(5,2);",
+                                 ManifoldCache())
+        (ids_a, lines_a), (ids_b, lines_b) = picked
+        assert ids_a != ids_b
+        assert (lines_a, lines_b) == ([1], [2])
+
+    def test_module_parts_keep_their_own_line(self):
+        picked, _ = self._render("module m() { cube(1); }\ntranslate([0,5,0]) m();\ntranslate([0,9,0]) m();",
+                                 ManifoldCache())
+        assert picked[0][0] != picked[1][0]
+        assert [lines for _, lines in picked] == [[1], [1]]
+
+    def test_rerender_stays_pickable(self):
+        cache = ManifoldCache()
+        src = "translate([0,0,0]) cylinder(5,2);\ntranslate([9,0,0]) cylinder(5,2);"
+        self._render(src, cache)
+        picked, _ = self._render(src, cache)
+        assert [lines for _, lines in picked] == [[1], [2]]
+
+    def test_hit_replays_warnings_including_a_descendants(self):
+        cache = ManifoldCache()
+        src = ("translate([1,0,0]) polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], "
+               "[[0,1,2],[0,3,1],[0,2,3]]);")
+        runs = [self._render(src, cache)[1] for _ in range(3)]
+        assert len(runs[0]) == 1 and "mesh is not closed" in runs[0][0]
+        assert runs[1] == runs[0] and runs[2] == runs[0]
+
+    def test_quiet_subtree_stays_quiet(self):
+        cache = ManifoldCache()
+        self._render("cube(1);", cache)
+        assert self._render("cube(1);", cache)[1] == []
