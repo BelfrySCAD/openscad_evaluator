@@ -2685,11 +2685,11 @@ class ManifoldCache:
 # for a future feature is safe. OpenSCAD silently ignores unknown arguments
 # (children(separate=true) renders the wrong shape there), so guarding on this
 # is how a script refuses. Names shared with openscad_cpp_evaluator (#113, #115);
-# mesh-repair and export-name are not implemented here.
+# export-name is not implemented here.
 _FEATURE_LEVELS = {
     "render-expr": 1, "linear-solve": 1, "polyhedron-vnf": 1, "separate-children": 1,
     "minkowski-diff": 1, "sphere-styles": 1, "simplify-op": 1, "expr-import": 1,
-    "object-function": 1, "roof-op": 1, "svg-class": 1, "levelset": 1,
+    "object-function": 1, "roof-op": 1, "svg-class": 1, "levelset": 1, "mesh-repair": 1,
 }
 
 
@@ -2941,6 +2941,7 @@ class Evaluator:
             "minkowski_difference": self._resolve_minkowski,
             "simplify": self._resolve_simplify,
             "levelset": self._resolve_levelset,
+            "mesh_repair": self._resolve_simplify,  # the same one positional tolerance
             "offset": self._resolve_offset,
             "projection": self._resolve_projection,
             "union": self._resolve_csg,
@@ -2981,6 +2982,7 @@ class Evaluator:
             "minkowski_difference": self._generate_minkowski_difference,
             "simplify": self._generate_simplify,
             "levelset": self._generate_levelset,
+            "mesh_repair": self._generate_mesh_repair,
             "offset": self._generate_offset,
             "projection": self._generate_projection,
             "union": self._generate_csg,
@@ -4013,11 +4015,11 @@ class Evaluator:
         "multmatrix": ("m",), "resize": ("newsize", "auto", "convexity"),
         "color": ("c", "alpha"),
         "union": (), "difference": (), "intersection": (), "hull": (), "fill": (),
-        "minkowski": ("convexity",), "minkowski_difference": (), "simplify": ("tolerance",),
+        "minkowski": ("convexity",), "minkowski_difference": (), "simplify": ("tolerance",), "mesh_repair": ("tolerance",),
         "levelset": ("field", "bounds", "isovalue", "invert", "edge"),
         "children": ("index", "separate"), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
-                   "filename", "layername", "center", "dpi", "id", "class"),
+                   "filename", "layername", "center", "dpi", "id", "class", "repair", "tolerance"),
         "linear_extrude": ("height", "v", "scale", "center", "twist", "slices", "segments", "convexity"),
         "rotate_extrude": ("angle", "start", "convexity"),
         "projection": ("cut", "convexity"),
@@ -5236,7 +5238,11 @@ class Evaluator:
                 except Exception as e:
                     self.error(f"import: {e}", node)
                     return {"color": color}
-                return {"kind": "mesh", "verts": verts, "tris": tris, "color": color}
+                # Not OpenSCAD parameters, so a script using them won't run
+                # upstream -- which is why repair is asked for, not automatic.
+                return {"kind": "mesh", "verts": verts, "tris": tris, "color": color,
+                        "repair": bool(self._get_arg(args, None, "repair", False)),
+                        "tolerance": self._get_arg(args, None, "tolerance")}
             elif ext == ".dxf":
                 contours = self._load_dxf_contours(path, layer, node)
                 return {"kind": "dxf", "contours": contours, "color": color}
@@ -5263,8 +5269,7 @@ class Evaluator:
         kind = params.get("kind")
         color = params["color"]
         if kind == "mesh":
-            body = self._mesh_to_colored_body_generate(params["verts"], params["tris"], node, color)
-            return self._body_list(body)
+            return self._import_mesh(params, node, color)
         if kind == "dxf":
             contours = params["contours"]
             if contours is None:
@@ -5366,19 +5371,93 @@ class Evaluator:
             return [self._json_to_osc(x) for x in v]
         return v  # str, int, float, bool, None — all native
 
-    def _mesh_to_colored_body_generate(self, verts: Any, tris: Any, node, color) -> Optional[ColoredBody]:
+    def _import_mesh(self, params: dict, node, color) -> list[ColoredBody]:
+        """An imported mesh, repaired on request (import(..., repair=true,
+        tolerance=)), and when it is still not a solid, named for what is
+        wrong -- "4 boundary edges" rather than Manifold's NotManifold --
+        and drawn as the open surface it is (cpp 72ca136, #191)."""
+        from .mesh_check import DEFAULT_WELD_TOLERANCE, check_mesh, repair_mesh
+        verts = np.asarray(params["verts"], dtype=np.float64).reshape(-1, 3)
+        tris = np.asarray(params["tris"], dtype=np.int64).reshape(-1, 3)
         if len(tris) == 0:
             self.error("import: mesh has no triangles", node)
-            return None
-        try:
-            verts_arr = np.asarray(verts, dtype=np.float64)
-            tri_arr   = np.asarray(tris,  dtype=np.uint32)
-            mesh = m3d.Mesh(vert_properties=verts_arr, tri_verts=tri_arr)
-            body = m3d.Manifold(mesh)
-        except Exception as e:
-            self.error(f"import: mesh construction failed: {e}", node)
-            return None
-        return self._mesh_body(body, verts_arr, tri_arr, node, color, "import")
+            return []
+        pos = getattr(node, "position", None)
+        if params.get("repair"):
+            tol = params.get("tolerance")
+            if type(tol) in (int, float) and tol < 0:
+                self._echo_fn(f"WARNING: import: tolerance must not be negative; using the default{self._loc(pos)}")
+                tol = None
+            elif tol is not None and type(tol) not in (int, float):
+                self._echo_fn(f"WARNING: import: tolerance must be a number{self._loc(pos)}")
+                tol = None
+            before = check_mesh(verts, tris)
+            verts, tris, report = repair_mesh(verts, tris, DEFAULT_WELD_TOLERANCE if tol is None else float(tol))
+            after = check_mesh(verts, tris)
+            if report.did_anything():
+                self._echo_fn(f"WARNING: import: repaired the mesh -- {report.summary()}{self._loc(pos)}")
+            if not after.ok() and not before.ok():
+                self._echo_fn(f"WARNING: import: still not manifold after repair -- {after.summary()}{self._loc(pos)}")
+        body = m3d.Manifold(m3d.Mesh64(vert_properties=verts, tri_verts=tris.astype(np.uint64)))
+        if body.status() == _MANIFOLD_OK:
+            return [self._tag_generated(body, node, color)]
+        if not self._hull_depth:
+            why = check_mesh(verts, tris).summary() or body.status().name
+            self._echo_fn(
+                f"WARNING: import: mesh is not a closed solid ({why}); drawing the object as an open "
+                "surface rather than a solid -- nothing is patched. hull() can still use its points, "
+                "but it cannot take part in union/difference/intersection"
+                f"{'' if params.get('repair') else '. Try import(..., repair=true)'}{self._loc(pos)}")
+        return [ColoredBody(color=color, raw_mesh=(verts, tris))]
+
+    def _generate_mesh_repair(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        """mesh_repair(tolerance): make an almost-closed mesh a solid -- weld,
+        drop degenerate and duplicate faces, orient, fill holes, flip
+        outward, strip zero-area faces. Not in OpenSCAD (cpp #191). Reads an
+        open body's raw_mesh, since it has no Manifold to repair. Welding
+        discards vertices, so the default tolerance is tight; a gap closed by
+        filling rather than welding can leave a needle, which is thin, not
+        zero-area, and stays -- a larger tolerance is the fix for that."""
+        from .mesh_check import DEFAULT_WELD_TOLERANCE, repair_mesh
+        bodies = flatten_csg_tree(children)
+        pos = getattr(node, "position", None)
+        tol = params["tolerance"]
+        if type(tol) in (int, float):
+            if tol < 0:
+                self._echo_fn(f"WARNING: mesh_repair: tolerance must not be negative{self._loc(pos)}")
+                return bodies
+        elif tol is not None:
+            self._echo_fn(f"WARNING: mesh_repair: tolerance must be a number{self._loc(pos)}")
+            tol = None
+        tol = DEFAULT_WELD_TOLERANCE if tol is None else float(tol)
+        out = []
+        for b in bodies:
+            if b.role != "normal" or (b.body is None and b.raw_mesh is None):
+                out.append(b)
+                continue
+            if b.raw_mesh is not None:
+                verts, tris = b.raw_mesh
+            else:
+                mesh = b.body.to_mesh64()
+                verts, tris = np.array(mesh.vert_properties)[:, :3], np.array(mesh.tri_verts)
+            verts, tris, report = repair_mesh(verts, tris, tol)
+            if report.did_anything():
+                rebuilt = m3d.Manifold(m3d.Mesh64(vert_properties=verts, tri_verts=tris.astype(np.uint64)))
+                if rebuilt.status() == _MANIFOLD_OK:
+                    # A solid now: drop the display-only soup, or it stays out of
+                    # every boolean; and tri_colors, since the count changed.
+                    # ponytail: tagged to this node so it stays pickable, which
+                    # the C++ port does not do.
+                    b = replace(self._tag_generated(rebuilt, node, b.color), role=b.role)
+                    self._echo_fn(f"WARNING: mesh_repair: {report.summary()}{self._loc(pos)}")
+                else:
+                    self._echo_fn(f"WARNING: mesh_repair: could not rebuild the repaired mesh "
+                                  f"({rebuilt.status().name}); geometry left unchanged{self._loc(pos)}")
+            if report.unfilled_holes:
+                self._echo_fn(f"WARNING: mesh_repair: {report.unfilled_holes} hole(s) left open -- a crack "
+                              f"too narrow to fill needs a larger tolerance to weld shut instead{self._loc(pos)}")
+            out.append(b)
+        return out
 
     def _load_stl(self, path: str):
         """Return (verts, tris) from binary or ASCII STL."""

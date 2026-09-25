@@ -6,6 +6,7 @@ returning (bodies, echo_lines). Geometry tests inspect bounding boxes;
 expression tests capture echo output.
 """
 import numpy as np
+import manifold3d as m3d
 import pytest
 from openscad_lalr_parser import getASTfromString, build_scopes
 
@@ -3882,7 +3883,7 @@ class TestFeatureDetection:
 
     def test_levels(self):
         _, lines = run('echo($_SUPPORTED_FEATURE, supported_feature("separate-children"), '
-                       'supported_feature("mesh-repair"), supported_feature("nope"), supported_feature(3), '
+                       'supported_feature("export-name"), supported_feature("nope"), supported_feature(3), '
                        'supported_feature(feature="roof-op"));')
         assert lines == ["ECHO: true, 1, 0, 0, 0, 1"]
 
@@ -4117,6 +4118,51 @@ class TestLevelSet:
         ev = Evaluator(echo_fn=lambda m: None, manifold_cache=ManifoldCache())
         ev.evaluate(nodes, build_scopes(nodes))
         assert ev.csg_tree[0].uncacheable
+
+
+class TestMeshRepair:
+    """Strict mesh check, import(repair=) and mesh_repair() (cpp 72ca136,
+    #191). Diagnoses are identical to openscad_cpp_evaluator's check_mesh on
+    each shape below."""
+
+    def test_diagnoses(self):
+        from openscad_evaluator.mesh_check import check_mesh
+        m = m3d.Manifold.cube([1, 1, 1]).to_mesh64()
+        v, t = np.array(m.vert_properties), np.array(m.tri_verts, dtype=np.int64)
+        flipped = t.copy()
+        flipped[0] = flipped[0][[0, 2, 1]]
+        assert check_mesh(v, t).summary() == ""
+        assert check_mesh(v, t[2:]).summary() == "4 boundary edges"
+        assert check_mesh(v, flipped).summary() == "3 inconsistently wound edges"
+        assert check_mesh(v, np.vstack([t, t[:1]])).summary() == "3 non-manifold edges, 1 duplicate face"
+        # Two cubes sharing only a corner: every edge has two faces, yet it pinches.
+        both = np.vstack([t, t + len(v)])
+        verts = np.vstack([v, v + 1])
+        _, first, inv = np.unique(np.round(verts * 1e6), axis=0, return_index=True, return_inverse=True)
+        assert check_mesh(verts, first[inv.reshape(-1)][both]).pinched_vertices == 1
+
+    def test_mesh_repair_makes_an_open_polyhedron_a_solid(self):
+        bodies, lines = run("difference() { mesh_repair() polyhedron([[0,0,0],[20,0,0],[0,20,0],[0,0,20]], "
+                            "[[0,1,2],[0,3,1],[0,2,3]]); cube(5); }")
+        assert bodies[0].body.volume() == pytest.approx(20 ** 3 / 6 - 125)
+        assert "WARNING: mesh_repair: 1 hole filled (1 triangles)" in [l.split(" in file ")[0] for l in lines]
+
+    def test_import_repair(self, tmp_path):
+        stl = tmp_path / "open.stl"
+        m = m3d.Manifold.cube([20, 20, 20]).to_mesh()
+        v, t = np.array(m.vert_properties, dtype=float).tolist(), np.array(m.tri_verts).tolist()
+        faces = [f for f in t if len({v[i][0] for i in f}) > 1 or v[f[0]][0] != 0]  # drop the x=0 face
+        stl.write_text("solid t\n" + "".join(
+            "facet normal 0 0 0\nouter loop\n" + "".join("vertex %r %r %r\n" % tuple(v[i]) for i in f)
+            + "endloop\nendfacet\n" for f in faces) + "endsolid t\n")
+        bodies, lines = run(f'import("{stl.as_posix()}", repair=true);')
+        assert bodies[0].body.volume() == pytest.approx(8000)
+        assert lines[0].startswith("WARNING: import: repaired the mesh -- 1 hole filled (2 triangles)")
+
+    def test_bad_tolerance(self):
+        _, lines = run("mesh_repair(-1) cube(5); mesh_repair(\"x\") cube(5);")
+        assert [l.split(" in file ")[0] for l in lines] == [
+            "WARNING: mesh_repair: tolerance must not be negative", "WARNING: mesh_repair: tolerance must be a number"]
 
 
 class TestTextMetrics:
@@ -5941,7 +5987,8 @@ class TestOpenMeshes:
                        "endsolid t\n")
         bodies, lines = run(f'import("{stl.as_posix()}");')
         assert len(bodies[0].raw_mesh[1]) == 2
-        assert lines[0].startswith("WARNING: import: mesh is not closed -- 4 boundary edge(s)")
+        assert lines[0].startswith("WARNING: import: mesh is not a closed solid (4 boundary edges)")
+        assert "Try import(..., repair=true)" in lines[0]
 
 
 class TestRenderExpression:

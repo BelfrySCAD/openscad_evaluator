@@ -21,8 +21,6 @@ Needs openscad_lalr_parser changes first
 - Strict-commas mode (#158)
 
 Language extensions
-- Strict mesh check, `repair()`, `import(repair=true)`, export-time check (72ca136);
-  `mesh_repair()` (#191)
 
 Export
 - Export the implicit top-level union split per colour then per component, with per-triangle
