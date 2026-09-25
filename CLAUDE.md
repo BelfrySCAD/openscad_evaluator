@@ -42,7 +42,7 @@ reuses its previous result instead of recomputing it.
   it if it ever needs updating)
 - `src/openscad_evaluator/resources/fonts/` — bundled Liberation Sans fallback font (used when
   `fc-match` isn't available or a `font=` spec can't be resolved)
-- `src/openscad_evaluator/export.py` — headless STL/OBJ/OFF/3MF export from a `ColoredBody` list;
+- `src/openscad_evaluator/export.py` — headless export (`export_model`; 3MF, AMF, OBJ+.mtl, PLY, VRML, X3D, STL, OFF, SVG, PDF) from a `ColoredBody` list, a port of openscad_cpp_evaluator's `export.cpp` (see docs/evaluator.md);
   no GUI dependency, no `lib3mf` dependency either (3MF is written by hand as a ZIP of XML via
   stdlib `zipfile`/`xml.etree.ElementTree`, mirroring `evaluator.py`'s own `_load_3mf` reader,
   since `lib3mf` has limited platform support — not available on aarch64/ARM64). STL/OBJ ported

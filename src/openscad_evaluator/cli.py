@@ -151,6 +151,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Give every disconnected piece its own object in the multi-object formats. "
              "Off by default, matching OpenSCAD",
     )
+    parser.add_argument("--export-format", choices=["asciistl", "binstl"],
+                        help="STL encoding (default binstl); only applies to .stl output")
+    parser.add_argument("--pdf-paper-size", metavar="SIZE",
+                        help="Paper size for .pdf output: a6, a5, a4 (default), a3, letter, legal, tabloid")
+    parser.add_argument("--pdf-orientation", metavar="NAME",
+                        help="Page orientation for .pdf output: portrait (default), landscape, or auto")
+    parser.add_argument("--pdf-no-scale", action="store_true",
+                        help="Leave the ruler and its caption off a .pdf, drawing the model alone")
+    parser.add_argument("--pdf-grid", action="store_true", help="Draw a grid across a .pdf page")
     parser.add_argument("--debug", action="store_true", help="Run under an interactive, gdb-style debugger")
     parser.add_argument("--profile", metavar="FILENAME", help="Write a per-call-site profiling report to FILENAME")
     parser.add_argument(
@@ -266,7 +275,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             # Warnings, not refusals: a deliberately open surface is a
             # legitimate thing to export.
-            for w in export_model(args.output, bodies, fmt=fmt, split_components=args.split_components):
+            pdf = {k: v for k, v in (("paper-size", args.pdf_paper_size), ("orientation", args.pdf_orientation),
+                                     ("show-scale", False if args.pdf_no_scale else None),
+                                     ("show-grid", True if args.pdf_grid else None)) if v is not None}
+            for w in export_model(args.output, bodies, fmt=fmt, split_components=args.split_components,
+                                  ascii_stl=args.export_format == "asciistl", pdf_options=pdf):
                 print(f"WARNING: export: {w}", file=sys.stderr)
         except (ValueError, ImportError) as e:
             print(f"error: {e}", file=sys.stderr)

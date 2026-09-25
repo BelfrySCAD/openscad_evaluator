@@ -207,6 +207,46 @@ class TestExportModel:
         assert export_model(str(out), _evaluate("cube(1); translate([1,0,0]) cube(1);")) == []
         assert out.read_text().splitlines()[1] == "12 20 0"  # one welded 2x1x1 box
 
+    @pytest.mark.parametrize("ext,head", [(".amf", '<?xml version="1.0" encoding="UTF-8"?>\n<amf unit="millimeter"'),
+                                          (".wrl", "#VRML V2.0 utf8\n"), (".x3d", '<?xml version="1.0"'),
+                                          (".ply", "ply\nformat binary_little_endian 1.0\n")])
+    def test_multi_object_formats(self, tmp_path, ext, head):
+        # Byte-identical to openscad_cpp_evaluator's AMF, VRML and X3D for this script.
+        out = tmp_path / f"m{ext}"
+        assert export_model(str(out), _evaluate(self.SCRIPT)) == []
+        assert out.read_bytes().startswith(head.encode())
+
+    def test_ply_unwelds_per_triangle_colour_with_valid_indices(self, tmp_path):
+        # The C++ port indexes these faces past the end of its vertex list.
+        out = tmp_path / "m.ply"
+        export_model(str(out), _evaluate(self.SCRIPT))
+        d = out.read_bytes()
+        h = d.index(b"end_header\n") + 11
+        nv = int(d[:h].split(b"element vertex ")[1].split()[0])
+        faces = np.frombuffer(d[h + nv * 15:], dtype=[("n", "u1"), ("i", "<i4", (3,))])
+        assert faces["i"].max() == nv - 1
+
+    def test_ascii_stl(self, tmp_path):
+        out = tmp_path / "m.stl"
+        export_model(str(out), _evaluate("cube(1);"), ascii_stl=True)
+        text = out.read_text()
+        assert text.startswith("solid OpenSCAD_Model\n  facet normal ") and text.count("endfacet") == 12
+
+    def test_svg_is_1_to_1_and_refuses_3d(self, tmp_path):
+        out = tmp_path / "m.svg"
+        export_model(str(out), _evaluate("translate([2,3]) square([10,5]);"))
+        assert '<svg width="12mm" height="7mm" viewBox="1 -9 12 7"' in out.read_text()
+        with pytest.raises(ValueError, match="Current top level object is not a 2D object"):
+            export_model(str(tmp_path / "c.svg"), _evaluate("cube(1);"))
+
+    def test_pdf_page_and_options(self, tmp_path):
+        out = tmp_path / "m.pdf"
+        assert export_model(str(out), _evaluate("square(10);"),
+                            pdf_options={"paper-size": "letter", "orientation": "landscape"}) == []
+        assert b"/MediaBox [0 0 792 612]" in out.read_bytes()
+        with pytest.raises(ValueError, match="unknown pdf option 'papersize'"):
+            export_model(str(out), _evaluate("square(10);"), pdf_options={"papersize": "a4"})
+
     def test_obj_writes_its_materials(self, tmp_path):
         export_model(str(tmp_path / "m.obj"), _evaluate("color([1,0,0,0.5]) cube(1);"))
         assert (tmp_path / "m.mtl").read_text() == "newmtl color_1\nKd 1 0 0\nd 0.5\n\n"

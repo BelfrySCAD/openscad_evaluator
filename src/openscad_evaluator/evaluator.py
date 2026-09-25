@@ -2483,7 +2483,9 @@ def to_renderable_bodies(bodies: list[ColoredBody], height: float = _TOP_LEVEL_2
                 vert_properties=np.array(mesh.vert_properties, dtype=np.float64), tri_verts=tris,
                 run_index=np.array([0, tris.size], dtype=np.uint64),
                 run_original_id=np.array([cb.section_id], dtype=np.uint32)))
-        out.append(ColoredBody(body=body, color=cb.color, flat_preview=True, role=cb.role))
+        # The section stays too: it is the real geometry, which a 2D export
+        # (SVG, PDF) reads instead of the slab.
+        out.append(ColoredBody(body=body, color=cb.color, flat_preview=True, role=cb.role, section=cb.section))
     return out
 
 
