@@ -3877,6 +3877,24 @@ class TestSphereStyles:
             "WARNING: sphere: style must be a string"]
 
 
+class TestFeatureDetection:
+    """$_SUPPORTED_FEATURE, $_BELFRYSCAD and supported_feature() (cpp #113, #115)."""
+
+    def test_levels(self):
+        _, lines = run('echo($_SUPPORTED_FEATURE, supported_feature("separate-children"), '
+                       'supported_feature("levelset"), supported_feature("nope"), supported_feature(3), '
+                       'supported_feature(feature="roof-op"));')
+        assert lines == ["ECHO: true, 1, 0, 0, 0, 1"]
+
+    def test_version_is_three_numbers(self):
+        _, lines = run("echo(len($_BELFRYSCAD), is_num($_BELFRYSCAD[0]));")
+        assert lines == ["ECHO: 3, true"]
+
+    def test_guard_idiom(self):
+        _, lines = run('echo(!is_undef($_SUPPORTED_FEATURE) && supported_feature("sphere-styles"));')
+        assert lines == ["ECHO: true"]
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
