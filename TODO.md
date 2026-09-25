@@ -12,10 +12,6 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 ### Bug fixes
 
-Diagnostics
-- Warnings should name the user's call site and carry TRACE lines, generate-time ones too
-  (3e11352)
-
 Debugger / viewport
 - 2D preview slab is 1e-3 thick, reference is 1; translated 2D shape loses its Z (#138)
 

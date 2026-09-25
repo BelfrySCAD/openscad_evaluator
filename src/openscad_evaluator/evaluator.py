@@ -5,6 +5,7 @@ Returns (manifold_body, id_to_node, colored_meshes) or raises EvalError.
 from __future__ import annotations
 import functools
 import math
+import re
 import random
 import threading
 import time
@@ -2260,6 +2261,10 @@ class CSGNode:
     # their own content (the actual rands() output also depends on every
     # earlier rands() call's position in the script's evaluation order).
     uncacheable: bool = False
+    # The top-level call site that reached this node, for a generate-time
+    # warning's ", from ..." clause: generation runs after the call stack has
+    # unwound. Not part of the cache key, so two call sites share an entry.
+    warn_entry: Optional[Any] = None
 
 
 @dataclass
@@ -2792,7 +2797,12 @@ class Evaluator:
             "show_only": self._generate_show_only,
         }
         self._errors: list[str] = []
-        self._echo_fn = echo_fn or (lambda msg: print(msg))
+        # Everything printed goes through _emit, which attributes a warning
+        # to the user's call site, then to _sink: the caller's echo_fn, or a
+        # cache capture wrapped around it (see generate_tree).
+        self._sink = echo_fn or (lambda msg: print(msg))
+        self._echo_fn = self._emit
+        self._generate_warn_entry = None
         self._call_stack: list = []
         self._frame_ctxs: list = []
         self._debug_hook = debug_hook
@@ -2971,6 +2981,27 @@ class Evaluator:
             ctx.let[k] = v
         if cmd == "stop":
             raise EvalError(DEBUGGING_STOPPED_MESSAGE)
+
+    _LOC_SUFFIX = re.compile(r" in file (.*), line (\d+)$")
+
+    def _emit(self, msg: str) -> None:
+        """Print `msg`; a warning raised below the top level also names the
+        user's own line that started the chain -- ", from w.scad, line 3",
+        the OUTERMOST call site, since intermediate frames are in the TRACE
+        lines that follow. A warning inside a library otherwise pointed only
+        into the library. Generate-time warnings run after the stack has
+        unwound, so they get the clause from their CSG node, and no trace.
+        Deliberately more than OpenSCAD prints, as in the C++ port (3e11352);
+        a top-level warning stays one line."""
+        if msg.startswith("WARNING:") and (self._call_stack or self._generate_warn_entry is not None):
+            entry = self._call_stack[0][2] if self._call_stack else self._generate_warn_entry
+            m = self._LOC_SUFFIX.search(msg.split("\n", 1)[0])
+            if entry is not None and not (m and m.group(1) == str(entry.origin) and int(m.group(2)) == entry.line):
+                head, nl, rest = msg.partition("\n")
+                msg = f"{head}, from {entry.origin}, line {entry.line}{nl}{rest}"
+            if self._call_stack:
+                msg = "\n".join([msg] + self._trace_lines())
+        self._sink(msg)
 
     @staticmethod
     def _loc(pos) -> str:
@@ -3263,6 +3294,7 @@ class Evaluator:
                     kind="union", node=node, bodies=[], is_builtin=False,
                     children=children, params={},
                     uncacheable=any(c.uncacheable for c in children),
+                    warn_entry=self._call_stack[0][2] if self._call_stack else None,
                 )
                 self._tree_stack[-1].append(union_node)
             else:
@@ -3275,7 +3307,8 @@ class Evaluator:
         uncacheable = (self._rands_call_count != rands_before) or any(c.uncacheable for c in children)
         tree_node = CSGNode(kind=kind, node=node, bodies=[],
                              is_builtin=is_builtin, children=children, params=params,
-                             uncacheable=uncacheable)
+                             uncacheable=uncacheable,
+                             warn_entry=self._call_stack[0][2] if self._call_stack else None)
         self._tree_stack[-1].append(tree_node)
         return []
 
@@ -3333,31 +3366,38 @@ class Evaluator:
                 # warning is raised; replay them, or an unchanged re-render
                 # goes quiet about a defect that is still there (#186).
                 for msg in warnings:
-                    self._echo_fn(msg)
+                    self._sink(msg)  # already attributed when first printed
                 node.bodies = self._restamp_cached_ids(bodies, node.node, self._cache_producer.get(key))
             else:
                 if key is not None:
                     self._warn_captures.append([])
                     if len(self._warn_captures) == 1:
-                        real_echo = self._echo_fn
+                        real_sink = self._sink
 
-                        def capturing_echo(msg, _real=real_echo):
+                        def capturing_sink(msg, _real=real_sink):
                             for c in self._warn_captures:
                                 c.append(msg)
                             _real(msg)
-                        self._echo_fn = capturing_echo
+                        self._sink = capturing_sink
                 in_hull = node.kind == "hull" and node.is_builtin
                 self._hull_depth += in_hull
                 try:
                     children_bodies = self.generate_tree(node.children)
                     generate_fn = self._GENERATE_DISPATCH.get(node.kind) if node.is_builtin else None
-                    node.bodies = generate_fn(node.params, node.children, node.node) if generate_fn is not None else children_bodies
+                    if generate_fn is not None:
+                        saved_entry, self._generate_warn_entry = self._generate_warn_entry, node.warn_entry
+                        try:
+                            node.bodies = generate_fn(node.params, node.children, node.node)
+                        finally:
+                            self._generate_warn_entry = saved_entry
+                    else:
+                        node.bodies = children_bodies
                 finally:
                     self._hull_depth -= in_hull
                     if key is not None:
                         warnings = self._warn_captures.pop()
                         if not self._warn_captures:
-                            self._echo_fn = real_echo
+                            self._sink = real_sink
                 if key is not None:
                     self._manifold_cache.put(key, (node.bodies, warnings))
                     self._cache_producer[key] = node.node

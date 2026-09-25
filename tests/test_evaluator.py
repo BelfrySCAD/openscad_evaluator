@@ -1344,7 +1344,8 @@ class TestUserFunctions:
         echo(outer());
         """
         _, lines = run(src)
-        assert lines[0] == "WARNING: Ignoring unknown function 'inner' in file <string>, line 2"
+        assert lines[0] == ("WARNING: Ignoring unknown function 'inner' in file <string>, line 2, "
+                            "from <string>, line 3\nTRACE: called by 'outer' in file <string>, line 3")
         assert lines[1] == "ECHO: undef"
 
 
@@ -1376,7 +1377,8 @@ class TestDefaultParamScoping:
         assert lines == [
             'WARNING: Ignoring unknown variable "a" in file <string>, line 1',
             "WARNING: undefined operation (undefined * number) in file <string>, line 1",
-            "WARNING: undefined operation (number + undefined) in file <string>, line 1",
+            "WARNING: undefined operation (number + undefined) in file <string>, line 1\n"
+            "TRACE: called by 'f' in file <string>, line 1",
             "ECHO: undef",
         ]
 
@@ -5987,7 +5989,9 @@ class TestBuiltinArguments:
 
     def test_children_out_of_bounds_warns(self):
         _, lines = run("module k() children([0:3]); k() { cube(1); cube(2); }")
-        assert lines == [f"WARNING: Children index ({i}) out of bounds (2 children) in file <string>, line 1"
+        assert lines == [f"WARNING: Children index ({i}) out of bounds (2 children) in file <string>, line 1\n"
+                         "TRACE: call of 'k()' in file <string>, line 1\n"
+                         "TRACE: called by 'k' in file <string>, line 1"
                          for i in (2, 3)]
 
     def test_fill(self):
@@ -6190,3 +6194,33 @@ class TestFontStyles:
         _, lines = run('echo(textmetrics("Hi",10,undef,undef,undef,undef,"center","top",2).position ==\n'
                        '     textmetrics("Hi",size=10,halign="center",valign="top",spacing=2).position);')
         assert lines == ["ECHO: true"]
+
+
+class TestWarningAttribution:
+    """Warnings below the top level name the user's line that started the
+    chain, as in the C++ port (3e11352). Output identical to it."""
+
+    def test_eval_time_warning_names_entry_and_traces(self, tmp_path):
+        (tmp_path / "lib.scad").write_text("module inner() { echo(1+\"a\"); }\nmodule outer() { inner(); }\n")
+        (tmp_path / "main.scad").write_text("include <lib.scad>\necho(2);\nouter();\n")
+        from openscad_lalr_parser import getASTfromFile
+        lines = []
+        nodes = getASTfromFile(str(tmp_path / "main.scad"))
+        Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes))
+        lib, main = tmp_path / "lib.scad", tmp_path / "main.scad"
+        assert lines[1] == "\n".join([
+            f"WARNING: undefined operation (number + string) in file {lib}, line 1, from {main}, line 3",
+            f"TRACE: call of 'inner()' in file {lib}, line 1",
+            f"TRACE: called by 'inner' in file {lib}, line 2",
+            f"TRACE: call of 'outer()' in file {lib}, line 2",
+            f"TRACE: called by 'outer' in file {main}, line 3"])
+
+    def test_generate_time_warning_names_entry_only(self):
+        _, lines = run("module m() {\n polyhedron([[0,0,0],[10,0,0],[0,10,0],[0,0,10]], "
+                       "[[0,1,2],[0,3,1],[0,2,3]]);\n}\nm();")
+        assert len(lines) == 1
+        assert lines[0].endswith("in file <string>, line 2, from <string>, line 4")
+
+    def test_top_level_warning_stays_one_line(self):
+        _, lines = run('echo(1+"a");')
+        assert lines[0] == "WARNING: undefined operation (number + string) in file <string>, line 1"
