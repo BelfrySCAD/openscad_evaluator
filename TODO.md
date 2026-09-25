@@ -40,7 +40,6 @@ Tools and API
   (#169, #170, #175)
 - Per-path profiling tree (`ProfileResult.paths`), child-call kind, call columns
   (8e54284, 709da93)
-- `idToCallSite` (#180), `evaluate(generate=False)` (#144)
+- `idToCallSite` (#180)
 - Cut-face green for uncoloured subtrahends, `keep_minuend_color` (#173)
-- Pickable originalID for 2D sections (#192), `flat_preview_height` (#193)
 - Real text shaping (kerning, bidi) — optional, large (#96)
