@@ -3946,6 +3946,39 @@ class TestListFonts:
             assert lines == [f'ECHO: "{f["style"]}"']
 
 
+class TestSvgImportFilter:
+    """import(svg, id=/class=) (cpp #182)."""
+
+    SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <g id="cut" transform="translate(10,0)">
+    <rect id="r1" class="cut outline" x="0" y="0" width="10" height="10"/>
+    <rect id="r2" class="cut" x="20" y="0" width="5" height="5"/>
+  </g>
+  <rect id="r3" class="engrave" x="0" y="50" width="20" height="20"/>
+</svg>"""
+
+    def _areas(self, tmp_path, body):
+        from openscad_lalr_parser import getASTfromFile
+        (tmp_path / "d.svg").write_text(self.SVG)
+        (tmp_path / "t.scad").write_text(body)
+        lines = []
+        nodes = getASTfromFile(str(tmp_path / "t.scad"))
+        bodies, _ = Evaluator(echo_fn=lines.append).evaluate(nodes, build_scopes(nodes))
+        return [round(b.section.area()) for b in bodies], [l.split(" in file ")[0] for l in lines]
+
+    def test_id_takes_a_group_whole_with_its_transform(self, tmp_path):
+        areas, _ = self._areas(tmp_path, 'import("d.svg", id="cut");')
+        assert areas == [125]
+
+    def test_class_matches_one_entry_of_the_list(self, tmp_path):
+        assert self._areas(tmp_path, 'import("d.svg", class="cut");')[0] == [125]
+        assert self._areas(tmp_path, 'import("d.svg", class="outline");')[0] == [100]
+
+    def test_a_miss_warns_and_imports_nothing(self, tmp_path):
+        assert self._areas(tmp_path, 'import("d.svg", id="nope");') == (
+            [], ['WARNING: import() filter id = "nope" did not match anything'])
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit

@@ -2650,11 +2650,11 @@ class ManifoldCache:
 # for a future feature is safe. OpenSCAD silently ignores unknown arguments
 # (children(separate=true) renders the wrong shape there), so guarding on this
 # is how a script refuses. Names shared with openscad_cpp_evaluator (#113, #115);
-# levelset, mesh-repair, svg-class and export-name are not implemented here.
+# levelset, mesh-repair and export-name are not implemented here.
 _FEATURE_LEVELS = {
     "render-expr": 1, "linear-solve": 1, "polyhedron-vnf": 1, "separate-children": 1,
     "minkowski-diff": 1, "sphere-styles": 1, "simplify-op": 1, "expr-import": 1,
-    "object-function": 1, "roof-op": 1,
+    "object-function": 1, "roof-op": 1, "svg-class": 1,
 }
 
 
@@ -3916,7 +3916,7 @@ class Evaluator:
         "minkowski": ("convexity",), "minkowski_difference": (), "simplify": ("tolerance",),
         "children": ("index", "separate"), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
-                   "filename", "layername", "center", "dpi", "id"),
+                   "filename", "layername", "center", "dpi", "id", "class"),
         "linear_extrude": ("height", "v", "scale", "center", "twist", "slices", "segments", "convexity"),
         "rotate_extrude": ("angle", "start", "convexity"),
         "projection": ("cut", "convexity"),
@@ -5033,12 +5033,14 @@ class Evaluator:
                 contours = self._load_dxf_contours(path, layer, node)
                 return {"kind": "dxf", "contours": contours, "color": color}
             elif ext in (".svg", ".pdf"):
+                filtered = any(isinstance(self._get_arg(args, None, k), str) for k in ("id", "class"))
                 try:
-                    contours = self._load_svg_contours(path)
+                    contours = self._load_svg_contours(path, node, self._get_arg(args, None, "id"),
+                                                       self._get_arg(args, None, "class"))
                 except Exception as e:
                     self.error(f"import: {e}", node)
                     return {"color": color}
-                return {"kind": "svg", "contours": contours, "color": color}
+                return {"kind": "svg", "contours": contours, "color": color, "filtered": filtered}
             elif ext == ".json":
                 self.error("import: .json returns data, not geometry — use as an expression", node)
                 return {"color": color}
@@ -5068,6 +5070,8 @@ class Evaluator:
         if kind == "svg":
             contours = params["contours"]
             if not contours:
+                if params.get("filtered"):
+                    return []  # a filter that missed already warned; it imports nothing
                 self.error("import: no shapes found in SVG file", node)
                 return []
             polys = [np.array(c, dtype=np.float64) for c in contours]
@@ -5092,7 +5096,8 @@ class Evaluator:
             elif ext in (".stl", ".obj", ".off", ".3mf"):
                 return self._import_as_vnf(path, ext, node)
             elif ext in (".dxf", ".svg"):
-                return self._import_as_region(path, ext, layer, node)
+                return self._import_as_region(path, ext, layer, node,
+                                              self._get_arg(args, None, "id"), self._get_arg(args, None, "class"))
             else:
                 self.error(f"import: unsupported file type '{ext}'", node)
                 return None
@@ -5130,13 +5135,13 @@ class Evaluator:
             faces_out.append(fi)
         return [verts_out, faces_out]
 
-    def _import_as_region(self, path: str, ext: str, layer: Any, node) -> Any:
+    def _import_as_region(self, path: str, ext: str, layer: Any, node, id_=None, cls=None) -> Any:
         """Load a 2D file and return a Region: [[[x,y],...], ...]."""
         try:
             if ext == ".dxf":
                 contours = self._load_dxf_contours(path, layer, node)
             else:
-                contours = self._load_svg_contours(path)
+                contours = self._load_svg_contours(path, node, id_, cls)
         except Exception as e:
             self.error(f"import: {e}", node)
             return None
@@ -5299,7 +5304,14 @@ class Evaluator:
                     contours.append(pts)
         return contours
 
-    def _load_svg_contours(self, path: str) -> list[list[tuple[float, float]]]:
+    def _load_svg_contours(self, path: str, node=None, id_=None, cls=None) -> list[list[tuple[float, float]]]:
+        """The SVG's filled outlines. `id_` (upstream's) and `cls` (this
+        port's, supported_feature("svg-class")) select elements: a match is
+        taken whole, so id= on a <g> means that group, with the transforms
+        above it still applied so it lands where it does in the drawing. A
+        miss imports nothing and warns -- falling back to the whole drawing
+        would hand a cut layer every layer, in silence (cpp #182). `layer=`
+        stays DXF's: upstream reads it from Inkscape's inkscape:label."""
         import xml.etree.ElementTree as _ET
         import re as _re
         import math as _math
@@ -5481,7 +5493,29 @@ class Evaluator:
             return out
 
         tree = _ET.parse(path)
-        return _walk(tree.getroot(), np.eye(3, dtype=np.float64))
+        id_ = id_ if isinstance(id_, str) else None
+        cls = cls if isinstance(cls, str) else None
+        if id_ is None and cls is None:
+            return _walk(tree.getroot(), np.eye(3, dtype=np.float64))
+        matched = False
+
+        def _walk_filtered(el, mat: np.ndarray) -> list:
+            nonlocal matched
+            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+            if tag in ("defs", "symbol"):
+                return []
+            if (id_ is not None and el.get("id") == id_) or (cls is not None and cls in el.get("class", "").split()):
+                matched = True
+                return _walk(el, mat)  # taken whole, its own transform included
+            m = _parse_transform(el.get("transform", "")) @ mat
+            return [c for child in el for c in _walk_filtered(child, m)]
+
+        out = _walk_filtered(tree.getroot(), np.eye(3, dtype=np.float64))
+        if not matched:
+            what = ", ".join(f'{k} = "{v}"' for k, v in (("id", id_), ("class", cls)) if v is not None)
+            self._echo_fn(f"WARNING: import() filter {what} did not match anything"
+                          f"{self._loc(getattr(node, 'position', None))}")
+        return out
 
     def _resolve_offset(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
