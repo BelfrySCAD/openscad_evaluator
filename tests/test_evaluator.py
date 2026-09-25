@@ -4062,6 +4062,27 @@ class TestKeepMinuendColor:
         assert self._colors(src, cache) == expect
 
 
+class TestTailCalls:
+    """Tail calls run as a loop, as OpenSCAD's own trampoline does. Output
+    identical to OpenSCAD 2026.02.01."""
+
+    def test_deep_self_mutual_and_literal_recursion(self):
+        _, lines = run("function acc(n,a=0)=n<=0?a:acc(n-1,a+1); echo(acc(20000));"
+                       "function ev(n) = n == 0 ? true : od(n-1); function od(n) = n == 0 ? false : ev(n-1);"
+                       "echo(ev(10001));"
+                       "f = function(n, a=0) n <= 0 ? a : let(b = a + n) f(n - 1, b); echo(f(5000));")
+        assert lines == ["ECHO: 20000", "ECHO: false", "ECHO: 1.25025e+7"]
+
+    def test_echo_and_assert_in_the_chain_still_run(self):
+        _, lines = run("function h(n, a=[]) = assert(n >= 0) n == 0 ? a : echo(n) h(n - 1, concat(a, [n]));"
+                       "echo(h(3));")
+        assert lines == ["ECHO: 3", "ECHO: 2", "ECHO: 1", "ECHO: [3, 2, 1]"]
+
+    def test_runaway_tail_recursion_is_an_error(self):
+        with pytest.raises(EvalError, match="Recursion detected calling function 'f'"):
+            run("function f(n) = f(n + 1); echo(f(0));")
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit

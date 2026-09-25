@@ -6788,15 +6788,7 @@ class Evaluator:
         return self._eval_expr(node.body, ctx)
 
     def _expr_assert(self, node, ctx):
-        if self._debugging:
-            self._check_debug(node, ctx)
-        raw = node.arguments
-        condition = self._eval_expr(raw[0].expr, ctx) if raw else True
-        if not condition:
-            cond_text = to_openscad([raw[0].expr]).strip() if raw else "false"
-            msg = self._eval_expr(raw[1].expr, ctx) if len(raw) > 1 else None
-            err = f"Assertion '{cond_text}' failed" + (f': "{msg}"' if msg is not None else "")
-            self.error(err, node, innermost_frame="assert")
+        self._check_assert(node, ctx)
         return self._eval_expr(node.body, ctx)
 
     def _expr_render(self, node: RenderExpression, ctx: EvalContext) -> OscObject:
@@ -7771,6 +7763,10 @@ class Evaluator:
         return any(k[0] == '$' for k in bound)
 
     def _eval_user_function(self, name: str, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node=None) -> Any:
+        child_ctx = self._bind_user_function(decl, arguments, ctx, call_node)
+        return self._run_function_body(name, decl.expr, decl.position, child_ctx, call_node)
+
+    def _bind_user_function(self, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node) -> EvalContext:
         params = decl.parameters or []
         bound = self._bind_args(params, arguments, ctx, call_node)
         fn_scope = decl.scope or ctx.scope
@@ -7791,14 +7787,80 @@ class Evaluator:
             else:
                 child_ctx.let[k] = v
         self._apply_defaults(params, bound, child_ctx)
+        return child_ctx
+
+    _TAIL_CALL_CAP = 1_000_000  # OpenSCAD runs 999,999 hops and stops at 2,000,000; so does the C++ port
+
+    def _run_function_body(self, name: str, body, decl_pos, child_ctx: EvalContext, call_node) -> Any:
+        """Evaluate a function body with tail calls as a loop, as OpenSCAD's
+        own trampoline does: a ternary, let, echo or assert in tail position
+        hands over its tail expression, and a call there to a user function
+        (named or literal) rebinds and carries on in this frame instead of
+        recursing. `function acc(n, a=0) = n <= 0 ? a : acc(n - 1, a + 1);`
+        otherwise died at a few hundred deep on Python's stack. Anything
+        else is evaluated normally.
+
+        The call-stack frame is replaced on each hop, so a TRACE names the
+        latest; the return hook fires once, for the whole chain.
+        ponytail: not while profiling, which should show the real call tree
+        (the C++ port lumps a chain into its first call instead) -- so a
+        profiled script can still run out of stack on very deep recursion."""
         pos = call_node.position if call_node is not None else None
-        prof = self._profile_enter("function", name, pos, decl.position) if self._profiling else None
-        self._call_stack.append(("function", name, pos, decl.position))
+        prof = self._profile_enter("function", name, pos, decl_pos) if self._profiling else None
+        self._call_stack.append(("function", name, pos, decl_pos))
         self._frame_ctxs.append(child_ctx)
+        ctx, expr, hops = child_ctx, body, 0
         try:
             if self._debugging:
-                self._check_debug(decl.expr, child_ctx)
-            result = self._eval_expr(decl.expr, child_ctx)
+                self._check_debug(expr, ctx)
+            while True:
+                t = type(expr)
+                if t is TernaryOp:
+                    if self._debugging:
+                        self._check_debug(expr, ctx)
+                    expr = expr.true_expr if self._eval_expr(expr.condition, ctx) else expr.false_expr
+                    if self._debugging:
+                        self._check_debug(expr, ctx, expr_level=True)
+                elif t is LetOp:
+                    let_ctx = ctx.let_child_ctx()
+                    dyn_copied = False
+                    for assign in expr.assignments:
+                        if self._debugging:
+                            self._check_debug(assign, let_ctx)
+                        v = self._eval_expr(assign.expr, let_ctx)
+                        dyn_copied = self._bind_let_name(let_ctx, assign.name.name, v, dyn_copied)
+                    ctx, expr = let_ctx, expr.body
+                elif t is EchoOp:
+                    if self._debugging:
+                        self._check_debug(expr, ctx)
+                    self._do_echo(expr.arguments, ctx)
+                    expr = expr.body
+                elif t is AssertOp:
+                    self._check_assert(expr, ctx)
+                    expr = expr.body
+                elif t is CommentedExpr:
+                    expr = expr.expr
+                elif t is PrimaryCall and not self._profiling and (hop := self._tail_callee(expr, ctx)) is not None:
+                    hops += 1
+                    if hops >= self._TAIL_CALL_CAP:
+                        self.error(f"Recursion detected calling function '{hop[0]}'", expr)
+                    hop_name, target = hop
+                    call = expr
+                    if self._debugging:
+                        self._check_debug(call, ctx, call_site=True)
+                    if type(target) is Closure:
+                        ctx = self._bind_closure(target, call.arguments, ctx, call)
+                        expr, decl_pos = target.fn.body, target.fn.position
+                    else:
+                        ctx = self._bind_user_function(target, call.arguments, ctx, call)
+                        expr, decl_pos = target.expr, target.position
+                    self._call_stack[-1] = ("function", hop_name, call.position, decl_pos)
+                    self._frame_ctxs[-1] = ctx
+                    if self._debugging:
+                        self._check_debug(expr, ctx)
+                else:
+                    result = self._eval_expr(expr, ctx)
+                    break
             if self._return_hook is not None:
                 self._return_hook(name, result, len(self._call_stack))
             return result
@@ -7808,7 +7870,46 @@ class Evaluator:
             if prof is not None:
                 self._profile_exit(*prof)
 
+    def _tail_callee(self, node: PrimaryCall, ctx: EvalContext):
+        """(name, FunctionDeclaration or Closure) if `node` calls a user
+        function, resolved exactly as _eval_function_call would, else None."""
+        left = node.left
+        if type(left) is not Identifier:
+            return None
+        name = left.name
+        if name == "import":
+            return None
+        if name in self._BUILTIN_FN_NAMES:
+            key = (id(ctx.scope), name)
+            cache = self._builtin_shadow
+            decl = cache.get(key, cache)
+            if decl is cache:
+                decl = cache[key] = ctx.scope.lookup_function(name)
+        else:
+            decl = ctx.scope.lookup_function(name)
+        if decl is not None:
+            return name, decl
+        if name in self._BUILTIN_FN_NAMES:
+            return None
+        value = self._eval_identifier(left, ctx, warn_if_undef=False)
+        return (name, value) if type(value) is Closure else None
+
+    def _check_assert(self, node, ctx) -> None:
+        if self._debugging:
+            self._check_debug(node, ctx)
+        raw = node.arguments
+        condition = self._eval_expr(raw[0].expr, ctx) if raw else True
+        if not condition:
+            cond_text = to_openscad([raw[0].expr]).strip() if raw else "false"
+            msg = self._eval_expr(raw[1].expr, ctx) if len(raw) > 1 else None
+            err = f"Assertion '{cond_text}' failed" + (f': "{msg}"' if msg is not None else "")
+            self.error(err, node, innermost_frame="assert")
+
     def _eval_function_literal(self, closure: Closure, arguments, ctx: EvalContext, call_node=None, name: str | None = None) -> Any:
+        child_ctx = self._bind_closure(closure, arguments, ctx, call_node)
+        return self._run_function_body(name or "<function>", closure.fn.body, closure.fn.position, child_ctx, call_node)
+
+    def _bind_closure(self, closure: Closure, arguments, ctx: EvalContext, call_node) -> EvalContext:
         func_node = closure.fn
         params = func_node.parameters
         bound = self._bind_args(params, arguments, ctx, call_node)
@@ -7823,23 +7924,7 @@ class Evaluator:
             else:
                 child_ctx.let[k] = v
         self._apply_defaults(params, bound, child_ctx)
-        pos = call_node.position if call_node is not None else None
-        fn_name = name or "<function>"
-        prof = self._profile_enter("function", fn_name, pos, func_node.position) if self._profiling else None
-        self._call_stack.append(("function", fn_name, pos, func_node.position))
-        self._frame_ctxs.append(child_ctx)
-        try:
-            if self._debugging:
-                self._check_debug(func_node.body, child_ctx)
-            result = self._eval_expr(func_node.body, child_ctx)
-            if self._return_hook is not None:
-                self._return_hook(fn_name, result, len(self._call_stack))
-            return result
-        finally:
-            self._call_stack.pop()
-            self._frame_ctxs.pop()
-            if prof is not None:
-                self._profile_exit(*prof)
+        return child_ctx
 
 
 _EXPR_DISPATCH: dict[type, callable] = {
