@@ -3,11 +3,11 @@ AST evaluator: walks the openscad_lalr_parser AST and produces Manifold geometry
 Returns (manifold_body, id_to_node, colored_meshes) or raises EvalError.
 """
 from __future__ import annotations
+import functools
 import math
 import random
 import threading
 import time
-from itertools import product as _product
 from pathlib import Path
 from typing import Any, Optional
 from dataclasses import dataclass, field, replace
@@ -45,6 +45,55 @@ from openscad_lalr_parser.nodes import (
     LetOp, EchoOp, AssertOp,
     FunctionLiteral,
 )
+
+
+_MANIFOLD_OK = m3d.Error.NoError
+
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+@functools.lru_cache(maxsize=4096)
+def _unescape_string(raw: str) -> str:
+    r"""A string literal's value from its source text, which the parser
+    keeps verbatim so the source can be reprinted. Matches OpenSCAD:
+    \n \t \r; \xNN for 01-7F only; \uXXXX and \UXXXXXX, with NUL, a
+    surrogate or anything past U+10FFFF becoming a space; any other escaped
+    character standing for itself (\\, \", and unknown ones like \q).
+    A line ending inside the literal contributes nothing, escaped or not,
+    so a string can continue on the next line."""
+    if "\\" not in raw and "\n" not in raw and "\r" not in raw:
+        return raw
+    out = []
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\n" or c == "\r":
+            i += 1
+            continue
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        e = raw[i + 1]
+        i += 2
+        if e == "n":
+            out.append("\n")
+        elif e == "t":
+            out.append("\t")
+        elif e == "r":
+            out.append("\r")
+        elif e in "xuU":
+            width = {"x": 2, "u": 4, "U": 6}[e]
+            digits = raw[i:i + width]
+            if len(digits) == width and all(d in _HEX for d in digits) and (e != "x" or int(digits, 16) <= 0x7F):
+                cp = int(digits, 16)
+                out.append(" " if cp == 0 or 0xD800 <= cp <= 0xDFFF or cp > 0x10FFFF else chr(cp))
+                i += width
+            else:
+                out.append(e)
+        elif e != "\n" and e != "\r":
+            out.append(e)
+    return "".join(out)
 
 
 class EvalError(Exception):
@@ -1216,7 +1265,7 @@ def _object_arg_type_name(v) -> str:
         return "range"
     if isinstance(v, OscObject):
         return "object"
-    if isinstance(v, (FunctionDeclaration, FunctionLiteral)):
+    if isinstance(v, (FunctionDeclaration, FunctionLiteral, Closure)):
         return "function"
     return "undef"
 
@@ -1360,6 +1409,22 @@ class OscObject:
 
     def __repr__(self):
         return f"OscObject({self.data!r})"
+
+
+class Closure:
+    """A function literal's value: the `FunctionLiteral` plus the local
+    (`let`) bindings in force where it was evaluated. Without them a
+    function that outlives its defining call -- `function mk(x) =
+    function(y) x + y; mk(10)(5)` -- read `x` as undef, since the call's
+    frame is gone by the time the literal runs."""
+    __slots__ = ("fn", "let")
+
+    def __init__(self, fn: FunctionLiteral, let: dict):
+        self.fn = fn
+        self.let = let
+
+    def __str__(self):
+        return str(self.fn)
 
 
 _FONT_PATH = Path(__file__).parent / "resources" / "fonts" / "LiberationSans-Regular.ttf"
@@ -2076,6 +2141,9 @@ class Evaluator:
                  manifold_cache: "ManifoldCache | None" = None, profile: bool = False):
         self.id_to_node: dict[int, ASTNode] = {}
         self.id_to_color: dict[int, Optional[tuple]] = {}
+        self._if_taken = False  # whether the last `if` ran a branch; see _is_operand_when_empty
+        self._builtin_shadow: dict[tuple, Any] = {}  # (id(scope), builtin name) -> user decl or None
+        self._global_values: dict[int, Any] = {}  # id(root-scope Assignment) -> value; see _eval_identifier
         self.csg_tree: list[CSGNode] = []
         self._tree_stack: list[list[CSGNode]] = [self.csg_tree]
         # Opt-in (None by default, so every existing bare Evaluator(...)
@@ -2224,7 +2292,7 @@ class Evaluator:
             "is_bool": lambda x: isinstance(x, bool),
             "is_string": lambda x: isinstance(x, str),
             "is_list": lambda x: isinstance(x, list),
-            "is_function": lambda x: isinstance(x, (FunctionDeclaration, FunctionLiteral)),
+            "is_function": lambda x: isinstance(x, (FunctionDeclaration, FunctionLiteral, Closure)),
             "is_object": lambda x: isinstance(x, OscObject),
             "search": self._builtin_search,
             "lookup": self._builtin_lookup,
@@ -2447,6 +2515,8 @@ class Evaluator:
         self._resolve_use_statements(nodes, root_scope)
         self._call_stack.clear()
         self._frame_ctxs.clear()
+        self._global_values = {}
+        self._builtin_shadow = {}
         self.csg_tree = []
         self._tree_stack = [self.csg_tree]
         self._profile_sites = {}
@@ -2461,7 +2531,13 @@ class Evaluator:
         assignments = [n for n in nodes if isinstance(n, Assignment)]
         others = [n for n in nodes if not isinstance(n, Assignment)]
         t_resolve_start = time.perf_counter() if self._profiling else 0.0
-        for node in assignments + others:
+        for node in assignments:
+            self._eval_statement(node, ctx)
+            name = node.name.name
+            if name[0] != '$':
+                # What a function reading this global will see -- see _eval_identifier.
+                self._global_values[id(root_scope.variables.get(name))] = ctx.let.get(name)
+        for node in others:
             self._eval_statement(node, ctx)
         t_resolve_end = time.perf_counter() if self._profiling else 0.0
         result = self.generate_tree(self.csg_tree)
@@ -2705,7 +2781,10 @@ class Evaluator:
                 branch = node.true_branch
                 if self._debugging:
                     self._check_debug(branch[0] if branch else node, ctx, expr_level=True)
-                return self._eval_children(branch, ctx)
+                result = self._eval_children(branch, ctx)
+                self._if_taken = True  # after the branch, whose own ifs set it too
+                return result
+            self._if_taken = False
             return []
         if t is ModularIfElse:
             cond = self._eval_expr(node.condition, ctx)
@@ -2719,6 +2798,8 @@ class Evaluator:
             return self._eval_let_block(node, ctx)
         if t is ModularEcho:
             self._do_echo(node.arguments, ctx)
+            if node.children:  # echo("x") cube(1); still draws the cube
+                return self._eval_children(node.children, ctx)
             return []
         if t is ModularAssert:
             args = self._resolve_args(node.arguments, ctx)
@@ -2740,8 +2821,31 @@ class Evaluator:
             return []
         return []
 
-    def _eval_children(self, children, ctx: EvalContext) -> list[ColoredBody]:
+    @staticmethod
+    def _block_ctx(children, ctx: EvalContext) -> EvalContext:
+        """A braced block is its own scope: `if (c) { x = 2; }` must not
+        leave x (or a `$fn = ...`) behind in the enclosing one. Copies only
+        what the block's own assignments would write, and only if it has
+        any -- most blocks have none."""
+        names = [c.name.name for c in children if type(c) is Assignment]
+        if not names:
+            return ctx
+        dollar = any(n[0] == '$' for n in names)
+        return EvalContext(
+            scope=ctx.scope,
+            dyn=dict(ctx.dyn) if dollar else ctx.dyn,
+            let=dict(ctx.let),
+            dyn_positions={},
+            dyn_explicit=set(ctx.dyn_explicit) if dollar else ctx.dyn_explicit,
+            color=ctx.color,
+            children_nodes=ctx.children_nodes,
+            children_caller_ctx=ctx.children_caller_ctx,
+        )
+
+    def _eval_children(self, children, ctx: EvalContext, new_scope: bool = True) -> list[ColoredBody]:
         result = []
+        if new_scope:
+            ctx = self._block_ctx(children, ctx)
         # OpenSCAD executes all assignments before geometry in each scope.
         assignments = [c for c in children if isinstance(c, Assignment)]
         others = [c for c in children if not isinstance(c, Assignment)]
@@ -2903,7 +3007,7 @@ class Evaluator:
         self._frame_ctxs.append(child_ctx)
         try:
             module_body = getattr(decl, 'children', None) or getattr(decl, 'body', None) or []
-            return self._eval_children(module_body, child_ctx)
+            return self._eval_children(module_body, child_ctx, new_scope=False)  # child_ctx is already fresh
         finally:
             self._call_stack.pop()
             self._frame_ctxs.pop()
@@ -3127,26 +3231,33 @@ class Evaluator:
     def _resolve_cylinder(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
         h = float(self._get_arg(args, 0, "h", 1.0))
-        r = self._get_arg(args, 1, "r", None)
-        r1 = self._get_arg(args, None, "r1", None)
-        r2 = self._get_arg(args, None, "r2", None)
-        d = self._get_arg(args, None, "d", None)
-        d1 = self._get_arg(args, None, "d1", None)
-        d2 = self._get_arg(args, None, "d2", None)
-        center = bool(self._get_arg(args, None, "center", False))
-
-        if d is not None and r is None:
-            r = d / 2
-        if d1 is not None and r1 is None:
-            r1 = d1 / 2
-        if d2 is not None and r2 is None:
-            r2 = d2 / 2
-        if r is not None:
-            r1 = r2 = float(r)
-        if r1 is None:
-            r1 = 1.0
-        if r2 is None:
-            r2 = r1
+        # Positional order is (h, r1, r2, center); r/d/d1/d2 are named only,
+        # so cylinder(10, 5, 2) is a cone. Applied in OpenSCAD's order, each
+        # overriding the last: r, d, r1, r2, d1, d2 -- d beats r, and each
+        # end defaults to 1 on its own. Only numbers count; a stray `true`
+        # in a radius slot is ignored rather than read as 1.
+        def num(v):
+            return type(v) in (int, float)
+        r1 = r2 = 1.0
+        r = self._get_arg(args, None, "r")
+        d = self._get_arg(args, None, "d")
+        if num(r):
+            r1 = r2 = r
+        if num(d):
+            r1 = r2 = d / 2
+        v = self._get_arg(args, 1, "r1")
+        if num(v):
+            r1 = v
+        v = self._get_arg(args, 2, "r2")
+        if num(v):
+            r2 = v
+        v = self._get_arg(args, None, "d1")
+        if num(v):
+            r1 = v / 2
+        v = self._get_arg(args, None, "d2")
+        if num(v):
+            r2 = v / 2
+        center = bool(self._get_arg(args, 3, "center", False))
         segs = self._fn(ctx, max(float(r1), float(r2)))
 
         return {"h": h, "r1": float(r1), "r2": float(r2), "center": center,
@@ -3315,8 +3426,19 @@ class Evaluator:
         return {"rgba": rgba}
 
     def _generate_color(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        # Recorded against the bodies' run IDs as well, because a later
+        # union() recovers colour only from those (_attach_tri_colors). A
+        # primitive records the colour it is born with, but forwarded
+        # children -- `module c(x) { color(x) children(); }`, as BOSL2 does --
+        # are born in the caller's colourless context.
         rgba = params["rgba"]
-        return [replace(b, color=rgba) for b in flatten_csg_tree(children)]
+        for b in flatten_csg_tree(children):
+            if b.body is not None:
+                oid = b.body.original_id()
+                ids = (oid,) if oid >= 0 else b.body.to_mesh().run_original_id
+                for rid in ids:
+                    self.id_to_color[int(rid)] = rgba
+        return [replace(b, color=rgba, tri_colors=None) for b in flatten_csg_tree(children)]
 
     def _css_color(self, name: str, alpha: float = 1.0) -> tuple:
         if name.startswith("#"):
@@ -3359,21 +3481,36 @@ class Evaluator:
         # generated bodies, using these same group_sizes to re-chunk children.
         op = node.name.name
         args, ctx = self._resolve_call_args(node, ctx)
+        ctx = self._block_ctx(node.children, ctx)
         assign_nodes = [c for c in node.children if isinstance(c, Assignment)]
         geo_nodes = [c for c in node.children
                      if not isinstance(c, (Assignment, ModuleDeclaration, FunctionDeclaration))]
 
         # Process assignments first for side-effects (they update ctx.dyn in-place)
         if assign_nodes:
-            self._eval_children(assign_nodes, ctx)
+            self._eval_children(assign_nodes, ctx, new_scope=False)
 
         group_sizes: list[int] = []
         for geo_node in geo_nodes:
             before = len(self._tree_stack[-1])
-            self._eval_children([geo_node], ctx)
-            after = len(self._tree_stack[-1])
-            group_sizes.append(after - before)
+            self._eval_children([geo_node], ctx, new_scope=False)
+            size = len(self._tree_stack[-1]) - before
+            if size or self._is_operand_when_empty(geo_node):
+                group_sizes.append(size)
         return {"op": op, "group_sizes": group_sizes}
+
+    def _is_operand_when_empty(self, node) -> bool:
+        """Whether a statement that produced nothing still counts as an
+        (empty) operand of union/difference/intersection -- the difference
+        between `intersection() { cube(2); if (false) cube(1); }` keeping the
+        cube and emptying it. As in OpenSCAD, a module call or loop builds a
+        node whatever it contains, and an empty one annihilates; an `if` that
+        took no branch, a `*`-disabled statement, and a bare echo()/assert()
+        build none and are skipped. Checked case by case against OpenSCAD."""
+        t = type(node)
+        if t is ModularIf:
+            return self._if_taken
+        return t not in (ModularModifierDisable, ModularEcho, ModularAssert)
 
     def _generate_csg(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
         op = params["op"]
@@ -3381,6 +3518,10 @@ class Evaluator:
         all_hi: list[ColoredBody] = []
         all_so: list[ColoredBody] = []
         csg_result: Optional[ColoredBody] = None
+        # 2D keeps colour geometrically: one part per colour, since a
+        # CrossSection has no per-edge provenance to recover it from after
+        # a merge the way _attach_tri_colors does for 3D.
+        parts_2d: Optional[list[ColoredBody]] = None
         idx = 0
 
         for size in params["group_sizes"]:
@@ -3393,7 +3534,10 @@ class Evaluator:
             all_hi.extend(hi)
             all_so.extend(so)
 
-            bodies_3d = [c for c in fg if c.body is not None]
+            # A Manifold-invalid operand (an open polyhedron, say) would poison
+            # the whole boolean -- one bad part emptied a 65-part union --
+            # so it is dropped instead, as OpenSCAD does.
+            bodies_3d = [c for c in fg if c.body is not None and c.body.status() == _MANIFOLD_OK]
             sections_2d = [c for c in fg if c.section is not None]
 
             if not bodies_3d and not sections_2d:
@@ -3404,9 +3548,9 @@ class Evaluator:
                 # while no positive operand has been established yet; union
                 # just skips the empty contributor and keeps going.
                 if op == "intersection":
-                    csg_result = None
+                    csg_result = parts_2d = None
                     break
-                if op == "difference" and csg_result is None:
+                if op == "difference" and csg_result is None and parts_2d is None:
                     break
                 continue
 
@@ -3423,24 +3567,43 @@ class Evaluator:
                     csg_result = replace(csg_result, body=csg_result.body - grp)
                 elif op == "intersection":
                     csg_result = replace(csg_result, body=csg_result.body ^ grp)
-            elif sections_2d:
-                # Union all 2D sections from this statement before applying the op
+            elif parts_2d is None or op == "union":
+                parts_2d = parts_2d or []
+                for c in sections_2d:
+                    self._paint_2d(parts_2d, c)
+            else:
                 grp = sections_2d[0].section
                 for c in sections_2d[1:]:
                     grp = grp + c.section
-                if csg_result is None:
-                    csg_result = ColoredBody(section=grp, color=sections_2d[0].color)
-                elif op == "union":
-                    csg_result = replace(csg_result, section=csg_result.section + grp)
-                elif op == "difference":
-                    csg_result = replace(csg_result, section=csg_result.section - grp)
-                elif op == "intersection":
-                    csg_result = replace(csg_result, section=csg_result.section ^ grp)
+                parts_2d = [replace(p, section=p.section - grp if op == "difference" else p.section ^ grp)
+                            for p in parts_2d]
+                parts_2d = [p for p in parts_2d if not p.section.is_empty()]
 
         # Return: CSG result + background ghosts + highlight overlays + show_only bodies (all separate from CSG result)
         if csg_result is not None and csg_result.body is not None:
             csg_result = self._attach_tri_colors(csg_result)
-        return ([csg_result] if csg_result is not None else []) + all_bg + all_hi + all_so
+        result = [csg_result] if csg_result is not None else []
+        if parts_2d:
+            result.extend(parts_2d)
+        return result + all_bg + all_hi + all_so
+
+    @staticmethod
+    def _paint_2d(parts: list[ColoredBody], c: ColoredBody) -> None:
+        """Add 2D body `c` to a union's per-colour parts in painter's order:
+        it notches what it covers out of every differently-coloured part and
+        merges into the part of its own colour, so a union of red and blue
+        squares stays red and blue, and two red squares are one red shape."""
+        same = None
+        for i, p in enumerate(parts):
+            if p.color == c.color:
+                same = i
+            else:
+                parts[i] = replace(p, section=p.section - c.section)
+        if same is None:
+            parts.append(ColoredBody(section=c.section, color=c.color))
+        else:
+            parts[same] = replace(parts[same], section=parts[same].section + c.section)
+        parts[:] = [p for p in parts if not p.section.is_empty()]
 
     def _attach_tri_colors(self, cb: ColoredBody) -> ColoredBody:
         """After a real boolean merge, per-input color is otherwise lost --
@@ -4527,7 +4690,9 @@ class Evaluator:
             children_caller_ctx=caller_ctx.children_caller_ctx,
         )
         for k, v in ctx.dyn.items():
-            if k.startswith('$'):
+            # $children is the count of the block being forwarded -- the
+            # caller's own, not that of whichever module forwards it.
+            if k[0] == '$' and k != '$children':
                 eval_ctx.dyn[k] = v
         for k, v in ctx.let.items():
             if k.startswith('$'):
@@ -4556,7 +4721,9 @@ class Evaluator:
             children_caller_ctx=caller_ctx.children_caller_ctx,
         )
         for k, v in ctx.dyn.items():
-            if k.startswith('$'):
+            # $children is the count of the block being forwarded -- the
+            # caller's own, not that of whichever module forwards it.
+            if k[0] == '$' and k != '$children':
                 eval_ctx.dyn[k] = v
         for k, v in ctx.let.items():
             if k.startswith('$'):
@@ -4578,23 +4745,10 @@ class Evaluator:
         # loop variables. Skip any assignment that also appears as a body node — those are
         # per-iteration let-like definitions, not loop variables.
         body_ids = {id(b) for b in node.body}
-        _av_pairs: list[tuple] = []
-        for assign in node.assignments:
-            if id(assign) in body_ids:
-                continue
-            name = assign.name.name
-            values = self._eval_expr(assign.expr, ctx)
-            if values is None:
-                values = []
-            elif isinstance(values, OscRange):
-                values = list(values)
-            elif isinstance(values, OscObject):
-                values = list(values)  # iterate over keys
-            elif isinstance(values, str):
-                values = list(values)  # iterate over characters
-            elif not isinstance(values, list):
-                values = [values]
-            _av_pairs.append((assign, name, values))
+        # Each range is evaluated inside the loops before it, so
+        # `for (i = [0:2], j = [0:i])` sees i.
+        _av_pairs = [(assign, assign.name.name) for assign in node.assignments
+                     if id(assign) not in body_ids]
 
         result = []
         _debugging = self._debugging
@@ -4605,8 +4759,8 @@ class Evaluator:
                     self._check_debug(node.body[0], parent_ctx, expr_level=True)
                 result.extend(self._eval_children(node.body, parent_ctx))
                 return
-            assign_node, name, values = _av_pairs[depth]
-            for val in values:
+            assign_node, name = _av_pairs[depth]
+            for val in self._loop_values(self._eval_expr(assign_node.expr, parent_ctx)):
                 child = parent_ctx.child_ctx(children_nodes=ctx.children_nodes,
                                              children_caller_ctx=ctx.children_caller_ctx)
                 child.let[name] = val
@@ -4618,13 +4772,18 @@ class Evaluator:
         return result
 
     @staticmethod
-    def _cartesian(var_seqs: list[tuple[str, list]]):
-        if not var_seqs:
-            yield []
-            return
-        names, value_lists = zip(*var_seqs)
-        for combo in _product(*value_lists):
-            yield list(zip(names, combo))
+    def _loop_values(values) -> list:
+        """What a `for` iterates over: a range's elements, an object's keys,
+        a string's characters, a list as is, undef as nothing, and any other
+        single value once."""
+        if values is None:
+            return []
+        t = type(values)
+        if t is list:
+            return values
+        if t is OscRange or t is OscObject or t is str:
+            return list(values)
+        return [values]
 
     def _resolve_intersection_for(self, node: ModularIntersectionFor, ctx: EvalContext) -> dict:
         # group_sizes records, per loop iteration, how many CSGNode children
@@ -4634,36 +4793,28 @@ class Evaluator:
         # variable number of tree children). Combining each iteration's
         # children into one body (_combine, a real Manifold call) is
         # deferred to generate — only the plain-data grouping happens here.
-        var_seqs: list[tuple[str, list]] = []
-        for assign in node.assignments:
-            name = assign.name.name
-            values = self._eval_expr(assign.expr, ctx)
-            if values is None:
-                return {"group_sizes": []}
-            if isinstance(values, OscRange):
-                values = list(values)
-            elif isinstance(values, OscObject):
-                values = list(values)  # iterate over keys
-            elif isinstance(values, str):
-                values = list(values)  # iterate over characters
-            elif not isinstance(values, list):
-                values = [values]
-            var_seqs.append((name, values))
-
         body_node = node.body if isinstance(node.body, list) else [node.body]
         _debugging = self._debugging
         group_sizes: list[int] = []
-        for combo in self._cartesian(var_seqs):
-            loop_ctx = ctx.child_ctx(children_nodes=ctx.children_nodes,
-                                     children_caller_ctx=ctx.children_caller_ctx)
-            for vname, val in combo:
-                loop_ctx.let[vname] = val
-            if _debugging and body_node:
-                self._check_debug(body_node[0], loop_ctx, expr_level=True)
-            before = len(self._tree_stack[-1])
-            self._eval_children(body_node, loop_ctx)
-            after = len(self._tree_stack[-1])
-            group_sizes.append(after - before)
+        assigns = node.assignments
+
+        # Nested like _eval_for, so a later range can read an earlier variable.
+        def _nested(depth: int, parent_ctx: EvalContext) -> None:
+            if depth == len(assigns):
+                if _debugging and body_node:
+                    self._check_debug(body_node[0], parent_ctx, expr_level=True)
+                before = len(self._tree_stack[-1])
+                self._eval_children(body_node, parent_ctx)
+                group_sizes.append(len(self._tree_stack[-1]) - before)
+                return
+            assign = assigns[depth]
+            for val in self._loop_values(self._eval_expr(assign.expr, parent_ctx)):
+                loop_ctx = parent_ctx.child_ctx(children_nodes=ctx.children_nodes,
+                                                children_caller_ctx=ctx.children_caller_ctx)
+                loop_ctx.let[assign.name.name] = val
+                _nested(depth + 1, loop_ctx)
+
+        _nested(0, ctx)
         return {"group_sizes": group_sizes}
 
     def _generate_intersection_for(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
@@ -4702,7 +4853,7 @@ class Evaluator:
         for assign in node.assignments:
             if self._debugging:
                 self._check_debug(assign, ctx)
-            v = self._eval_expr(assign.expr, ctx)
+            v = self._eval_expr(assign.expr, child_ctx)  # sequential: b=a+1 sees a
             # dyn/dyn_explicit are already a fresh copy (plain child_ctx(),
             # not let_child_ctx()) -- dyn_copied=True skips the redundant copy.
             self._bind_let_name(child_ctx, assign.name.name, v, True)
@@ -4745,8 +4896,10 @@ class Evaluator:
 
     def _eval_expr(self, node, ctx: EvalContext):
         t = type(node)
-        if t is NumberLiteral or t is BooleanLiteral or t is StringLiteral:
+        if t is NumberLiteral or t is BooleanLiteral:
             return node.val
+        if t is StringLiteral:
+            return _unescape_string(node.val)
         if t is Identifier:
             name = node.name
             let = ctx.let
@@ -4762,16 +4915,7 @@ class Evaluator:
                     return v
                 if name in dyn:
                     return v
-            if name in self._CONSTANTS:
-                return self._CONSTANTS[name]
-            decl = ctx.scope.lookup_variable(name)
-            if decl is None:
-                pos = getattr(node, 'position', None)
-                self._echo_fn(f"WARNING: Ignoring unknown variable '{name}'{self._loc(pos)}")
-                return None
-            if type(decl) is ParameterDeclaration:
-                return None
-            return self._eval_expr(decl.expr, ctx)
+            return self._eval_identifier(node, ctx)
         if t is UndefinedLiteral:
             return None
         if t is CommentedExpr:
@@ -5090,7 +5234,7 @@ class Evaluator:
         return self._eval_expr(node.body, ctx)
 
     def _expr_function_literal(self, node, ctx):
-        return node
+        return Closure(node, dict(ctx.let))
 
     _CONSTANTS = {"PI": math.pi}
 
@@ -5117,7 +5261,26 @@ class Evaluator:
             return None
         if type(decl) is ParameterDeclaration:
             return None
-        return self._eval_expr(decl.expr, ctx)
+        # A file's globals are evaluated once per run, not once per read: a
+        # function reading `r = rands(...)` must see the same r every call.
+        # Only root-scope assignments qualify -- a module body's locals
+        # differ per call.
+        key = id(decl)
+        globals_ = self._global_values
+        if key in globals_:
+            return globals_[key]
+        v = self._eval_expr(decl.expr, ctx)
+        if self._is_global(ctx.scope, name, decl):
+            globals_[key] = v
+        return v
+
+    @staticmethod
+    def _is_global(scope, name: str, decl) -> bool:
+        while scope.parent is not None:
+            if scope.variables.get(name) is decl:
+                return False
+            scope = scope.parent
+        return scope.variables.get(name) is decl
 
     def _eval_list_comp(self, node: ListComprehension, ctx: EvalContext) -> list:
         result = []
@@ -5246,23 +5409,9 @@ class Evaluator:
         return [v]
 
     def _eval_listcomp_for(self, node: ListCompFor, ctx: EvalContext) -> list:
-        _av_pairs: list[tuple] = []
-        for assign in node.assignments:
-            name = assign.name.name
-            values = self._eval_expr(assign.expr, ctx)
-            if values is None:
-                values = []
-            elif type(values) is list:
-                pass
-            elif type(values) is OscRange:
-                values = list(values)
-            elif type(values) is OscObject:
-                values = list(values)
-            elif type(values) is str:
-                values = list(values)  # iterate over characters
-            else:
-                values = [values]
-            _av_pairs.append((assign, name, values))
+        # Ranges are evaluated inside the loops before them -- see _eval_for.
+        _av_pairs = [(assign, assign.name.name) for assign in node.assignments]
+        _loop_values = self._loop_values
 
         result = []
         _debugging = self._debugging
@@ -5277,7 +5426,10 @@ class Evaluator:
                     result.extend(self._eval_list_comp_body(node.body, parent_ctx))
                 self._expr_depth -= 1
                 return
-            assign_node, name, values = _av_pairs[depth]
+            assign_node, name = _av_pairs[depth]
+            values = self._eval_expr(assign_node.expr, parent_ctx)
+            if type(values) is not list:
+                values = _loop_values(values)
             for val in values:
                 child = parent_ctx.let_child_ctx()
                 child.let[name] = val
@@ -5342,13 +5494,22 @@ class Evaluator:
             if name == "import":
                 args = self._resolve_args(node.arguments, ctx)
                 return self._import_as_value(args, node)
-            if name not in self._BUILTIN_FN_NAMES:
-                decl = ctx.scope.lookup_function(name)
-                if decl is not None:
-                    if self._debugging:
-                        self._check_debug(node, ctx)
-                    return self._eval_user_function(name, decl, node.arguments, ctx, node)
+            # A user function shadows a builtin of the same name, as in OpenSCAD.
+            if name in self._BUILTIN_FN_NAMES:
+                # Cached, since builtins are called constantly and hardly
+                # ever shadowed; scopes don't change during a run.
+                key = (id(ctx.scope), name)
+                cache = self._builtin_shadow
+                decl = cache.get(key, cache)
+                if decl is cache:
+                    decl = cache[key] = ctx.scope.lookup_function(name)
             else:
+                decl = ctx.scope.lookup_function(name)
+            if decl is not None:
+                if self._debugging:
+                    self._check_debug(node, ctx)
+                return self._eval_user_function(name, decl, node.arguments, ctx, node)
+            if name in self._BUILTIN_FN_NAMES:
                 args = self._resolve_args(node.arguments, ctx)
                 if name == "object":
                     return self._builtin_object(args, node)
@@ -5376,7 +5537,7 @@ class Evaluator:
             func_node = self._eval_identifier(left, ctx, warn_if_undef=False)
         else:
             func_node = self._eval_expr(left, ctx)
-        if type(func_node) is FunctionLiteral:
+        if type(func_node) is Closure:
             if self._debugging:
                 self._check_debug(node, ctx)
             return self._eval_function_literal(func_node, node.arguments, ctx, node, name=name)
@@ -5803,13 +5964,15 @@ class Evaluator:
             if prof is not None:
                 self._profile_exit(*prof)
 
-    def _eval_function_literal(self, func_node: FunctionLiteral, arguments, ctx: EvalContext, call_node=None, name: str | None = None) -> Any:
+    def _eval_function_literal(self, closure: Closure, arguments, ctx: EvalContext, call_node=None, name: str | None = None) -> Any:
+        func_node = closure.fn
         params = func_node.parameters
         bound = self._bind_args(params, arguments, ctx)
         fn_scope = func_node.scope or ctx.scope
         # See _eval_user_function's matching comment -- same optimization.
         share_dyn = not self._has_dollar_param(id(func_node), params) and not self._bound_has_dollar_key(bound)
-        child_ctx = self._call_ctx_for(func_node, ctx, scope=fn_scope, share_dyn=share_dyn)
+        child_ctx = ctx.call_ctx(scope=fn_scope, share_dyn=share_dyn)
+        child_ctx.let = dict(closure.let)
         for k, v in bound.items():
             if k[0] == '$':
                 child_ctx.dyn[k] = v
