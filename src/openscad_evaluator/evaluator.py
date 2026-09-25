@@ -119,6 +119,31 @@ def _range_count(r: "OscRange") -> float:
     return math.inf if math.isinf(n) else math.floor(n + 1e-10) + 1
 
 
+# The OpenSCAD release this evaluator tracks, as openscad_cpp_evaluator does:
+# 2026.01.01, the first tagged build with hex literals and object().
+# 2025.01.01, reported before, was never a release.
+_OPENSCAD_VERSION = (2026, 1, 1)
+
+
+def _version_num(v=None):
+    """version_num(): the release as y*10000 + m*100 + d, or that of a
+    [y, m, d] / [y, m] vector passed in (which was ignored); anything else
+    is undef."""
+    if v is None:
+        v = _OPENSCAD_VERSION
+    if not isinstance(v, (list, tuple)) or len(v) not in (2, 3) or \
+            not all(type(x) in (int, float) for x in v):
+        return None
+    y, m, d = (list(v) + [0])[:3]
+    return y * 10000 + m * 100 + d
+
+
+def _signed_area(poly) -> float:
+    """Shoelace area: positive for a counter-clockwise contour."""
+    p = np.asarray(poly, dtype=np.float64)
+    return 0.5 * float(np.dot(p[:, 0], np.roll(p[:, 1], -1)) - np.dot(np.roll(p[:, 0], -1), p[:, 1]))
+
+
 def _cos_sin_deg(deg: float) -> tuple[float, float]:
     """cos and sin of `deg` degrees, exact at multiples of 90, so a quarter
     turn leaves no 6e-17 residue (a 2D shape turned edge-on would keep a
@@ -2293,6 +2318,7 @@ class Evaluator:
             "multmatrix": self._resolve_transform,
             "color": self._resolve_color,
             "hull": self._resolve_hull,
+            "fill": self._resolve_hull,  # the same: children only
             "minkowski": self._resolve_minkowski,
             "offset": self._resolve_offset,
             "projection": self._resolve_projection,
@@ -2329,6 +2355,7 @@ class Evaluator:
             "multmatrix": self._generate_transform,
             "color": self._generate_color,
             "hull": self._generate_hull,
+            "fill": self._generate_fill,
             "minkowski": self._generate_minkowski,
             "offset": self._generate_offset,
             "projection": self._generate_projection,
@@ -2396,8 +2423,8 @@ class Evaluator:
             "search": self._builtin_search,
             "lookup": self._builtin_lookup,
             "has_key": lambda obj, key: (key in obj.data) if isinstance(obj, OscObject) else None,
-            "version": lambda: [2025, 1, 1],
-            "version_num": lambda: 20250101,
+            "version": lambda: list(_OPENSCAD_VERSION),
+            "version_num": _version_num,
             "parent_module": self._builtin_parent_module,
         }
         self._BUILTIN_FN_NAMES = frozenset(self._math_fns) | {"object", "textmetrics", "fontmetrics"}
@@ -3171,7 +3198,7 @@ class Evaluator:
         "translate": ("v",), "rotate": ("a", "v"), "scale": ("v",), "mirror": ("v",),
         "multmatrix": ("m",), "resize": ("newsize", "auto", "convexity"),
         "color": ("c", "alpha"),
-        "union": (), "difference": (), "intersection": (), "hull": (),
+        "union": (), "difference": (), "intersection": (), "hull": (), "fill": (),
         "minkowski": ("convexity",), "children": ("index",), "render": ("convexity",),
         "import": ("file", "layer", "convexity", "origin", "scale", "width", "height",
                    "filename", "layername", "center", "dpi", "id"),
@@ -3258,7 +3285,7 @@ class Evaluator:
 
     def _resolve_children_call(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
-        self._builtin_children(args, ctx)  # side effect only; return (real bodies) unused now
+        self._builtin_children(args, ctx, node)  # side effect only; return (real bodies) unused now
         return {}
 
     def _resolve_breakpoint(self, node: ModularCall, ctx: EvalContext) -> dict:
@@ -3514,6 +3541,20 @@ class Evaluator:
             tris = tris[:, [0, 2, 1]]
         return verts, tris
 
+    def _resize_scales(self, args: dict, span) -> list[float]:
+        """resize()'s scale per axis: newsize/current where newsize is given;
+        where it is 0 and `auto` is set for that axis, the largest of the
+        given scales, so resize([10,0,0], auto=true) scales uniformly (auto
+        was ignored); otherwise 1."""
+        newsize = [float(x) for x in self._get_arg(args, 0, "newsize", [0, 0, 0])]
+        newsize += [0.0] * (3 - len(newsize))
+        auto = self._get_arg(args, 1, "auto", False)
+        auto = [bool(a) for a in auto][:3] + [False] * 3 if isinstance(auto, list) else [bool(auto)] * 3
+        scales = [ns / sp if ns and sp else None for ns, sp in zip(newsize, span)]
+        given = [sc for sc in scales if sc is not None]
+        fill = max(given) if given else 1.0
+        return [sc if sc is not None else (fill if auto[i] else 1.0) for i, sc in enumerate(scales)]
+
     def _transform_matrix(self, name: str, args: dict, span) -> np.ndarray:
         """The 4x4 matrix of a transform; `span` is the extent resize() scales to."""
         m = np.eye(4)
@@ -3536,9 +3577,7 @@ class Evaluator:
             if n @ n:
                 m[:3, :3] -= 2 * np.outer(n, n) / (n @ n)
         elif name == "resize":
-            newsize = [float(x) for x in self._get_arg(args, 0, "newsize", [0, 0, 0])]
-            newsize += [0.0] * (3 - len(newsize))
-            m[:3, :3] = np.diag([ns / sp if ns and sp else 1 for ns, sp in zip(newsize, span)])
+            m[:3, :3] = np.diag(self._resize_scales(args, span))
         elif name == "multmatrix":
             mat = self._get_arg(args, 0, "m", None)
             if mat is not None:
@@ -3605,13 +3644,8 @@ class Evaluator:
             v = self._to_vec3(v)
             body = body.mirror(v)
         elif name == "resize":
-            newsize = self._get_arg(args, 0, "newsize", [0, 0, 0])
-            newsize = [float(x) for x in newsize]
             bb = body.bounding_box()  # (xmin,ymin,zmin,xmax,ymax,zmax)
-            sx = newsize[0] / (bb[3] - bb[0]) if newsize[0] != 0 and (bb[3]-bb[0]) != 0 else 1
-            sy = newsize[1] / (bb[4] - bb[1]) if newsize[1] != 0 and (bb[4]-bb[1]) != 0 else 1
-            sz = newsize[2] / (bb[5] - bb[2]) if newsize[2] != 0 and (bb[5]-bb[2]) != 0 else 1
-            body = body.scale([sx, sy, sz])
+            body = body.scale(self._resize_scales(args, [bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]]))
         elif name == "multmatrix":
             m = self._get_arg(args, 0, "m", None)
             if m is not None:
@@ -3956,6 +3990,18 @@ class Evaluator:
                 if sections:
                     hull_result = ColoredBody(section=m3d.CrossSection.batch_hull(sections), color=fg[0].color)
         return ([hull_result] if hull_result is not None else []) + bg + hi + so
+
+    def _generate_fill(self, params: dict, children: list[CSGNode], node: ASTNode) -> list[ColoredBody]:
+        """fill(): its 2D children's union with every hole filled -- only the
+        outer (counter-clockwise) contours kept. It was an unknown module."""
+        bodies = flatten_csg_tree(children)
+        cs = self._to_cross_section(bodies)
+        if cs is None:
+            return []
+        outers = [p for p in cs.to_polygons() if _signed_area(p) > 0]
+        filled = m3d.CrossSection([np.asarray(p, dtype=np.float64) for p in outers], m3d.FillRule.Positive) \
+            if outers else m3d.CrossSection()
+        return [ColoredBody(section=filled, color=bodies[0].color if bodies else None)]
 
     def _resolve_polyhedron(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
@@ -4700,8 +4746,12 @@ class Evaluator:
     def _resolve_offset(self, node: ModularCall, ctx: EvalContext) -> dict:
         args, ctx = self._resolve_call_args(node, ctx)
         self._eval_children(node.children, ctx)  # side effect only, see _resolve_transform
-        r = self._get_arg(args, None, "r", None)
+        # offset(2) is offset(r=2), and a bare offset() is r=1, as in OpenSCAD
+        # (both did nothing).
+        r = self._get_arg(args, 0, "r", None)
         delta = self._get_arg(args, None, "delta", None)
+        if r is None and delta is None:
+            r = 1.0
         chamfer = bool(self._get_arg(args, None, "chamfer", False))
         segs = self._fn(ctx, abs(float(r))) if r is not None else None
         return {"r": r, "delta": delta, "chamfer": chamfer, "segs": segs, "color": ctx.color}
@@ -4715,7 +4765,9 @@ class Evaluator:
         if r is not None:
             result = cs.offset(float(r), m3d.JoinType.Round, circular_segments=params["segs"])
         elif delta is not None:
-            jt = m3d.JoinType.Miter if chamfer else m3d.JoinType.Square
+            # Sharp corners unless chamfered -- these were the wrong way round:
+            # offset(delta=2) square(10) is 14 x 14 (196), not cut at the corners.
+            jt = m3d.JoinType.Square if chamfer else m3d.JoinType.Miter
             result = cs.offset(float(delta), jt)
         else:
             return [bodies[0]] if bodies else []
@@ -5051,14 +5103,15 @@ class Evaluator:
                 eval_ctx.let[k] = v
         return self._eval_children(ctx.children_nodes, eval_ctx)
 
-    def _builtin_children(self, args: dict, ctx: EvalContext) -> list[ColoredBody]:
+    def _builtin_children(self, args: dict, ctx: EvalContext, node=None) -> list[ColoredBody]:
         idx = self._get_arg(args, 0, "index", None)
         if idx is None:
             return self._eval_children_lazy(ctx)
         # children(N) must index into child STATEMENTS, not output bodies.
         # A filtered statement may produce 0 bodies, shifting all subsequent
         # body-index lookups — so we evaluate only the Nth statement directly.
-        idx = int(idx)
+        # N may be a number, a vector or a range (those crashed in int()).
+        indices = [idx] if type(idx) in (int, float) else self._loop_values(idx, node)
         if not ctx.children_nodes:
             return []
         caller_ctx = ctx.children_caller_ctx
@@ -5066,7 +5119,17 @@ class Evaluator:
             return []
         geo_nodes = [c for c in ctx.children_nodes
                      if not isinstance(c, (Assignment, ModuleDeclaration, FunctionDeclaration))]
-        if idx < 0 or idx >= len(geo_nodes):
+        picked = []
+        for i in indices:
+            if type(i) not in (int, float):
+                continue
+            i = int(i)
+            if 0 <= i < len(geo_nodes):
+                picked.append(geo_nodes[i])
+            else:
+                self._echo_fn(f"WARNING: Children index ({i}) out of bounds ({len(geo_nodes)} children)"
+                              f"{self._loc(getattr(node, 'position', None))}")
+        if not picked:
             return []
         eval_ctx = caller_ctx.child_ctx(
             children_nodes=caller_ctx.children_nodes,
@@ -5080,7 +5143,10 @@ class Evaluator:
         for k, v in ctx.let.items():
             if k.startswith('$'):
                 eval_ctx.let[k] = v
-        return self._eval_children([geo_nodes[idx]], eval_ctx)
+        result = []
+        for child in picked:
+            result.extend(self._eval_children([child], eval_ctx))
+        return result
 
     def _builtin_breakpoint(self, args: dict, node, ctx: EvalContext):
         cond = self._get_arg(args, 0, "condition", default=None)
@@ -5966,6 +6032,12 @@ class Evaluator:
                     self._warn_unexpected_args(self._BUILTIN_PARAMS[name], node.arguments, node, builtin=True)
                 if name == "object":
                     return self._builtin_object(args, node)
+                if name == "search":
+                    positional = [args[i] for i in range(len(args)) if i in args]
+                    try:
+                        return self._builtin_search(*positional, node=node)
+                    except Exception:
+                        return None
                 if name == "textmetrics":
                     return self._builtin_textmetrics(args, node)
                 if name == "fontmetrics":
@@ -6106,7 +6178,7 @@ class Evaluator:
             random.seed(int(seed))
         return [random.uniform(float(minval), float(maxval)) for _ in range(int(n))]
 
-    def _builtin_search(self, match, vector, num_returns=1, index_col=0):
+    def _builtin_search(self, match, vector, num_returns=1, index_col=0, node=None):
         """OpenSCAD search(): find positions of match value(s) in vector.
 
         Strings are treated as character arrays — each character is searched
@@ -6139,6 +6211,17 @@ class Evaluator:
             else:
                 return matches[:num_returns]
 
+        if isinstance(match, str) and isinstance(vector, list):
+            # Characters are looked for in a column of each entry, so every
+            # entry must be a list that long; OpenSCAD refuses the whole
+            # search at the first that isn't (a list of strings matched).
+            for i, item in enumerate(vector):
+                if not isinstance(item, list) or len(item) <= col:
+                    self._echo_fn(
+                        f"WARNING: Invalid entry in search vector at index {i}, required number of "
+                        f"values in the entry: {col + 1}. Invalid entry: {self._fmt_val(item)}"
+                        f"{self._loc(getattr(node, 'position', None))}")
+                    return []
         if isinstance(match, str):
             # String → character array: search for each char independently.
             # With num_returns=1: not-found chars are dropped (not included as []).
@@ -6203,7 +6286,10 @@ class Evaluator:
             elif isinstance(val, list):
                 for entry in val:
                     if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str):
+                        result.pop(entry[0], None)  # re-set moves it last, as in OpenSCAD
                         result[entry[0]] = entry[1]
+                    elif isinstance(entry, list) and len(entry) == 1 and isinstance(entry[0], str):
+                        result.pop(entry[0], None)  # [key] deletes; an absent key is fine
                     else:
                         self._echo_fn(
                             f"WARNING: object(Argument {key}) malformed [key,value] entry in "

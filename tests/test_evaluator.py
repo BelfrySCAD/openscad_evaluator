@@ -5900,3 +5900,60 @@ class TestDollarVariables:
                        "lvl(); outer(); "
                        "module w() { children(); } module o() { w() echo($parent_modules); } o() cube(1);")
         assert lines == ["ECHO: 1", "ECHO: 2", "ECHO: 2"]
+
+
+class TestBuiltinArguments:
+    """Expected values are OpenSCAD 2026.02.01's."""
+
+    @pytest.mark.parametrize("src, size", [
+        ("resize([10,0,0], auto=true) cube([2,4,8]);", (10, 20, 40)),
+        ("resize([10,0,0], auto=[true,false,true]) cube([2,4,8]);", (10, 4, 40)),
+        ("resize([10,8,0], auto=true) cube([2,4,8]);", (10, 8, 40)),   # the larger scale
+        ("resize([0,2,0], auto=true) cube([2,4,8]);", (1, 2, 4)),
+        ("resize([10,0,0]) cube([2,4,8]);", (10, 4, 8)),
+    ])
+    def test_resize_auto(self, src, size):
+        bb = bbox(run(src)[0])
+        assert (bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]) == approx(size)
+
+    @pytest.mark.parametrize("src, area", [
+        ("offset(2) square(10);", 191.2426789),   # r positionally: did nothing
+        ("offset() square(10);", 142.5201744),    # r=1 by default: did nothing
+        ("offset(delta=2) square(10);", 196),     # sharp: was chamfered
+        ("offset(delta=2, chamfer=true) square(10);", 193.2547694),
+    ])
+    def test_offset(self, src, area):
+        bodies, _ = run(src)
+        assert bodies[0].section.area() == approx(area, rel=1e-3)
+
+    def test_children_by_vector_and_range(self):
+        src = ("module {m}() children({i}); {m}() {{ cube(1); translate([5,0,0]) cube(2); "
+               "translate([20,0,0]) cube(3); }}")
+        bodies, _ = run(src.format(m="s", i="[0:1]"))  # crashed
+        assert sum(b.body.volume() for b in bodies) == approx(9)
+        bodies, _ = run(src.format(m="p", i="[2, 0]"))
+        assert sum(b.body.volume() for b in bodies) == approx(28)
+
+    def test_children_out_of_bounds_warns(self):
+        _, lines = run("module k() children([0:3]); k() { cube(1); cube(2); }")
+        assert lines == [f"WARNING: Children index ({i}) out of bounds (2 children) in file <string>, line 1"
+                         for i in (2, 3)]
+
+    def test_fill(self):
+        bodies, _ = run("fill() difference() { square(20); translate([3,3]) square(14); }")
+        assert bodies[0].section.area() == approx(400)
+
+    def test_version(self):
+        _, lines = run("echo(version(), version_num(), version_num([2019,5,0]), version_num([2021,1]), "
+                       "version_num(5));")
+        assert lines == ["ECHO: [2026, 1, 1], 2.02601e+7, 2.01905e+7, 2.02101e+7, undef"]
+
+    def test_object_delete_entry(self):
+        _, lines = run('o = object(a=42, b=53, c=8); '
+                       'echo(object(o, [["d", 18], ["b"]]), object(o, [["b"], ["b", 99]]), object(o, [["zz"]]));')
+        assert lines == ["ECHO: { a = 42; c = 8; d = 18; }, { a = 42; c = 8; b = 99; }, { a = 42; b = 53; c = 8; }"]
+
+    def test_search_string_in_a_list_of_strings_is_refused(self):
+        _, lines = run('echo(search("x", ["x", "yx", "x"], 0));')
+        assert lines == ['WARNING: Invalid entry in search vector at index 0, required number of values in '
+                         'the entry: 1. Invalid entry: "x" in file <string>, line 1', "ECHO: []"]

@@ -14,15 +14,8 @@ PRs. Each item below was confirmed to still be wrong here, most by a probe scrip
 
 
 Builtin arguments
-- `resize(auto=)` ignored (04797d0)
-- `offset(2)` means r=2; bare `offset()` means r=1 (04797d0)
-- `children([0:1])` crashes (`int()` of an OscRange); expand vectors and ranges (#107)
-- `search()` ignores `num_returns_per_match`/`index_col_num` (#146)
-- `object()` single-element `[key]` delete entry (#106)
 - `font` style ignored in `text()`/`textmetrics()`/`fontmetrics()` (#163, #164); `:style=bold`
   falls back to Regular when `fc-match` is missing, i.e. always on macOS (#171)
-- `fill()` missing (#100)
-- `version()` is `[2025,1,1]`; `version_num([2019,5,0])` is undef (#98)
 
 Numbers and strings
 - Undefined escape sequences (`\q`, `\x80`) should warn "Undefined escape sequence";
