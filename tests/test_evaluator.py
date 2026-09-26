@@ -4180,6 +4180,22 @@ class TestCoverage:
         return ev.coverage_result, {(s["origin"].rsplit("/", 1)[-1], s["line"], s["column"], s["kind"]): s["hits"]
                                     for s in ev.coverage_result["spans"]}
 
+    def test_a_file_reached_by_nested_use_is_listed(self, tmp_path):
+        # Through resolve_use_scopes, as the CLI runs a script: it drops the
+        # use<> statements, so a used file's globals and anything it used in
+        # turn are reachable only through its root scope.
+        from openscad_lalr_parser import getASTfromFile
+        from openscad_evaluator.evaluator import resolve_use_scopes
+        (tmp_path / "lib.scad").write_text("g = 1;\nfunction hit(x) = x + g;\nfunction miss(x) = x;\n")
+        (tmp_path / "mid.scad").write_text("use <lib.scad>\nfunction f() = hit(1);\n")
+        (tmp_path / "main.scad").write_text("use <mid.scad>\necho(f(), f());\n")
+        main = str(tmp_path / "main.scad")
+        nodes, _own, scope = resolve_use_scopes(getASTfromFile(main, include_comments=False), main, print)
+        ev = Evaluator(echo_fn=lambda m: None, coverage=True)
+        ev.evaluate(nodes, scope)
+        h = {(s["line"], s["kind"]): s["hits"] for s in ev.coverage_result["spans"] if s["origin"].endswith("lib.scad")}
+        assert h == {(1, "statement"): 1, (2, "body"): 2, (3, "body"): 0}
+
     def test_statements_arms_and_bodies(self, tmp_path):
         r, h = self._cov(tmp_path, "a = 3;\nfunction f(x) = x > 0 ? x : -x;\necho(f(a));\n"
                                    "if (a > 2) { cube(1); } else { sphere(1); }\nd = a > 1 && a < 9;\n"

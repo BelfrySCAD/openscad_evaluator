@@ -3818,13 +3818,13 @@ class Evaluator:
     def _coverage_universe(self, nodes, root_scope) -> tuple[list, list]:
         """(roots, used-file globals) for the coverage walk: the run's own
         top-level statements, every declaration of every file it use<>s --
-        shadowed or not, as the C++ port reports them -- and those files'
-        own global assignments."""
+        shadowed or not, as the C++ port reports them, and at any depth of
+        nested use<> -- and those files' own global assignments."""
         roots = [n for n in nodes if type(n) is not UseStatement]
         extra, seen_files = [], set()
-        for node in nodes:
-            if type(node) is not UseStatement:
-                continue
+        pending = [n for n in nodes if type(n) is UseStatement]
+        while pending:
+            node = pending.pop(0)
             origin = getattr(node.position, "origin", "") if node.position else ""
             lib = findLibraryFile(origin, node.filepath.val)
             if lib is None or lib in seen_files:
@@ -3835,12 +3835,25 @@ class Evaluator:
                     roots.append(n)
                 elif type(n) is Assignment:
                     extra.append(n)
+                elif type(n) is UseStatement:
+                    pending.append(n)  # a used file's own use<>: its declarations run too
         # Declarations use<> injected are the very nodes this run executed,
         # so prefer them over the fresh parse above: same span, but these
-        # carry the hits. build_result dedupes by position.
-        for decl in list(root_scope.modules.values()) + list(root_scope.functions.values()):
-            roots.insert(0, decl)
-        return roots, extra
+        # carry the hits. build_result dedupes by position. Each is anchored
+        # to its own file's root scope, which holds what THAT file use<>d,
+        # so following decl.scope reaches every level of nesting.
+        executed, scopes, seen = [], [root_scope], {id(root_scope)}
+        while scopes:
+            scope = scopes.pop()
+            if scope is not root_scope:  # a used file's root: its globals ran once, from here
+                extra[:0] = [v for v in scope.variables.values() if type(v) is Assignment]
+            for decl in list(scope.modules.values()) + list(scope.functions.values()):
+                executed.append(decl)
+                own = getattr(decl, "scope", None)
+                if own is not None and id(own) not in seen:
+                    seen.add(id(own))
+                    scopes.append(own)
+        return executed + roots, extra
 
     def _current_call_chain(self) -> tuple:
         return tuple((e[2], e[0] == "module") for e in reversed(self._call_stack))
