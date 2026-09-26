@@ -6934,3 +6934,16 @@ class TestSharedIncludeScopes:
             out = []
             Evaluator(echo_fn=out.append).evaluate(nodes, scope, generate=False)
             assert out == [want]
+
+
+def test_a_file_included_twice_runs_twice(tmp_path):
+    """OpenSCAD 2026.02.01 prints `lib` twice (openscad_lalr_parser 2.1)."""
+    from openscad_lalr_parser import getASTfromFile
+    from openscad_evaluator.evaluator import resolve_use_scopes
+    (tmp_path / "lib.scad").write_text('echo("lib");\n')
+    (tmp_path / "main.scad").write_text("include <lib.scad>\ninclude <lib.scad>\n")
+    main = str(tmp_path / "main.scad")
+    nodes, _own, scope = resolve_use_scopes(getASTfromFile(main, include_comments=False), main, print)
+    out = []
+    Evaluator(echo_fn=out.append).evaluate(nodes, scope, generate=False)
+    assert out == ['ECHO: "lib"', 'ECHO: "lib"']
