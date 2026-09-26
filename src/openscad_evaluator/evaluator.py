@@ -2331,25 +2331,43 @@ def _measure_text(text: str, size: float, spacing: float, font: dict | None = No
     return m
 
 
-def _text_align_offset(halign: str, valign: str, m: dict) -> tuple[float, float]:
-    """OpenSCAD's ShapeResults::calc_offsets_horiz/_vert: the `(offset_x,
-    offset_y)` translation for `halign`/`valign`, given `_measure_text`'s
-    dict. Shared by `_builtin_textmetrics` (which reports it) and
-    `_builtin_text` (which applies it). "default" is left/baseline for a
-    horizontal run and center/top for a vertical one; text with no ink is
-    not moved. An unknown value (or valign="baseline" on a vertical run)
-    does not move the text there either; OpenSCAD also warns, which this
-    does not."""
+def _text_align_offset(halign: str, valign: str, m: dict, warn=None) -> tuple[float, float]:
+    """OpenSCAD's ShapeResults::calc_offsets_horiz/_vert, warnings included:
+    the `(offset_x, offset_y)` translation for `halign`/`valign`, given
+    `_measure_text`'s dict. Shared by `_builtin_textmetrics` (which reports
+    it) and `_builtin_text` (which applies it). "default" is left/baseline
+    for a horizontal run and center/top for a vertical one. An unknown value,
+    or valign="baseline" on a vertical run, leaves that axis where it is and
+    is passed to `warn` in OpenSCAD's words. Text with no ink is neither
+    moved nor warned about, since it never reaches this code there."""
     if not m["has_ink"]:
         return 0.0, 0.0
+    # A non-string is read as unset, as the C++ evaluator reads it (OpenSCAD
+    # gives an "Invalid type" warning there instead, which neither gives).
+    halign = halign if isinstance(halign, str) else "default"
+    valign = valign if isinstance(valign, str) else "default"
+
+    def unknown(param, choices, value):
+        if warn:
+            warn(f"Unknown value for the {param} parameter (use {choices}): '{value}'")
+
+    h_choices, v_choices = '"left", "right" or "center"', '"baseline", "bottom", "top" or "center"'
     if m["vertical"]:
-        offset_x = {"left": -m["left"], "right": -m["right"]}.get(halign, 0.0)
-        offset_y = {"center": -m["advance_y"] / 2, "bottom": -m["advance_y"]}.get(valign, 0.0)
+        h = {"left": -m["left"], "right": -m["right"], "center": 0.0, "default": 0.0}
+        v = {"center": -m["advance_y"] / 2, "bottom": -m["advance_y"], "top": 0.0, "default": 0.0}
+        if valign == "baseline":
+            if warn:
+                warn('Don\'t use valign="baseline" with vertical layouts')
+            v["baseline"] = 0.0
     else:
-        offset_x = -{"center": 0.5, "right": 1.0}.get(halign, 0.0) * m["advance_x"]
-        offset_y = {"top": -m["ascent"], "center": -(m["ascent"] + m["descent"]) / 2,
-                    "bottom": -m["descent"]}.get(valign, 0.0)
-    return offset_x, offset_y
+        h = {"left": 0.0, "center": -0.5 * m["advance_x"], "right": -m["advance_x"], "default": 0.0}
+        v = {"top": -m["ascent"], "center": -(m["ascent"] + m["descent"]) / 2, "bottom": -m["descent"],
+             "baseline": 0.0, "default": 0.0}
+    if halign not in h:
+        unknown("halign", h_choices, halign)
+    if valign not in v:
+        unknown("valign", v_choices, valign)
+    return h.get(halign, 0.0), v.get(valign, 0.0)
 
 
 class _FlattenPen(BasePen):
@@ -6225,7 +6243,8 @@ class Evaluator:
             scale = size * (100 / 72) / font["units_per_em"]
             segs = max(2, self._fn(ctx) // 2)
             m = _measure_text(text, size, spacing, font, *map(str, shaping))
-            offset_x, offset_y = _text_align_offset(halign, valign, m)
+            offset_x, offset_y = _text_align_offset(halign, valign, m, lambda w: self._echo_fn(
+                f"WARNING: {w}{self._loc(getattr(node, 'position', None))}"))
         except Exception as e:
             self.error(f"text: {e}", node)
         # font_spec (not the font dict itself) is cached: _resolve_font()
@@ -8027,7 +8046,8 @@ class Evaluator:
 
         font = _resolve_font(str(font_spec))
         m = _measure_text(text, size, spacing, font, *map(str, shaping))
-        offset_x, offset_y = _text_align_offset(halign, valign, m)
+        offset_x, offset_y = _text_align_offset(halign, valign, m, lambda w: self._echo_fn(
+            f"WARNING: {w}{self._loc(getattr(node, 'position', None))}"))
         position = [offset_x + m["left"], offset_y + m["bottom"]]
         size_vec = [m["right"] - m["left"], m["top"] - m["bottom"]]
 

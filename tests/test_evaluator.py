@@ -4389,6 +4389,26 @@ class TestTextShaping:
         _, _, rb, _, _ = self._metrics('textmetrics("abc", size=10, direction="ttb", halign="right", valign="bottom")')
         assert rb == pytest.approx([-3.8627, 39.1032], abs=0.01)
 
+    @pytest.mark.parametrize("src,want", [
+        ('m = textmetrics("ab", halign="middle");',
+         ['Unknown value for the halign parameter (use "left", "right" or "center"): \'middle\'']),
+        ('m = textmetrics("ab", valign="mid");',
+         ['Unknown value for the valign parameter (use "baseline", "bottom", "top" or "center"): \'mid\'']),
+        ('m = textmetrics("ab", direction="ttb", valign="baseline");',
+         ['Don\'t use valign="baseline" with vertical layouts']),
+        ('text("ab", direction="ttb", halign="x", valign="y");',
+         ['Unknown value for the halign parameter (use "left", "right" or "center"): \'x\'',
+          'Unknown value for the valign parameter (use "baseline", "bottom", "top" or "center"): \'y\'']),
+        ('m = textmetrics("  ", halign="bogus");', []),
+        ('m = textmetrics("ab", halign="default", valign="default");', []),
+        ('m = textmetrics("ab", direction="ttb", valign="top");', []),
+        ('m = textmetrics("ab", halign=3);', []),
+    ])
+    def test_unknown_alignment_warns_as_openscad_does(self, src, want):
+        # OpenSCAD 2026.02.01's warnings, verbatim.
+        _, echoes = run(src)
+        assert [e.split(" in file")[0] for e in echoes if e.startswith("WARNING")] == [f"WARNING: {w}" for w in want]
+
     def test_inkless_text_is_not_aligned(self):
         _, _, off, adv, _ = self._metrics('textmetrics("  ", size=10, halign="right")')
         assert off == [0, 0] and adv[0] > 7
