@@ -4347,6 +4347,33 @@ class TestCubeSize:
                              "to a number or a vec3 of numbers in file <string>, line 1"]
 
 
+class TestTextShaping:
+    """HarfBuzz shaping (cpp #96). Expected values checked against
+    OpenSCAD-dev 2026.02.01, which agrees to within its FreeType hinting."""
+
+    def _advance(self, src):
+        _, echoes = run(f"echo({src}.advance);")
+        return [float(v) for v in echoes[0][len("ECHO: ["):-1].split(",")]
+
+    def test_kerning_tightens_a_pair(self):
+        assert self._advance('textmetrics("AV", size=10)')[0] == pytest.approx(17.4967, abs=1e-3)
+        assert self._advance('textmetrics("A", size=10)')[0] * 2 > 18.5  # unkerned sum
+
+    def test_combining_mark_takes_no_advance(self):
+        assert self._advance('textmetrics("xe\\u0301", size=10)')[0] == pytest.approx(14.6688, abs=1e-3)
+
+    def test_rtl_run_measures_the_same_width(self):
+        assert self._advance('textmetrics("abc", size=10, direction="rtl")')[0] == pytest.approx(22.3931, abs=1e-3)
+
+    def test_vertical_run_advances_down(self):
+        x, y = self._advance('textmetrics("abc", size=10, direction="ttb")')
+        assert x == 0 and y < -30
+
+    def test_text_draws_the_shaped_glyphs(self):
+        _, echoes = run('r = render() { text("AV", size=10); }; echo(r.boundingbox[1][0] - r.boundingbox[0][0]);')
+        assert float(echoes[0][len("ECHO: "):]) == pytest.approx(17.4086, abs=1e-2)
+
+
 class TestTextMetrics:
     """`textmetrics()`/`fontmetrics()` measure against the bundled Liberation
     Sans font (see docs/evaluator.md). Values are close to, but not bit-for-bit
