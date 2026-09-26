@@ -23,7 +23,7 @@ from shapely_polyskel import skeletonize
 
 from openscad_evaluator._css_colors import CSS_COLORS
 
-from openscad_lalr_parser import to_openscad, findLibraryFile, getASTfromFile, build_scopes
+from openscad_lalr_parser import to_openscad, findLibraryFile, getASTfromFile, ScopeTable, build_scopes, build_scopes_into
 from openscad_lalr_parser.nodes import (
     ASTNode, Assignment, Identifier,
     NumberLiteral, BooleanLiteral, StringLiteral, UndefinedLiteral,
@@ -2933,7 +2933,7 @@ class EvalContext:
         )
 
 
-def resolve_use_scopes(nodes, current_file, log_fn):
+def resolve_use_scopes(nodes, current_file, log_fn, table=None):
     """Resolve `use <file>` statements per OpenSCAD semantics.
 
     Each top-level `UseStatement` is replaced by the used file's *own*
@@ -2954,8 +2954,15 @@ def resolve_use_scopes(nodes, current_file, log_fn):
       declaration is re-anchored to its own file's root scope (computed
       recursively), giving it access to its own file's globals without
       exposing them to `current_file`.
+
+    Every file's scopes are recorded in ONE ScopeTable (`table`, created
+    here at the top of the recursion): the evaluator reads them all back
+    through `root_scope.table`, and a table per used file would leave it
+    seeing no scope at all for their nodes (cpp #8's buildScopesInto).
     """
-    from openscad_lalr_parser import getASTfromLibraryFile, build_scopes
+    from openscad_lalr_parser import getASTfromLibraryFile
+    if table is None:
+        table = ScopeTable()
     from openscad_lalr_parser.nodes import UseStatement, ModuleDeclaration, FunctionDeclaration
 
     injected = []
@@ -2977,7 +2984,7 @@ def resolve_use_scopes(nodes, current_file, log_fn):
             continue
         if not lib_nodes:
             continue
-        _, lib_own_nodes, lib_root_scope = resolve_use_scopes(lib_nodes, lib_path, log_fn)
+        _, lib_own_nodes, lib_root_scope = resolve_use_scopes(lib_nodes, lib_path, log_fn, table)
         lib_injected = [
             n for n in lib_own_nodes
             if isinstance(n, (ModuleDeclaration, FunctionDeclaration))
@@ -2988,7 +2995,7 @@ def resolve_use_scopes(nodes, current_file, log_fn):
 
     own_nodes = [n for n in nodes if not isinstance(n, UseStatement)]
     processed_nodes = injected + own_nodes
-    root_scope = build_scopes(processed_nodes)
+    root_scope = build_scopes_into(processed_nodes, table)
     for lib_injected, lib_root_scope in reanchor:
         for n in lib_injected:
             n.build_scope(lib_root_scope)
@@ -3032,6 +3039,7 @@ class Evaluator:
         # coverage_result after evaluate() -- see coverage.py (cpp #169).
         # Hits are keyed by id(node); the AST outlives the run.
         self._coverage = coverage
+        self._scopes = ScopeTable()  # replaced by the run's own in evaluate()
         self._cov_hits: dict[int, int] = {}
         self.coverage_result = None
         self._cache_producer: dict[tuple, ASTNode] = {}  # key -> node whose generate filled it
@@ -3446,7 +3454,7 @@ class Evaluator:
             used_ast = getASTfromFile(lib_file)
             if not used_ast:
                 continue
-            used_scope = build_scopes(used_ast)
+            used_scope = build_scopes_into(used_ast, root_scope.table)  # read back through the run's table
             for name, decl in used_scope.modules.items():
                 if name not in root_scope.modules:
                     root_scope.define_module(name, decl)
@@ -3465,6 +3473,10 @@ class Evaluator:
         full, so every echo, warning and error is reported as usual, but no
         geometry is built and the body list is empty -- "does this script
         run?", as OpenSCAD's `-o out.term` asks (cpp #144)."""
+        # Where every node's scope was recorded (see ScopeTable): nodes of an
+        # included file are shared with every other includer, so the scope
+        # cannot live on the node.
+        self._scopes = root_scope.table
         self._resolve_use_statements(nodes, root_scope)
         self._cov_hits = {}
         self._files_run: set[int] = set()
@@ -3841,7 +3853,7 @@ class Evaluator:
         # so prefer them over the fresh parse above: same span, but these
         # carry the hits. build_result dedupes by position. Each is anchored
         # to its own file's root scope, which holds what THAT file use<>d,
-        # so following decl.scope reaches every level of nesting.
+        # so following each declaration's scope reaches every level of nesting.
         executed, scopes, seen = [], [root_scope], {id(root_scope)}
         while scopes:
             scope = scopes.pop()
@@ -3849,7 +3861,7 @@ class Evaluator:
                 extra[:0] = [v for v in scope.variables.values() if type(v) is Assignment]
             for decl in list(scope.modules.values()) + list(scope.functions.values()):
                 executed.append(decl)
-                own = getattr(decl, "scope", None)
+                own = scope.table.get(decl)
                 if own is not None and id(own) not in seen:
                     seen.add(id(own))
                     scopes.append(own)
@@ -4046,7 +4058,7 @@ class Evaluator:
             # each node evaluates in its correct lexical scope. Share ctx.dyn
             # (not a copy) so that eager assignments in one sibling are visible
             # to subsequent siblings in the same block.
-            child_scope = getattr(child, 'scope', None)
+            child_scope = self._scopes.get(child)
             if child_scope is not None:
                 child_ctx = EvalContext(
                     scope=child_scope,
@@ -4207,7 +4219,7 @@ class Evaluator:
         if self._coverage:
             self._cov_hit(decl)
         # Bind parameters
-        child_scope = getattr(decl, 'scope', None) or ctx.scope
+        child_scope = self._scopes.get(decl) or ctx.scope
         params = getattr(decl, 'parameters', None) or []
         args = self._bind_args(params, call.arguments, ctx, call)
 
@@ -6537,7 +6549,7 @@ class Evaluator:
         if fn is not None:
             # No live context at generate time: a root from the closure's own
             # scope, so $-variables sit at their defaults inside it.
-            fctx = EvalContext(scope=fn.fn.scope or self._root_ctx.scope)
+            fctx = EvalContext(scope=self._scopes.get(fn.fn) or self._root_ctx.scope)
             fctx.let = dict(fn.let)
             names = [p.name.name for p in fn.fn.parameters]
 
@@ -6688,9 +6700,9 @@ class Evaluator:
                 out.append(stmt)  # written but false: ponytail, re-resolves its args once
                 continue
             pos = stmt.position
-            out.extend(ModularCall(position=pos, scope=None, name=Identifier(position=pos, scope=None, name="children"),
-                                   arguments=[PositionalArgument(position=pos, scope=None,
-                                                                 expr=NumberLiteral(position=pos, scope=None, val=i))],
+            out.extend(ModularCall(position=pos, name=Identifier(position=pos, name="children"),
+                                   arguments=[PositionalArgument(position=pos,
+                                                                 expr=NumberLiteral(position=pos, val=i))],
                                    children=[])
                        for i in self._children_indices(args, eff_ctx, stmt))
         return out
@@ -8315,7 +8327,7 @@ class Evaluator:
     def _bind_user_function(self, decl: FunctionDeclaration, arguments, ctx: EvalContext, call_node) -> EvalContext:
         params = decl.parameters or []
         bound = self._bind_args(params, arguments, ctx, call_node)
-        fn_scope = decl.scope or ctx.scope
+        fn_scope = self._scopes.get(decl) or ctx.scope
         # No $-prefixed parameter is declared AND this call's own bound
         # arguments include no $-prefixed key either -- the common case,
         # and the only case where child_ctx.dyn is guaranteed untouched by
@@ -8466,7 +8478,7 @@ class Evaluator:
         func_node = closure.fn
         params = func_node.parameters
         bound = self._bind_args(params, arguments, ctx, call_node)
-        fn_scope = func_node.scope or ctx.scope
+        fn_scope = self._scopes.get(func_node) or ctx.scope
         # See _eval_user_function's matching comment -- same optimization.
         share_dyn = not self._has_dollar_param(id(func_node), params) and not self._bound_has_dollar_key(bound)
         child_ctx = ctx.call_ctx(scope=fn_scope, share_dyn=share_dyn)

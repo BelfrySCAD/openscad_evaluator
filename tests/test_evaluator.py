@@ -6911,3 +6911,26 @@ class TestWarningAttribution:
     def test_top_level_warning_stays_one_line(self):
         _, lines = run('echo(1+"a");')
         assert lines[0] == "WARNING: undefined operation (number + string) in file <string>, line 1"
+
+
+class TestSharedIncludeScopes:
+    """An included file's nodes are shared by every includer (openscad_lalr_parser
+    2.0 records scopes in a ScopeTable, not on the node), so two scripts that
+    include the same library evaluate against their own globals, whichever was
+    scoped last."""
+
+    def test_two_includers_each_see_their_own_globals(self, tmp_path):
+        from openscad_lalr_parser import getASTfromFile
+        from openscad_evaluator.evaluator import resolve_use_scopes
+        (tmp_path / "lib.scad").write_text("function f() = k;\n")
+        (tmp_path / "a.scad").write_text("k = 1;\ninclude <lib.scad>\necho(f());\n")
+        (tmp_path / "b.scad").write_text("k = 2;\ninclude <lib.scad>\necho(f());\n")
+        runs = []
+        for name in ("a.scad", "b.scad"):
+            path = str(tmp_path / name)
+            nodes, _own, scope = resolve_use_scopes(getASTfromFile(path, include_comments=False), path, print)
+            runs.append((nodes, scope))
+        for (nodes, scope), want in zip(runs, ("ECHO: 1", "ECHO: 2")):  # a runs after b was scoped
+            out = []
+            Evaluator(echo_fn=out.append).evaluate(nodes, scope, generate=False)
+            assert out == [want]
