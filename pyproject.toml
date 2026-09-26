@@ -42,6 +42,7 @@ dependencies = [
     "shapely-polyskel>=0.1.2",
     "Pillow>=10.0",
     "openscad_lalr_parser>=1.4.0",
+    "uharfbuzz>=0.40",
 ]
 
 [project.optional-dependencies]

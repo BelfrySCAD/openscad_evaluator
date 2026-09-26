@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 import manifold3d as m3d
 import numpy as np
 from fontTools.ttLib import TTFont
+import uharfbuzz as hb
 from fontTools.pens.basePen import BasePen
 from shapely_polyskel import skeletonize
 
@@ -2111,6 +2112,8 @@ def _font_tables_from_path(path: str, ttc_index: int = 0) -> dict:
             "head": font["head"],
             "hhea": font.get("hhea"),
             "glyph_set": font.getGlyphSet(),
+            "glyph_order": font.getGlyphOrder(),  # HarfBuzz glyph index -> name
+            "hb_font": hb.Font(hb.Face(hb.Blob.from_file_path(path), ttc_index)),
             "path": path,
             "ttc_index": ttc_index,
             "family_name": family_name or "Liberation Sans",
@@ -2229,37 +2232,49 @@ def _glyph_bounds(gname: str, font: dict) -> tuple[float, float, float, float] |
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _measure_text(text: str, size: float, spacing: float, font: dict | None = None) -> dict:
-    """Lay out `text` left-to-right and return its ink-bbox/advance metrics
+def _measure_text(text: str, size: float, spacing: float, font: dict | None = None,
+                  direction: str = "", language: str = "", script: str = "") -> dict:
+    """Shape `text` with HarfBuzz and return its ink-bbox/advance metrics
     in OpenSCAD units, scaled for `size` (see docs/evaluator.md for the
-    scale-factor and per-glyph layout derivation).
+    scale factor). Kerning, ligatures, mark positioning and bidi reordering
+    all apply; `direction`/`language`/`script` left empty are guessed from
+    the text, as OpenSCAD's detect_properties() does (cpp #96).
 
     Returns a dict with `ascent`, `descent`, `ink_min_x`, `ink_max_x`,
-    `advance_x`, and `glyphs` (a list of `(glyph_name, pen_x_scaled)` for
-    each renderable glyph, used by `text()`) — aggregates are all `0` and
-    `glyphs` is empty if `text` contains no measurable glyphs.
+    `advance_x`, `advance_y`, and `glyphs` (a list of `(glyph_name, x, y)`
+    for each renderable glyph, used by `text()`) — aggregates are all `0`
+    and `glyphs` is empty if `text` contains no measurable glyphs.
     """
     if font is None:
         font = _load_default_font()
-    cmap, hmtx = font["cmap"], font["hmtx"]
+    # The 100/72 is OpenSCAD's own text() size bug (its #4304), kept on purpose.
     scale = size * (100 / 72) / font["units_per_em"]
 
-    pen_x = 0.0
+    buf = hb.Buffer()
+    buf.add_str(text)
+    if direction:
+        buf.direction = direction
+    if script:
+        buf.script = script
+    if language:
+        buf.language = language
+    buf.guess_segment_properties()  # fills in only what was not set above
+    hb.shape(font["hb_font"], buf)
+
+    pen_x = pen_y = 0.0
     ascent = descent = ink_min_x = ink_max_x = 0.0
     has_ink = False
     glyphs = []
-    for ch in text:
-        gname = cmap.get(ord(ch))
-        if gname is None:
-            continue
-        advance, _lsb = hmtx[gname]
+    order = font["glyph_order"]
+    for info, pos in zip(buf.glyph_infos or [], buf.glyph_positions or []):  # None when empty
+        gname = order[info.codepoint]
+        x = (pen_x + pos.x_offset) * scale
+        y = (pen_y + pos.y_offset) * scale
         bounds = _glyph_bounds(gname, font)
         if bounds is not None:
             xmin, ymin, xmax, ymax = bounds
-            left = pen_x * scale + xmin * scale
-            right = pen_x * scale + xmax * scale
-            top = ymax * scale
-            bottom = ymin * scale
+            left, right = x + xmin * scale, x + xmax * scale
+            bottom, top = y + ymin * scale, y + ymax * scale
             if not has_ink:
                 ink_min_x, ink_max_x, ascent, descent = left, right, top, bottom
                 has_ink = True
@@ -2268,8 +2283,9 @@ def _measure_text(text: str, size: float, spacing: float, font: dict | None = No
                 ink_max_x = max(ink_max_x, right)
                 ascent = max(ascent, top)
                 descent = min(descent, bottom)
-            glyphs.append((gname, pen_x * scale))
-        pen_x += advance * spacing
+            glyphs.append((gname, x, y))
+        pen_x += pos.x_advance * spacing
+        pen_y += pos.y_advance * spacing
 
     return {
         "ascent": ascent,
@@ -2277,6 +2293,7 @@ def _measure_text(text: str, size: float, spacing: float, font: dict | None = No
         "ink_min_x": ink_min_x,
         "ink_max_x": ink_max_x,
         "advance_x": pen_x * scale,
+        "advance_y": pen_y * scale,
         "glyphs": glyphs,
     }
 
@@ -6152,8 +6169,8 @@ class Evaluator:
         Renders `text` as 2D glyph outlines, using the font specified by `font=`
         (an OpenSCAD/fontconfig pattern such as `"Times New Roman:style=Bold"`).
         Resolved via `fc-match` when available; falls back to bundled Liberation
-        Sans if the font cannot be found.  `direction`, `language`, `script` are
-        accepted but unused.
+        Sans if the font cannot be found.  Shaped by HarfBuzz; `direction`,
+        `language` and `script` are honoured, and guessed from the text when unset.
         """
         args, ctx = self._resolve_call_args(node, ctx)
         text = self._get_arg(args, 0, "text", "")
@@ -6162,12 +6179,13 @@ class Evaluator:
         halign = self._get_arg(args, None, "halign", "left")
         valign = self._get_arg(args, None, "valign", "baseline")
         spacing = self._get_arg(args, None, "spacing", 1)
+        shaping = [self._get_arg(args, None, k, "") or "" for k in ("direction", "language", "script")]
 
         try:
             font = _resolve_font(str(font_spec))
             scale = size * (100 / 72) / font["units_per_em"]
             segs = max(2, self._fn(ctx) // 2)
-            m = _measure_text(text, size, spacing, font)
+            m = _measure_text(text, size, spacing, font, *map(str, shaping))
             offset_x, offset_y = _text_align_offset(halign, valign, m)
         except Exception as e:
             self.error(f"text: {e}", node)
@@ -6182,9 +6200,9 @@ class Evaluator:
             font = _resolve_font(params["font_spec"])
             scale = params["scale"]
             sections = []
-            for gname, pen_x_scaled in params["glyphs"]:
+            for gname, x, y in params["glyphs"]:
                 glyph_cs = _glyph_cross_section(gname, params["segs"], font)
-                sections.append(glyph_cs.scale([scale, scale]).translate([pen_x_scaled, 0]))
+                sections.append(glyph_cs.scale([scale, scale]).translate([x, y]))
             cs = m3d.CrossSection.batch_boolean(sections, m3d.OpType.Add) if sections else m3d.CrossSection()
             offset_x, offset_y = params["offset"]
             cs = cs.translate([offset_x, offset_y])
@@ -7956,8 +7974,8 @@ class Evaluator:
         `OscObject` with `position`, `size`, `ascent`, `descent`, `offset`,
         `advance` — matching real OpenSCAD's key order. Falls back to the
         bundled Liberation Sans if `font=` is unset, `fc-match` is
-        unavailable, or the font can't be found. `direction`/`language`/
-        `script` are accepted but unused; see docs/evaluator.md for known gaps.
+        unavailable, or the font can't be found. Shaped by HarfBuzz, with
+        `direction`/`language`/`script` honoured as in `text()`.
         """
         text = self._get_arg(args, 0, "text", "")
         # All nine positional, unlike text(), which takes only font that way.
@@ -7966,9 +7984,10 @@ class Evaluator:
         valign = self._get_arg(args, 7, "valign", "baseline")
         spacing = self._get_arg(args, 8, "spacing", 1)
         font_spec = self._get_arg(args, 2, "font", "") or ""
+        shaping = [self._get_arg(args, i, k, "") or "" for i, k in ((3, "direction"), (4, "language"), (5, "script"))]
 
         font = _resolve_font(str(font_spec))
-        m = _measure_text(text, size, spacing, font)
+        m = _measure_text(text, size, spacing, font, *map(str, shaping))
         ascent, descent = m["ascent"], m["descent"]
         advance_x = m["advance_x"]
 
@@ -7983,7 +8002,7 @@ class Evaluator:
             "ascent": ascent,
             "descent": descent,
             "offset": [offset_x, offset_y],
-            "advance": [advance_x, 0.0],
+            "advance": [advance_x, m["advance_y"]],
         })
 
     def _builtin_dxf(self, name: str, args: dict, node):
