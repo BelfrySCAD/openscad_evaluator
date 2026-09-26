@@ -4369,6 +4369,30 @@ class TestTextShaping:
         x, y = self._advance('textmetrics("abc", size=10, direction="ttb")')
         assert x == 0 and y < -30
 
+    def _metrics(self, src):
+        _, echoes = run(f"m = {src}; echo(m.position, m.size, m.offset, m.advance, m.ascent);")
+        import ast
+        return ast.literal_eval("[" + echoes[0][len("ECHO: "):] + "]")
+
+    def test_vertical_run_matches_openscad(self):
+        # FreeType's vertical metrics, as OpenSCAD shapes through hb-ft; hb-ot's
+        # own fallback made this advance -46.55.
+        pos, size, _, adv, ascent = self._metrics('textmetrics("abc", size=10, direction="ttb")')
+        assert adv[1] == pytest.approx(-39.1032, abs=1e-3)
+        assert pos == pytest.approx([-3.2733, -36.3957], abs=0.01)
+        assert size[1] == pytest.approx(33.6848, abs=0.01)
+        assert ascent == pytest.approx(10.0672, abs=0.01)  # the glyphs' own, not their placement
+
+    def test_vertical_run_aligns_by_its_own_rules(self):
+        _, _, lc, _, _ = self._metrics('textmetrics("abc", size=10, direction="ttb", halign="left", valign="center")')
+        assert lc == pytest.approx([3.2733, 19.5516], abs=0.01)
+        _, _, rb, _, _ = self._metrics('textmetrics("abc", size=10, direction="ttb", halign="right", valign="bottom")')
+        assert rb == pytest.approx([-3.8627, 39.1032], abs=0.01)
+
+    def test_inkless_text_is_not_aligned(self):
+        _, _, off, adv, _ = self._metrics('textmetrics("  ", size=10, halign="right")')
+        assert off == [0, 0] and adv[0] > 7
+
     def test_text_draws_the_shaped_glyphs(self):
         _, echoes = run('r = render() { text("AV", size=10); }; echo(r.boundingbox[1][0] - r.boundingbox[0][0]);')
         assert float(echoes[0][len("ECHO: "):]) == pytest.approx(17.4086, abs=1e-2)

@@ -2113,13 +2113,47 @@ def _font_tables_from_path(path: str, ttc_index: int = 0) -> dict:
             "hhea": font.get("hhea"),
             "glyph_set": font.getGlyphSet(),
             "glyph_order": font.getGlyphOrder(),  # HarfBuzz glyph index -> name
-            "hb_font": hb.Font(hb.Face(hb.Blob.from_file_path(path), ttc_index)),
+            "hb_font": _hb_font(path, ttc_index, font),
             "path": path,
             "ttc_index": ttc_index,
             "family_name": family_name or "Liberation Sans",
             "style_name": style_name or "Regular",
         }
     return _font_table_cache[key]
+
+
+def _hb_font(path: str, ttc_index: int, font: TTFont) -> "hb.Font":
+    """A HarfBuzz font whose vertical metrics are FreeType's, as they are in
+    OpenSCAD (which shapes through hb-ft). For a font with no vmtx --
+    nearly every Latin font, Liberation Sans included -- hb-ot falls back to
+    hhea ascender-descender, FreeType to OS/2 typo ascender-descender, so a
+    ttb "abc" was 46.5 tall instead of 39.1. The numbers are FreeType's
+    TrueType synthesis, read back from FreeType itself; a font with vmtx is left to hb-ot, which reads it
+    the same way FreeType does."""
+    parent = hb.Font(hb.Face(hb.Blob.from_file_path(path), ttc_index))
+    if "vmtx" in font:
+        return parent
+    os2 = font.get("OS/2")
+    if os2 is not None:
+        asc, desc = os2.sTypoAscender, os2.sTypoDescender
+    else:
+        asc, desc = font["hhea"].ascent, font["hhea"].descent
+    vadv = asc - desc
+    order = font.getGlyphOrder()
+    tables = {"glyf": font.get("glyf"), "glyph_set": font.getGlyphSet()}
+
+    def v_origin(_f, g, _u):
+        # FreeType centres the glyph's ink in its vertical advance:
+        # vertBearingY = (vadv - height) / 2, truncated as C truncates.
+        ymin, ymax = (_glyph_bounds(order[g], tables) or (0, 0, 0, 0))[1::2]
+        return True, parent.get_glyph_h_advance(g) // 2, ymax + int((vadv - (ymax - ymin)) / 2)
+
+    funcs = hb.FontFuncs()
+    funcs.set_glyph_v_advance_func(lambda _f, _g, _u: -vadv, None)  # FreeType's vertical grows downward
+    funcs.set_glyph_v_origin_func(v_origin, None)
+    sub = hb.Font(parent)  # everything not overridden delegates to parent
+    sub.funcs = funcs
+    return sub
 
 
 def _load_default_font() -> dict:
@@ -2234,16 +2268,19 @@ def _glyph_bounds(gname: str, font: dict) -> tuple[float, float, float, float] |
 
 def _measure_text(text: str, size: float, spacing: float, font: dict | None = None,
                   direction: str = "", language: str = "", script: str = "") -> dict:
-    """Shape `text` with HarfBuzz and return its ink-bbox/advance metrics
-    in OpenSCAD units, scaled for `size` (see docs/evaluator.md for the
-    scale factor). Kerning, ligatures, mark positioning and bidi reordering
-    all apply; `direction`/`language`/`script` left empty are guessed from
-    the text, as OpenSCAD's detect_properties() does (cpp #96).
+    """Shape `text` with HarfBuzz and return its metrics in OpenSCAD units,
+    scaled for `size` (see docs/evaluator.md for the scale factor). Kerning,
+    ligatures, mark positioning and bidi reordering all apply;
+    `direction`/`language`/`script` left empty are guessed from the text, as
+    OpenSCAD's detect_properties() does (cpp #96).
 
-    Returns a dict with `ascent`, `descent`, `ink_min_x`, `ink_max_x`,
-    `advance_x`, `advance_y`, and `glyphs` (a list of `(glyph_name, x, y)`
-    for each renderable glyph, used by `text()`) — aggregates are all `0`
-    and `glyphs` is empty if `text` contains no measurable glyphs.
+    As in OpenSCAD's ShapeResults, `left`/`right`/`bottom`/`top` is the ink
+    box of the glyphs where they are placed, while `ascent`/`descent` are
+    the glyphs' own extents about THEIR baseline, ignoring where they sit;
+    the two differ only for a vertical run or a glyph the shaper offsets.
+    Also returns `advance_x`, `advance_y`, `has_ink`, `vertical` (a ttb/btt
+    run) and `glyphs` (`(glyph_name, x, y)` per inked glyph, used by
+    `text()`). Everything is 0 when `text` has no ink.
     """
     if font is None:
         font = _load_default_font()
@@ -2262,7 +2299,7 @@ def _measure_text(text: str, size: float, spacing: float, font: dict | None = No
     hb.shape(font["hb_font"], buf)
 
     pen_x = pen_y = 0.0
-    ascent = descent = ink_min_x = ink_max_x = 0.0
+    m = {"ascent": 0.0, "descent": 0.0, "left": 0.0, "right": 0.0, "bottom": 0.0, "top": 0.0}
     has_ink = False
     glyphs = []
     order = font["glyph_order"]
@@ -2272,44 +2309,46 @@ def _measure_text(text: str, size: float, spacing: float, font: dict | None = No
         y = (pen_y + pos.y_offset) * scale
         bounds = _glyph_bounds(gname, font)
         if bounds is not None:
-            xmin, ymin, xmax, ymax = bounds
-            left, right = x + xmin * scale, x + xmax * scale
-            bottom, top = y + ymin * scale, y + ymax * scale
+            xmin, ymin, xmax, ymax = (v * scale for v in bounds)
+            g = {"left": x + xmin, "right": x + xmax, "bottom": y + ymin, "top": y + ymax,
+                 "ascent": ymax, "descent": ymin}
             if not has_ink:
-                ink_min_x, ink_max_x, ascent, descent = left, right, top, bottom
+                m.update(g)
                 has_ink = True
             else:
-                ink_min_x = min(ink_min_x, left)
-                ink_max_x = max(ink_max_x, right)
-                ascent = max(ascent, top)
-                descent = min(descent, bottom)
+                for k in ("left", "bottom", "descent"):
+                    m[k] = min(m[k], g[k])
+                for k in ("right", "top", "ascent"):
+                    m[k] = max(m[k], g[k])
             glyphs.append((gname, x, y))
         pen_x += pos.x_advance * spacing
         pen_y += pos.y_advance * spacing
 
-    return {
-        "ascent": ascent,
-        "descent": descent,
-        "ink_min_x": ink_min_x,
-        "ink_max_x": ink_max_x,
-        "advance_x": pen_x * scale,
-        "advance_y": pen_y * scale,
-        "glyphs": glyphs,
-    }
+    # hb reads only the first letter of a direction, so this is exactly
+    # the set of strings the shaper takes as vertical.
+    m.update(advance_x=pen_x * scale, advance_y=pen_y * scale, has_ink=has_ink, glyphs=glyphs,
+             vertical=direction[:1].lower() in ("t", "b"))
+    return m
 
 
 def _text_align_offset(halign: str, valign: str, m: dict) -> tuple[float, float]:
-    """Compute the `(offset_x, offset_y)` translation for `halign`/`valign`,
-    given the dict returned by `_measure_text`. Shared by `_builtin_textmetrics`
-    (which reports it) and `_builtin_text` (which applies it)."""
-    advance_x, ascent, descent = m["advance_x"], m["ascent"], m["descent"]
-    offset_x = -{"left": 0.0, "center": 0.5, "right": 1.0}.get(halign, 0.0) * advance_x
-    offset_y = {
-        "top": -ascent,
-        "center": -(ascent + descent) / 2,
-        "baseline": 0.0,
-        "bottom": -descent,
-    }.get(valign, 0.0)
+    """OpenSCAD's ShapeResults::calc_offsets_horiz/_vert: the `(offset_x,
+    offset_y)` translation for `halign`/`valign`, given `_measure_text`'s
+    dict. Shared by `_builtin_textmetrics` (which reports it) and
+    `_builtin_text` (which applies it). "default" is left/baseline for a
+    horizontal run and center/top for a vertical one; text with no ink is
+    not moved. An unknown value (or valign="baseline" on a vertical run)
+    does not move the text there either; OpenSCAD also warns, which this
+    does not."""
+    if not m["has_ink"]:
+        return 0.0, 0.0
+    if m["vertical"]:
+        offset_x = {"left": -m["left"], "right": -m["right"]}.get(halign, 0.0)
+        offset_y = {"center": -m["advance_y"] / 2, "bottom": -m["advance_y"]}.get(valign, 0.0)
+    else:
+        offset_x = -{"center": 0.5, "right": 1.0}.get(halign, 0.0) * m["advance_x"]
+        offset_y = {"top": -m["ascent"], "center": -(m["ascent"] + m["descent"]) / 2,
+                    "bottom": -m["descent"]}.get(valign, 0.0)
     return offset_x, offset_y
 
 
@@ -6176,8 +6215,8 @@ class Evaluator:
         text = self._get_arg(args, 0, "text", "")
         size = self._get_arg(args, 1, "size", 10)
         font_spec = self._get_arg(args, 2, "font", "") or ""  # positional, but nothing after it is
-        halign = self._get_arg(args, None, "halign", "left")
-        valign = self._get_arg(args, None, "valign", "baseline")
+        halign = self._get_arg(args, None, "halign", "default")
+        valign = self._get_arg(args, None, "valign", "default")
         spacing = self._get_arg(args, None, "spacing", 1)
         shaping = [self._get_arg(args, None, k, "") or "" for k in ("direction", "language", "script")]
 
@@ -7980,29 +8019,25 @@ class Evaluator:
         text = self._get_arg(args, 0, "text", "")
         # All nine positional, unlike text(), which takes only font that way.
         size = self._get_arg(args, 1, "size", 10)
-        halign = self._get_arg(args, 6, "halign", "left")
-        valign = self._get_arg(args, 7, "valign", "baseline")
+        halign = self._get_arg(args, 6, "halign", "default")
+        valign = self._get_arg(args, 7, "valign", "default")
         spacing = self._get_arg(args, 8, "spacing", 1)
         font_spec = self._get_arg(args, 2, "font", "") or ""
         shaping = [self._get_arg(args, i, k, "") or "" for i, k in ((3, "direction"), (4, "language"), (5, "script"))]
 
         font = _resolve_font(str(font_spec))
         m = _measure_text(text, size, spacing, font, *map(str, shaping))
-        ascent, descent = m["ascent"], m["descent"]
-        advance_x = m["advance_x"]
-
         offset_x, offset_y = _text_align_offset(halign, valign, m)
-
-        position = [offset_x + m["ink_min_x"], offset_y + descent]
-        size_vec = [m["ink_max_x"] - m["ink_min_x"], ascent - descent]
+        position = [offset_x + m["left"], offset_y + m["bottom"]]
+        size_vec = [m["right"] - m["left"], m["top"] - m["bottom"]]
 
         return OscObject({
             "position": position,
             "size": size_vec,
-            "ascent": ascent,
-            "descent": descent,
+            "ascent": m["ascent"],
+            "descent": m["descent"],
             "offset": [offset_x, offset_y],
-            "advance": [advance_x, m["advance_y"]],
+            "advance": [m["advance_x"], m["advance_y"]],
         })
 
     def _builtin_dxf(self, name: str, args: dict, node):
